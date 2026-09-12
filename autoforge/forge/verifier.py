@@ -1,20 +1,17 @@
 """Verification: the gate between "forged" and "trusted".
 
-Two orthogonal questions, both tested (see DESIGN.md §2.4):
+Five orthogonal checks, in order of increasing cost:
 
-  A. Does it RUN?      — execution check: call it, does it do the right thing
-                         without crashing?
-  B. Does it FIRE?     — trigger check: when the need arises, will the agent
-                         actually call it? And will it stay quiet when the need
-                         is absent?
+  A. execution     — does the code run on a standard input without crashing?
+  B. robustness    — does it survive edge-case inputs? (deterministic fuzzer)
+  C. adversarial   — can it survive an LLM attacker? (adversarial gate)
+  D. trigger       — when the need arises, will the agent call this tool?
+  E. negative      — when the need is absent, will it stay quiet?
 
-Question B is the one mainstream frameworks skip, and it is exactly where the
-"Constraint Tax" lives: a tool can be perfectly correct and still never be
-invoked. We test it by handing the probe query to a live agent with the tool
-registered, and observing whether the tool call appears.
-
-We also test the NEGATIVE case. A tool that fires on everything is worse than
-one that never fires, because it steals calls from better tools.
+Question D+E is the "Constraint Tax" and "over-triggering" problems. Question B
+guards against the exact bug found in the live demo (ISBN prefix contamination).
+Question C is unique to autoforge — no framework runs an attacker against its
+own tools before trusting them.
 """
 from __future__ import annotations
 
@@ -26,6 +23,8 @@ from ..core.agent import Agent
 from ..core.llm import LLMClient
 from ..tools.registry import ToolRegistry
 from ..tools.spec import ToolSpec, ToolState
+from .adversary import AdversarialGate, AdversarialReport
+from .fuzzer import RobustnessResult, run_robustness_checks
 from .sandbox import Sandbox
 
 
@@ -63,7 +62,15 @@ class VerificationReport:
 
 
 class ToolVerifier:
-    """Runs the check battery against a freshly forged tool."""
+    """Runs the full check battery against a freshly forged tool.
+
+    Checks (in order of increasing cost):
+      A. execution — does the code run without crashing on a standard input?
+      B. robustness — does it survive edge-case inputs? (deterministic fuzzer)
+      C. adversarial — can it survive an LLM attacker?
+      D. trigger — does the agent call it when appropriate?
+      E. negative — does it stay quiet when inappropriate?
+    """
 
     def __init__(
         self,
@@ -71,18 +78,26 @@ class ToolVerifier:
         *,
         sandbox: Sandbox | None = None,
         run_execution_check: bool = True,
+        run_robustness_check: bool = True,
+        run_adversarial_check: bool = True,
         run_trigger_check: bool = True,
         run_negative_check: bool = True,
         trigger_trials: int = 1,
+        adversary: AdversarialGate | None = None,
+        require_robustness_rate: float = 0.8,
     ) -> None:
         self.llm = llm
         self.sandbox = sandbox or Sandbox()
         self.run_execution_check = run_execution_check
+        self.run_robustness_check = run_robustness_check
+        self.run_adversarial_check = run_adversarial_check
         self.run_trigger_check = run_trigger_check
         self.run_negative_check = run_negative_check
         self.trigger_trials = trigger_trials
+        self.adversary = adversary
+        self.require_robustness_rate = require_robustness_rate
 
-    # -- individual checks --------------------------------------------
+    # -- individual checks (A–E) ----------------------------------------
     @staticmethod
     def _infer_args(spec: ToolSpec) -> dict[str, Any]:
         """Generate plausible sample arguments from the parameter schema."""
@@ -118,18 +133,40 @@ class ToolVerifier:
             {"output": str(result.output)[:200], "duration_ms": round(result.duration_ms, 1)},
         )
 
+    def check_robustness(self, spec: ToolSpec) -> CheckResult:
+        """B. Deterministic edge-case fuzzing — survives the ISBN prefix bug?"""
+        result = run_robustness_checks(
+            spec, sandbox=self.sandbox, require_survival_rate=self.require_robustness_rate,
+        )
+        return CheckResult(
+            "robustness", result.passed,
+            result.summary(),
+            {"survival_rate": round(result.survival_rate, 3),
+             "survived": result.survived, "total": result.total},
+        )
+
+    def check_adversarial(self, spec: ToolSpec, sample_args: dict[str, Any] | None = None) -> CheckResult:
+        """C. An LLM attacker tries to break the tool."""
+        gate = self.adversary or AdversarialGate(self.llm, execution_sandbox=self.sandbox)
+        report = gate.attack(spec)
+        return CheckResult(
+            "adversarial", report.passed,
+            report.summary(),
+            {"survived": report.survived, "total": report.total_attacks},
+        )
+
     def check_trigger(self, spec: ToolSpec, query: str) -> CheckResult:
-        """B+. Register the tool alone, ask the query, see if it fires."""
+        """D. Register the tool alone, ask the query, see if it fires."""
         registry = self._probe_registry()
         registry.register(spec)
         hits = 0
         seen: list[str] = []
         for _ in range(self.trigger_trials):
-            agent = Agent(self.llm, registry, max_turns=2)
+            # No terminate tool here: the probe measures whether THIS tool
+            # fires, so the context must contain nothing else that competes.
+            agent = Agent(self.llm, registry, max_turns=2, allow_self_terminate=False)
             res = agent.run(query)
             seen.extend(res.tool_calls)
-            # One trial = one vote. A tool called twice in a turn still counts
-            # once; otherwise a chatty agent inflates the trigger score.
             if spec.name in res.tool_calls:
                 hits += 1
         passed = hits > 0
@@ -140,10 +177,10 @@ class ToolVerifier:
         )
 
     def check_negative(self, spec: ToolSpec, query: str) -> CheckResult:
-        """B-. Ask an unrelated-but-adjacent query; the tool must stay quiet."""
+        """E. Ask an unrelated-but-adjacent query; the tool must stay quiet."""
         registry = self._probe_registry()
         registry.register(spec)
-        agent = Agent(self.llm, registry, max_turns=2)
+        agent = Agent(self.llm, registry, max_turns=2, allow_self_terminate=False)
         res = agent.run(query)
         over_fired = spec.name in res.tool_calls
         return CheckResult(
@@ -154,8 +191,6 @@ class ToolVerifier:
 
     @staticmethod
     def _probe_registry() -> ToolRegistry:
-        """A harness registry that can SEE draft tools — otherwise the trigger
-        probe would be testing a tool the agent is not allowed to call."""
         return ToolRegistry(
             auto_quarantine=False,
             visible_states={ToolState.DRAFT, ToolState.PROBATION, ToolState.ACTIVE},
@@ -167,6 +202,12 @@ class ToolVerifier:
 
         if self.run_execution_check:
             checks.append(self.check_execution(spec, sample_args))
+
+        if self.run_robustness_check and spec.code:
+            checks.append(self.check_robustness(spec))
+
+        if self.run_adversarial_check and spec.code:
+            checks.append(self.check_adversarial(spec, sample_args))
 
         if self.run_trigger_check:
             positive = [p for p in spec.probes if p.expect == "call"]
@@ -193,12 +234,7 @@ def register_if_verified(
     sample_args: dict[str, Any] | None = None,
     promote_on_pass: bool = False,
 ) -> VerificationReport:
-    """Verify, then place the tool in the lifecycle accordingly.
-
-    Passing verification earns PROBATION (callable + context-visible). Failing
-    leaves it DRAFT (registered, but not injected). ACTIVE is reserved for tools
-    that have also held up in live use, or for `promote_on_pass`.
-    """
+    """Verify, then place the tool in the lifecycle accordingly."""
     report = verifier.verify(spec, sample_args)
     spec.verification = report.to_dict()
     if report.passed:

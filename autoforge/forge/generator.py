@@ -28,6 +28,7 @@ from ..tools.spec import ToolSpec, ToolState, TriggerProbe
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _BRACE_RE = re.compile(r"\{.*\}", re.DOTALL)
+_BRACKET_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 
 @dataclass
@@ -51,21 +52,55 @@ class GeneratedTool:
 
 def extract_json(text: str) -> dict[str, Any] | None:
     """Pull a JSON object out of model output that may be wrapped in prose."""
+    data = extract_json_any(text)
+    return data if isinstance(data, dict) else None
+
+
+def extract_json_any(text: str) -> Any | None:
+    """Like `extract_json`, but also returns JSON arrays.
+
+    Strategy: try the raw text first (fast path when the LLM output is already
+    clean JSON). Fall back to fence extraction and regex heuristics only when
+    the raw text fails to parse.
+    """
     if not text:
         return None
+
+    # Fast path: the output IS JSON already
+    try:
+        data = json.loads(text)
+        if isinstance(data, (dict, list)):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # Heuristic: extract content from ``` fences (most reliable)
     candidates: list[str] = []
-    candidates.extend(m.group(1) for m in _FENCE_RE.finditer(text))
-    candidates.append(text)
+    candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(text) if m.group(1).strip())
+
+    # Heuristic: find the outermost brace or bracket construct.
+    # DOTALL greedy `.*` between delimiters is intentionally wrong for nested
+    # structures (it over-matches), but it's good enough for our heuristic:
+    # we only try it when the fast path failed (meaning the text is not clean
+    # JSON), and we try each candidate separately.
     brace = _BRACE_RE.search(text)
-    if brace:
+    bracket = _BRACKET_RE.search(text)
+
+    if brace and bracket:
+        # Prefer the construct that starts first in the text.
+        candidates.append((brace if brace.start() <= bracket.start() else bracket).group(0))
+    elif brace:
         candidates.append(brace.group(0))
+    elif bracket:
+        candidates.append(bracket.group(0))
+
     for cand in candidates:
         cand = cand.strip()
         if not cand:
             continue
         try:
             data = json.loads(cand)
-            if isinstance(data, dict):
+            if isinstance(data, (dict, list)):
                 return data
         except json.JSONDecodeError:
             continue
@@ -194,6 +229,7 @@ __all__ = [
     "LLMToolGenerator",
     "TemplateGenerator",
     "extract_json",
+    "extract_json_any",
     "GENERATOR_SYSTEM",
     "Sandbox",
 ]
