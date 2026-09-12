@@ -37,7 +37,7 @@ def main() -> int:
         return 1
 
     base = "https://aiping.cn/api/v1"
-    model = "deepseek-v4.1-flash"
+    model = "DeepSeek-V4.1-Flash"
 
     use_proxy = os.environ.get("AUTOFORGE_PROXY", "1") == "1"
     llm = OpenAICompatClient(

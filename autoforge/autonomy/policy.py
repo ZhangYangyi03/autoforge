@@ -31,6 +31,7 @@ class AutonomyPolicy:
     may_modify_routing: bool = True       # change how tools are retrieved
     may_retire_tools: bool = True         # remove tools it judges harmful
     may_promote_tools: bool = True        # grant trust without verification
+    may_design_topology: bool = True      # redesign its own multi-agent team
 
     # -- operational freedom ---------------------------------------------
     may_spawn_agents: bool = True         # create sub-agents
@@ -73,6 +74,7 @@ SUPERVISED = AutonomyPolicy(
     may_modify_forge_config=False,
     may_promote_tools=False,
     may_spawn_agents=False,
+    may_design_topology=False,
     may_run_arbitrary_code=False,
     may_access_network=False,
     may_install_packages=False,

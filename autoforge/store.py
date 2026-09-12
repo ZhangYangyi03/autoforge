@@ -57,6 +57,19 @@ _DDL = (
     "\n    depends_on TEXT NOT NULL,"
     "\n    PRIMARY KEY (tool, depends_on)"
     "\n);"
+    "\nCREATE TABLE IF NOT EXISTS baselines ("
+    "\n    tool TEXT NOT NULL PRIMARY KEY,"
+    "\n    frozen_at REAL NOT NULL,"
+    "\n    baseline TEXT NOT NULL DEFAULT '{}'"
+    "\n);"
+    "\nCREATE TABLE IF NOT EXISTS topologies ("
+    "\n    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "\n    timestamp REAL NOT NULL,"
+    "\n    task TEXT NOT NULL DEFAULT '',"
+    "\n    topology TEXT NOT NULL DEFAULT '{}',"
+    "\n    fitness REAL NOT NULL DEFAULT 0.0,"
+    "\n    trials INTEGER NOT NULL DEFAULT 0"
+    "\n);"
 )
 
 
@@ -287,6 +300,56 @@ class ToolStore:
             (tool,),
         ).fetchall()
         return [r["tool"] for r in rows]
+
+    # -- frozen baselines -------------------------------------------------
+    def save_baseline(self, baseline: Any) -> None:
+        """Persist a tool's frozen exam. Upsert: the row is the obligation set."""
+        self._conn.execute(
+            "INSERT INTO baselines (tool, frozen_at, baseline) VALUES (?,?,?)"
+            " ON CONFLICT(tool) DO UPDATE SET"
+            " frozen_at=excluded.frozen_at, baseline=excluded.baseline",
+            (baseline.tool, float(baseline.frozen_at), _j(baseline.to_dict())),
+        )
+        self._conn.commit()
+
+    def load_baseline(self, tool: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT baseline FROM baselines WHERE tool = ?", (tool,)
+        ).fetchone()
+        return _unjson(row["baseline"]) if row else None
+
+    # -- topologies -------------------------------------------------------
+    def save_topology(self, topology: Any, task: str = "") -> None:
+        """Persist a designed multi-agent topology (nodes, edges, rationale)."""
+        self._conn.execute(
+            "INSERT INTO topologies (timestamp, task, topology, fitness, trials)"
+            " VALUES (?,?,?,?,?)",
+            (
+                _now(),
+                (task or "")[:500],
+                _j(topology.to_dict()),
+                float(getattr(topology, "fitness", 0.0) or 0.0),
+                int(getattr(topology, "trials", 0) or 0),
+            ),
+        )
+        self._conn.commit()
+
+    def load_topologies(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Most recent topologies first, newest at index 0."""
+        rows = self._conn.execute(
+            "SELECT * FROM topologies ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "timestamp": r["timestamp"],
+                "task": r["task"],
+                "fitness": r["fitness"],
+                "trials": r["trials"],
+                "topology": _unjson(r["topology"]),
+            }
+            for r in rows
+        ]
 
     # -- events -----------------------------------------------------------
     def log_event(self, kind: str, payload: dict[str, Any]) -> None:

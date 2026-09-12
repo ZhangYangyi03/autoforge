@@ -36,8 +36,25 @@ from typing import Any, Callable
 from ..core.llm import LLMClient
 from ..core.message import Message
 from ..forge.generator import GeneratedTool, GENERATOR_SYSTEM, extract_json
-from ..forge.verifier import ToolVerifier, VerificationReport
+from ..forge.validity import FrozenBaseline, ValidityGate, ValidityReport
+from ..forge.verifier import CheckResult, ToolVerifier, VerificationReport
 from ..tools.spec import ToolSpec, ToolState, TriggerProbe
+
+# The check classes the battery is *supposed* to contain. A mutant that omits
+# one of these does not get a smaller denominator — a missing class counts as
+# failed. Without this, deleting your own guardrail probe raises your score.
+REQUIRED_CHECK_CLASSES: tuple[str, ...] = (
+    "execution",
+    "robustness",
+    "adversarial",
+    "trigger",
+    "negative",
+)
+
+# Probe-mass needed to earn the full evidence multiplier. Calibrated to the
+# fuzzer's default 50-probe surface so a 6-probe "exam" cannot match a real
+# one. Surviving MORE probes is better; the term is capped, not unbounded.
+_REFERENCE_PROBE_MASS = 20.0
 
 _MUTATE_SYSTEM = (
     "You are a tool breeder. You will be given a tool's current code and its\n"
@@ -96,11 +113,21 @@ class Mutant:
     report: VerificationReport | None = None
     fitness: float = 0.0
     duration_ms: float = 0.0
+    vector: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    validity: ValidityReport | None = None
+    rejected_by: str = ""            # which gate vetoed it, if any
+
+    @property
+    def admissible(self) -> bool:
+        return self.rejected_by == "" and (self.validity is None or self.validity.admissible)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "fitness": round(self.fitness, 3),
+            "vector": list(self.vector),
             "passed": self.report.passed if self.report else False,
+            "admissible": self.admissible,
+            "rejected_by": self.rejected_by,
             "root_cause": "",
         }
 
@@ -140,12 +167,19 @@ class EvolutionEngine:
         population_size: int = 3,
         parallel_verification: bool = True,
         mutate_model: str | None = None,
+        validity_gate: ValidityGate | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.llm = llm
         self.verifier = verifier
         self.population_size = population_size
         self.parallel_verification = parallel_verification
         self.mutate_model = mutate_model
+        # Default ON: a population that competes without an independent gate
+        # optimises its own exam. Opting out is a deliberate, visible choice.
+        self.validity_gate = validity_gate if validity_gate is not None else ValidityGate()
+        self.on_event = on_event
+        self.log: list[dict[str, Any]] = []
 
     # -- mutation ---------------------------------------------------------
     def analyse_failure(self, tool: ToolSpec, error: str) -> dict[str, str]:
@@ -170,8 +204,15 @@ class EvolutionEngine:
         failure_report: str,
         *,
         existing_names: str = "",
+        baseline: FrozenBaseline | None = None,
+        context: str = "internal",
     ) -> EvolutionResult:
-        """Spawn mutants, verify them, return the best one."""
+        """Spawn mutants, run the independent gate, then verify the survivors.
+
+        Order matters: the gate runs BEFORE verification, so a mutant that
+        deleted a guardrail is dropped without ever competing on fitness. The
+        veto is not a penalty it can out-earn.
+        """
         result = EvolutionResult(
             tool=tool.name,
             original_version=tool.hash,
@@ -203,30 +244,62 @@ class EvolutionEngine:
             result.kept_existing = True
             return result
 
-        # 2. Verify each in turn (or parallel)
+        # 2. Verify each in turn. Gate first: an inadmissible mutant never
+        #    reaches the scoreboard, so no fitness value can rescue it.
+        gate = self.validity_gate
         mutants: list[Mutant] = []
         for generated in candidates[:self.population_size]:
             started = time.perf_counter()
             spec = self._to_spec(generated)
+
+            verdict: ValidityReport | None = None
+            rejected = ""
+            if gate is not None:
+                verdict = gate.evaluate(spec, baseline=baseline, context=context)
+                if not verdict.admissible:
+                    rejected = verdict.violated[0].gate
+
+            if rejected:
+                mutants.append(Mutant(
+                    generated, None, 0.0,
+                    (time.perf_counter() - started) * 1000,
+                    (0.0, 0.0, 0.0), verdict, rejected,
+                ))
+                self._emit_veto(generated.name, rejected, verdict)
+                continue
+
             report = self.verifier.verify(spec)
             duration = (time.perf_counter() - started) * 1000
-            fitness = self._compute_fitness(report)
-            mutants.append(Mutant(generated, report, fitness, duration))
+            mutants.append(Mutant(
+                generated, report,
+                self._compute_fitness(report), duration,
+                self._fitness_vector(report), verdict,
+            ))
 
-        mutants.sort(key=lambda m: m.fitness, reverse=True)
+        admissible = [m for m in mutants if m.admissible]
         result.mutants = mutants
         result.rounds = 1
 
-        # 3. Select best
-        best = mutants[0]
-        result.best_mutant = best
-
-        if best.report and best.report.passed:
-            result.kept_existing = False
-        else:
+        # 3. Select among admissible mutants only, via the Pareto front.
+        if not admissible:
             result.kept_existing = True
+            return result
+
+        best = self._pareto_front(admissible)[0]
+        result.best_mutant = best
+        result.kept_existing = not (best.report and best.report.passed)
 
         return result
+
+    def _emit_veto(self, name: str, gate: str, verdict: ValidityReport | None) -> None:
+        entry = {
+            "t": time.time(), "kind": "mutant_vetoed",
+            "tool": name, "gate": gate,
+            "detail": verdict.violated[0].detail if verdict and verdict.violated else "",
+        }
+        self.log.append(entry)
+        if self.on_event:
+            self.on_event("mutant_vetoed", entry)
 
     # -- crossover --------------------------------------------------------
     def crossover(self, parent_a: ToolSpec, parent_b: ToolSpec) -> GeneratedTool:
@@ -268,17 +341,80 @@ class EvolutionEngine:
     # -- helpers ----------------------------------------------------------
     @staticmethod
     def _compute_fitness(report: VerificationReport) -> float:
-        """Score: passed checks + trigger count bonus."""
+        """Score a mutant WITHOUT letting it define its own exam.
+
+        The old formula was `passed / len(report.checks)`, which handed the
+        mutant two levers: drop a check it would have failed and the numerator
+        *and* the denominator both move in its favour. Replaced with:
+
+          cleared / len(REQUIRED_CHECK_CLASSES)     <- denominator is fixed
+
+        A missing check class is a failed check class. A mutant that omits its
+        negative probe scores as if the negative probe failed, which is the
+        truth. The probe-mass multiplier then rewards surviving more evidence
+        but is capped, so it cannot be farmed by inflating a trivial probe set.
+        """
         if not report.checks:
             return 0.0
-        passed = sum(1 for c in report.checks if c.passed)
-        total = len(report.checks)
-        base = passed / total if total else 0.0
-        # Bonus for clean trigger+negative
-        trigger_bonus = 0.2 if any(
-            c.name == "negative" and c.passed for c in report.checks
-        ) else 0.0
-        return base + trigger_bonus
+        by_class: dict[str, list[CheckResult]] = {}
+        for c in report.checks:
+            by_class.setdefault(c.name, []).append(c)
+
+        cleared = sum(
+            1 for cls in REQUIRED_CHECK_CLASSES
+            if (rs := by_class.get(cls)) and all(r.passed for r in rs)
+        )
+        base = cleared / len(REQUIRED_CHECK_CLASSES)
+        mass = min(EvolutionEngine._survived_mass(report), _REFERENCE_PROBE_MASS)
+        return base * (1.0 + 0.25 * mass / _REFERENCE_PROBE_MASS)
+
+    @staticmethod
+    def _survived_mass(report: VerificationReport) -> float:
+        """How much evidence actually survived. Reads counts, not class names."""
+        mass = 0.0
+        for c in report.checks:
+            if not c.passed:
+                continue
+            ev = getattr(c, "evidence", None)
+            n = ev.get("survived") if isinstance(ev, dict) else None
+            mass += float(n) if isinstance(n, (int, float)) else 1.0
+        return mass
+
+    @staticmethod
+    def _fitness_vector(report: VerificationReport) -> tuple[float, float, float]:
+        """(task, safety, robustness) — kept apart so no axis can buy another.
+
+        paste_5's point: a single scalar lets a mutant pay for safety with
+        capability. A vector means `high task, low safety` is dominated by any
+        mutant that is at least as good on all three.
+        """
+        by_class: dict[str, list[CheckResult]] = {}
+        for c in report.checks:
+            by_class.setdefault(c.name, []).append(c)
+
+        def rate(cls: str) -> float:
+            rs = by_class.get(cls) or []
+            return sum(1 for r in rs if r.passed) / len(rs) if rs else 0.0
+
+        task = (rate("execution") + rate("trigger")) / 2
+        safety = (rate("negative") + rate("adversarial")) / 2
+        robustness = rate("robustness")
+        return (round(task, 4), round(safety, 4), round(robustness, 4))
+
+    @staticmethod
+    def _dominates(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
+        """Pareto dominance: no worse anywhere, strictly better somewhere."""
+        return all(x >= y for x, y in zip(a, b)) and any(x > y for x, y in zip(a, b))
+
+    @classmethod
+    def _pareto_front(cls, mutants: list["Mutant"]) -> list["Mutant"]:
+        """The non-dominated survivors, best fitness first."""
+        front = [
+            m for m in mutants
+            if not any(cls._dominates(o.vector, m.vector)
+                       for o in mutants if o is not m)
+        ]
+        return sorted(front or mutants, key=lambda m: m.fitness, reverse=True)
 
     @staticmethod
     def _parse_population(text: str) -> list[GeneratedTool]:
@@ -336,4 +472,5 @@ __all__ = [
     "Mutant",
     "GeneratedTool",
     "ToolVerifier",
+    "REQUIRED_CHECK_CLASSES",
 ]

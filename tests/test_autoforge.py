@@ -344,7 +344,7 @@ class TestForgePipeline:
 
 
 # ======================================================================
-# verifier: the two orthogonal questions
+# verifier: does it run, does it survive, does it fire, does it stay quiet
 # ======================================================================
 class TestVerifier:
     def test_trigger_detects_a_never_firing_tool(self):

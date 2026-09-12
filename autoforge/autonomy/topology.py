@@ -150,12 +150,19 @@ class TopologyDesigner:
         self.generator_model = generator_model
 
     def design(self, task: str, current_topology: Topology | None = None,
-               failure_report: str = "") -> Topology:
-        """Design a topology from scratch or mutate an existing one."""
+               failure_report: str = "", max_agents: int = 4) -> Topology:
+        """Design a topology from scratch or mutate an existing one.
+
+        `max_agents` is a soft ceiling on team size, passed to the model as a
+        budget hint. The result is not truncated if the model overshoots —
+        clipping nodes would leave dangling edges and silently degrade the
+        whole design, which is worse than a slightly oversized team.
+        """
         from ..core.message import Message
         from ..forge.generator import extract_json
 
         prompt = f"Task: {task}\n"
+        prompt += f"\nTeam-size budget: at most {max_agents} agents.\n"
         if current_topology:
             prompt += f"\nCurrent topology:\n{json.dumps(current_topology.to_dict(), indent=2)}\n"
             prompt += f"\nCurrent fitness: {current_topology.fitness}\n"

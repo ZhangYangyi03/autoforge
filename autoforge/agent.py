@@ -17,6 +17,7 @@ The meta-tools it exposes to itself (all decided by policy):
   forge_tool      create a tool for a need
   evolve_tool     breed a better version of an existing tool
   spawn_agent     create a child to handle a subtask
+  design_team     design the multi-agent topology that fits the task
   amend_self      change its own prompt / config / routing weights
   set_autonomy    change its own permissions
   list_tools      inspect its own library
@@ -32,6 +33,7 @@ from typing import Any
 from .autonomy.policy import FULL_FREEDOM, AutonomyPolicy
 from .autonomy.selfmod import Amendment, SelfModifier
 from .autonomy.spawn import ShareMode, Spawner
+from .autonomy.topology import Topology, TopologyDesigner
 from .core.agent import Agent, AgentResult
 from .core.llm import LLMClient
 from .core.message import Message
@@ -40,6 +42,7 @@ from .forge.generator import TemplateGenerator
 from .forge.metacog import MetaCognition
 from .forge.pipeline import ForgeConfig, ForgePipeline
 from .forge.sandbox import Sandbox
+from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .route.router import BehaviourRouter
 from .store import ToolStore
@@ -53,6 +56,7 @@ You can:
 - forge_tool      — create a new tool when you hit a need you cannot serve
 - evolve_tool     — breed a better version of a tool that underperforms
 - spawn_agent     — create a child agent for a subtask
+- design_team     — redesign the multi-agent topology that fits the task
 - amend_self      — change your own prompt, forge config, or routing weights
 - set_autonomy    — change your own permissions
 - evaluate_tool   — run the full verification battery on any tool
@@ -63,6 +67,8 @@ You can:
 Principles:
 - Forge only when a need genuinely recurs; don't duplicate existing tools.
 - When a tool fails repeatedly, evolve it rather than retrying blindly.
+- When a task spans several specialities, design the team before doing the
+  work: a coordinator plus focused workers and a critic beats one loop.
 - Self-modifications need a rationale. Say WHY you are changing yourself.
 - You decide when the task is done. There is no hidden turn limit.
 - Prefer the simplest path that works.
@@ -83,6 +89,7 @@ class ForgeAgent:
     enable_meta_cognition: bool = False
     enable_evolution: bool = True
     trace: list[dict[str, Any]] = field(default_factory=list)
+    topology: Topology = field(default_factory=Topology.single_agent)
 
     def __post_init__(self) -> None:
         if self.generator is None:
@@ -120,6 +127,8 @@ class ForgeAgent:
             agent_factory=_default_agent_factory(self),
         )
 
+        self.topology_designer = TopologyDesigner(self.llm)
+
         self._register_meta_tools()
 
         if self.store is not None and self.policy.log_all_changes:
@@ -132,6 +141,7 @@ class ForgeAgent:
         self._tool_forge()
         self._tool_evolve()
         self._tool_spawn()
+        self._tool_design_team()
         self._tool_amend()
         self._tool_autonomy()
         self._tool_list()
@@ -141,6 +151,23 @@ class ForgeAgent:
     def _add(self, spec: ToolSpec) -> None:
         self.registry.register(spec)
         self.registry.promote(spec.name)
+
+    # ------------------------------------------------------------------
+    # frozen baselines — the exam the mutants do not write
+    # ------------------------------------------------------------------
+    def _baseline_for(self, spec: ToolSpec) -> FrozenBaseline:
+        """The tool's pinned obligation set, created on first evolution.
+
+        Loaded from the store so the ratchet survives process restarts; a
+        baseline that only lives in RAM resets to "whatever the current version
+        is", which is exactly the erosion this guards against.
+        """
+        stored = self.store.load_baseline(spec.name) if self.store else None
+        return FrozenBaseline.from_dict(stored) if stored else FrozenBaseline.capture(spec)
+
+    def _freeze_baseline(self, baseline: FrozenBaseline) -> None:
+        if self.store:
+            self.store.save_baseline(baseline)
 
     def _tool_forge(self) -> None:
         def forge_tool(need: str) -> str:
@@ -171,10 +198,17 @@ class ForgeAgent:
             if self.evolution is None:
                 return "Evolution is disabled."
             report = failure_report or spec.verification.get("failed_detail", "underperforming")
-            result = self.evolution.evolve(spec, report)
-            self._record("evolve", {"tool": name, "improved": result.improved})
+            baseline = self._baseline_for(spec)
+            result = self.evolution.evolve(spec, report, baseline=baseline, context="internal")
+            self._record("evolve", {
+                "tool": name, "improved": result.improved,
+                "vetoed": [m.generated.name for m in result.mutants if not m.admissible],
+            })
             if not result.improved:
-                return f"Evolved {name!r}: no mutant beat the original ({len(result.mutants)} tried)."
+                vetoed = sum(1 for m in result.mutants if not m.admissible)
+                tail = f" {vetoed} vetoed by the validity gate." if vetoed else ""
+                return (f"Evolved {name!r}: no admissible mutant beat the original "
+                        f"({len(result.mutants)} tried).{tail}")
             best = result.best_mutant.generated
             new_spec = ToolSpec(
                 name=best.name, description=best.description,
@@ -184,6 +218,9 @@ class ForgeAgent:
                 state=ToolState.ACTIVE,
             )
             self.registry.register(new_spec, replace=True)
+            # The baseline ratchets forward: probes the winner added become
+            # permanent obligations, and nothing already in it can be dropped.
+            self._freeze_baseline(baseline.extended_with(new_spec))
             if self.store:
                 self.store.archive_version(name, spec.code, spec.verification)
                 self.store.save_tool(new_spec)
@@ -219,6 +256,72 @@ class ForgeAgent:
                 "isolated": {"type": "boolean", "description": "give it its own tool library"},
             }, "required": ["task"]},
             fn=spawn_agent, source="builtin", tags=["meta"],
+        ))
+
+    def _tool_design_team(self) -> None:
+        def design_team(task: str, max_agents: int = 4, failure_report: str = "") -> str:
+            if not self.policy.may_design_topology:
+                return "Denied by autonomy policy: may_design_topology is off."
+            try:
+                budget = max(1, int(max_agents))
+            except (TypeError, ValueError):
+                return f"max_agents must be an integer, got {max_agents!r}"
+
+            previous = self.topology
+            # A pristine default (one bare node, no edges, no rationale) is not
+            # a real design — seed from scratch rather than "mutating" nothing.
+            seed = previous if previous.edges or previous.rationale else None
+
+            designed = self.topology_designer.design(
+                task,
+                current_topology=seed,
+                failure_report=failure_report,
+                max_agents=budget,
+            )
+
+            degraded = len(designed.nodes) == 1 and designed.nodes[0].id == "main"
+            self.topology = designed
+            self._record("design_team", {
+                "task": task[:200],
+                "agents": len(designed.nodes),
+                "edges": len(designed.edges),
+                "degraded": degraded,
+            })
+            if self.store:
+                self.store.log_event("topology", designed.to_dict())
+                self.store.save_topology(designed, task)
+
+            if degraded:
+                return ("Team design could not be parsed; kept a single-agent "
+                        "topology so the task can still run.")
+
+            roles = ", ".join(f"{n.id}:{n.role.value}" for n in designed.nodes)
+            overshoot = f" (over the {budget}-agent budget)" if len(designed.nodes) > budget else ""
+            channels = ", ".join(
+                f"{e.source}->{e.target}({e.channel})" for e in designed.edges
+            ) or "none"
+            out = [
+                f"Designed a {len(designed.nodes)}-agent team{overshoot}: {roles}",
+                f"  channels: {channels}",
+            ]
+            if designed.rationale:
+                out.append(f"  rationale: {designed.rationale[:200]}")
+            return "\n".join(out)
+
+        self._add(ToolSpec(
+            name="design_team",
+            description=(
+                "Design the multi-agent topology (roles, channels, team size) that "
+                "fits a task, instead of running everything in one loop."
+            ),
+            parameters={"type": "object", "properties": {
+                "task": {"type": "string", "description": "the task the team must handle"},
+                "max_agents": {"type": "integer",
+                               "description": "team-size budget (default 4)"},
+                "failure_report": {"type": "string",
+                                   "description": "why the current team failed (optional)"},
+            }, "required": ["task"]},
+            fn=design_team, source="builtin", tags=["meta"],
         ))
 
     def _tool_amend(self) -> None:
@@ -384,6 +487,7 @@ class ForgeAgent:
             "tools": self.registry.report(),
             "amendments": self.selfmod.log(),
             "spawns": self.spawner.summary(),
+            "topology": self.topology.to_dict(),
             "trace_len": len(self.trace),
         }
 
