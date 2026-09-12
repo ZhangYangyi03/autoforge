@@ -15,7 +15,16 @@ Design pillars
 Freedom is the default; verification lets you *trust* what the freedom produced.
 """
 
-__version__ = "0.2.0"
+# One source of truth: pyproject.toml. Hardcoding the version here meant the
+# package reported 0.2.0 while pyproject said 0.4.0 -- a number nobody would
+# notice was wrong until they quoted it. Read it from the installed metadata
+# instead, and fall back only when running from a source tree with no install.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("autoforge")
+except Exception:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
 
 from autoforge.agent import AUTONOMOUS_SYSTEM, ForgeAgent
 from autoforge.autonomy.policy import FULL_FREEDOM, SUPERVISED, AutonomyPolicy

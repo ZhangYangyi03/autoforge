@@ -9,10 +9,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 
 import pytest
 
 from autoforge import cli, configfile, setup_wizard
+
+
+def test_package_version_matches_pyproject():
+    """`autoforge.__version__` must equal the version in pyproject.toml.
+
+    It used to be hardcoded at 0.2.0 while pyproject said 0.4.0. A version
+    string is the one number everybody quotes and nobody re-derives, so it is
+    read from installed metadata now -- and pinned here so a future edit to one
+    file without the other fails loudly instead of shipping a wrong number.
+    """
+    import autoforge
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        text = fh.read()
+
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    assert m, "no version= line found in pyproject.toml"
+    declared = m.group(1)
+
+    assert autoforge.__version__ == declared, (
+        f"autoforge.__version__ is {autoforge.__version__!r} but pyproject.toml "
+        f"declares {declared!r}"
+    )
+    assert autoforge.__version__ != "0.0.0+unknown", (
+        "package metadata was unreadable; the version fallback is being reported"
+    )
 
 
 def _args(**kw) -> argparse.Namespace:
