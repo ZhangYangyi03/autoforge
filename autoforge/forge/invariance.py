@@ -135,12 +135,39 @@ class InvarianceResult:
         return self.checked / self.total if self.total else 1.0
 
     def summary(self) -> str:
+        return f"{self.name}: {self.detail()}"
+
+    def detail(self) -> str:
+        """The verdict without the tool name, for embedding in a wider report.
+
+        RobustnessResult already names the tool; repeating it here stutters in
+        the operator's terminal and spends tokens twice in the retry prompt.
+        """
         if self.passed and not self.violations:
-            return f"{self.name}: {self.checked}/{self.total} invariances hold"
-        return (
-            f"{self.name}: {len(self.violations)} invariance violation(s) "
+            return f"{self.checked}/{self.total} invariances hold"
+        head = (
+            f"{len(self.violations)} invariance violation(s) "
             f"({self.checked}/{self.total} checked)"
         )
+        return head + "".join(f". {self._describe(v)}" for v in self.violations[:4])
+
+    @staticmethod
+    def _describe(v: dict[str, Any]) -> str:
+        """One violated relation, with the evidence a retry prompt can act on.
+
+        The bare count ("2 invariance violation(s)") teaches the model nothing:
+        the next round reproduces the same code and burns the same round. Name
+        the relation and show the pair of calls that disagreed.
+        """
+        text = f"{v.get('relation', '?')}: {v.get('detail', '')}"
+        if "clean_input" in v:
+            text += (
+                f" [{v['clean_input']!r} -> {v['clean_output']!r}"
+                f" but {v['mutated_input']!r} -> {v['mutated_output']!r}]"
+            )
+        elif "first" in v:
+            text += f" [{v['first']!r} != {v['second']!r}]"
+        return text
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -22,7 +22,7 @@ from typing import Any
 from ..core.agent import Agent
 from ..core.llm import LLMClient
 from ..tools.registry import ToolRegistry
-from ..tools.spec import ToolSpec, ToolState
+from ..tools.spec import ToolSpec, ToolState, normalise_parameters
 from .adversary import AdversarialGate, AdversarialReport
 from .fuzzer import RobustnessResult, run_robustness_checks
 from .sandbox import Sandbox
@@ -138,9 +138,18 @@ class ToolVerifier:
         result = run_robustness_checks(
             spec, sandbox=self.sandbox, require_survival_rate=self.require_robustness_rate,
         )
+        # Name the probes that failed. Without this the retry only sees "0/19"
+        # and cannot learn which inputs broke it, so the feedback loop is inert.
+        detail = result.summary()
+        if result.failures:
+            shown = "; ".join(
+                f"{f.get('label', '?')} -> {str(f.get('error', ''))[:60]}"
+                for f in result.failures[:5]
+            )
+            detail += f". Failing probes: {shown}"
         return CheckResult(
             "robustness", result.passed,
-            result.summary(),
+            detail,
             {"survival_rate": round(result.survival_rate, 3),
              "survived": result.survived, "total": result.total,
              "invariance": (result.invariance.to_dict()
@@ -200,6 +209,13 @@ class ToolVerifier:
 
     # -- battery --------------------------------------------------------
     def verify(self, spec: ToolSpec, sample_args: dict[str, Any] | None = None) -> VerificationReport:
+        # Settle the parameter shape before any check reads it. The generator
+        # and the store already normalise at their trust boundaries; a spec
+        # built by hand still reaches here raw, and every check below reads
+        # `schema.get("type", ...)` per property. The judge establishes its own
+        # preconditions rather than dying three frames deep.
+        spec.parameters = normalise_parameters(spec.parameters)
+
         checks: list[CheckResult] = []
 
         if self.run_execution_check:

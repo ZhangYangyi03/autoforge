@@ -175,7 +175,7 @@ class RobustnessResult:
     def summary(self) -> str:
         base = f"{self.name}: {self.survived}/{self.total} robustness probes survived"
         if self.invariance is not None:
-            base += f"; {self.invariance.summary()}"
+            base += f"; {self.invariance.detail()}"
         return base
 
     def to_dict(self) -> dict[str, Any]:

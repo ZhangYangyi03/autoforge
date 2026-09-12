@@ -47,6 +47,16 @@ class LLMClient:
 class OpenAICompatClient(LLMClient):
     """Any OpenAI-compatible chat completions endpoint."""
 
+    #: Sent when the caller does not pass `max_tokens` of its own.
+    #:
+    #: Not cosmetic: aiping.cn returns 503 for a completion body with no
+    #: `max_tokens` while the identical body carrying a modest cap returns 200
+    #: (12 requests, cleanly separated -- see probes/probe_gateway_max_tokens.py).
+    #: Omitting the field is therefore a provider-specific landmine, and the
+    #: safe place to defuse it is here, once, rather than at every call site.
+    #: Pass `default_max_tokens=None` for providers that reject the field.
+    DEFAULT_MAX_TOKENS: int | None = 2048
+
     def __init__(
         self,
         model: str,
@@ -56,6 +66,7 @@ class OpenAICompatClient(LLMClient):
         timeout: float = 120.0,
         proxies: dict[str, str] | None = None,
         default_temperature: float = 0.0,
+        default_max_tokens: int | None = DEFAULT_MAX_TOKENS,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.model = model
@@ -64,6 +75,7 @@ class OpenAICompatClient(LLMClient):
         self.timeout = timeout
         self.proxies = proxies
         self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
         self.extra_headers = extra_headers or {}
         self.name = f"openai-compat:{model}"
 
@@ -81,6 +93,8 @@ class OpenAICompatClient(LLMClient):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = kwargs.pop("tool_choice", "auto")
+        if self.default_max_tokens is not None and "max_tokens" not in kwargs:
+            payload["max_tokens"] = self.default_max_tokens
         payload.update(kwargs)
 
         headers = {

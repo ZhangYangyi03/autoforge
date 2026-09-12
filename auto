@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+# autoforge — one-command launcher.
+#
+# Straight from a fresh clone, no install step:
+#
+#     git clone https://github.com/<you>/autoforge && cd autoforge && ./auto
+#
+# Want `auto` on your PATH everywhere instead? Then:
+#
+#     pip install -e .
+#
+# Everything after the script name is passed straight through:
+#     ./auto --help
+#     ./auto forge "normalise ISBNs" --out isbn.json
+set -e
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$here"
+
+py=""
+for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1; then py=$c; break; fi
+done
+if [ -z "$py" ]; then
+    echo "auto: no python3 on PATH - install Python 3.10+ first" >&2
+    exit 1
+fi
+
+if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo "auto: need Python 3.10+, got $("$py" -V 2>&1)" >&2
+    exit 1
+fi
+
+# requests is the single runtime dependency. Fetch it once, quietly, so a fresh
+# clone just works; afterwards this check costs ~20ms and is a no-op.
+if ! "$py" -c 'import requests' >/dev/null 2>&1; then
+    echo "auto: installing the one dependency (requests)..." >&2
+    "$py" -m pip install --quiet requests
+fi
+
+exec "$py" -m autoforge.cli "$@"

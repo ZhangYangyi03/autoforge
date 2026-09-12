@@ -24,13 +24,111 @@ ledger        degraded?       quarantine / rehab / retire
 
 ## Quick start
 
+Straight from a fresh clone — no install step, one command:
+
 ```bash
-cd 项目_开发/autoforge
-python examples/demo_offline.py     # full framework, zero API keys
-python -m pytest tests/ -o addopts= -q   # 158 tests
+git clone https://github.com/<you>/autoforge && cd autoforge
+./auto                              # macOS / Linux / WSL / Git Bash
+auto                                # Windows cmd     (PowerShell: .\auto)
 ```
 
-Use a real model:
+The launcher checks your Python (3.10+), fetches `requests` once if it is
+missing, and drops you into the REPL. Nothing else to set up. `auto.cmd` ships
+alongside it so Windows works without touching your PATH.
+
+Prefer `auto` on your PATH everywhere? Install the console script instead:
+
+```bash
+pip install -e .
+auto                                # now a real entry point, any directory
+```
+
+### Configure once, then forget about it
+
+```bash
+auto setup
+```
+
+One wizard: pick a provider, paste a key, confirm the model. It writes
+`~/.autoforge/config.json`, tests the endpoint with a single short request, and
+from then on `auto` just runs — in this terminal and in every new one.
+
+```
+  provider:
+   * 1) aiping.cn gateway (hosted, needs an API key)
+     2) Ollama on this machine (local, no key)
+     3) Something else (any OpenAI-compatible endpoint)
+```
+
+Every prompt shows the current value and takes it on a bare Enter, so re-running
+the wizard is how you change one field without retyping the rest. To see what is
+actually in effect, and which layer supplied each value:
+
+```bash
+auto config
+```
+
+```
+  base_url   https://aiping.cn/api/v1  config C:\Users\you\.autoforge\config.json
+  model      DeepSeek-V4.1-Flash       config C:\Users\you\.autoforge\config.json
+  api_key    QC-5...e262 (len 68)      config C:\Users\you\.autoforge\config.json
+  max_tokens 3000                      config C:\Users\you\.autoforge\config.json
+  proxy      True                      config C:\Users\you\.autoforge\config.json
+```
+
+Resolution order is **flag > environment > config file > default**, so a one-off
+override never means re-running the wizard:
+
+```bash
+auto --model other-model                    # this invocation only
+AUTOFORGE_MODEL=other-model auto            # this shell only
+auto --base-url http://127.0.0.1:11434/v1 --model qwen2.5:7b --no-proxy
+```
+
+Why bother with a file when environment variables exist: a variable exported
+*after* a terminal was opened is invisible to that terminal — Windows and POSIX
+alike inherit the environment at process start. That turns configuration into
+"it worked a minute ago, in the other window." A file has no such lag, which is
+why `auto setup` is the supported path and the env vars are the escape hatch.
+
+`auto setup` is also safe to run with no terminal: without a tty it takes
+whatever the flags and environment already say, saves them, and exits instead of
+blocking on a prompt.
+
+`auto` on its own drops you into a REPL: type a recurring need in plain language
+and the agent decides whether to forge, verify and keep a tool for it. Forged
+tools persist for the rest of the session.
+
+```bash
+auto --help                         # all flags
+auto forge "<need>" --out t.json    # forge one tool, one shot, then exit
+auto list                           # inspect artifacts written by --out
+auto list autoforge_tools/t.json    # dump one artifact
+```
+
+Point it at a local model (no key, no network) — either through `auto setup`
+above, or per-invocation:
+
+```bash
+# local, CPU-friendly: drops the LLM-driven checks
+AUTOFORGE_BASE_URL=http://127.0.0.1:11434/v1 AUTOFORGE_MODEL=qwen2.5:7b \
+  AUTOFORGE_FAST=1 auto
+```
+
+Local endpoints never use the socks proxy and never need a key, so those two
+questions are skipped automatically.
+
+Inside the REPL: `/help`, `/tools` (library + health), `/report` (policy and
+self-amendments), `/trace` (the decision log), `/reset`, `/quit`.
+
+Offline demo, zero API keys:
+
+```bash
+python examples/demo_offline.py
+python -m pytest tests/ -o addopts= -q
+```
+
+Use the library directly:
 
 ```python
 import os

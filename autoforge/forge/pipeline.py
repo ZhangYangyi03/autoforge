@@ -20,6 +20,7 @@ one that fired well and quietly rotted. autoforge closes both loops.
 from __future__ import annotations
 
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -117,7 +118,7 @@ class ForgePipeline:
             started = time.perf_counter()
             attempt = ForgeAttempt(need, round_no)
             try:
-                prompt_need = need if not feedback else f"{need}\n\nPrevious attempt failed:\n{feedback}"
+                prompt_need = need if not feedback else self._repair_prompt(need, feedback)
                 generated = self.generator.generate(prompt_need, context or existing)
                 attempt.generated = generated
                 spec = self._to_spec(generated)
@@ -138,6 +139,13 @@ class ForgePipeline:
                     feedback = self._feedback(report)
             except Exception as exc:  # noqa: BLE001
                 attempt.error = f"{type(exc).__name__}: {exc}"
+                # A framework whose whole point is judging generated code cannot
+                # afford to swallow its own tracebacks. Keep them in the log.
+                self._emit("forge_error", {
+                    "round": round_no,
+                    "error": attempt.error,
+                    "traceback": traceback.format_exc(),
+                })
                 feedback = attempt.error
 
             attempt.duration_ms = (time.perf_counter() - started) * 1000
@@ -149,9 +157,6 @@ class ForgePipeline:
             })
             if attempt.accepted:
                 break
-
-            if round_no < self.config.max_rounds and feedback:
-                need = self._repair_prompt(need, feedback)
 
         self._emit("forge_done", {"need": need, "ok": result.ok, "rounds": result.rounds})
         return result

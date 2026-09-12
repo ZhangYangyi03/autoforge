@@ -24,7 +24,7 @@ from typing import Any, Callable
 from ..core.llm import LLMClient
 from ..core.message import Message
 from .sandbox import Sandbox
-from ..tools.spec import ToolSpec, ToolState, TriggerProbe
+from ..tools.spec import ToolSpec, ToolState, TriggerProbe, normalise_parameters
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _BRACE_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -46,8 +46,109 @@ class GeneratedTool:
     def __post_init__(self) -> None:
         if not self.entry:
             self.entry = self.name
-        if not self.parameters:
-            self.parameters = {"type": "object", "properties": {}}
+        self.parameters = normalise_parameters(self.parameters)
+
+
+# JSON permits only these escapes after a backslash. Small models frequently
+# emit ``\'`` (borrowed from Python/shell) which is a hard parse error.
+_VALID_ESCAPE_RE = re.compile(r"\\(?![\\/\"bfnrtu])")
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _fix_unescaped_quotes(text: str) -> str:
+    """Escape double quotes that appear *inside* a JSON string value.
+
+    Observed defect: the model embeds Python source in the ``code`` field and
+    writes ``raise ValueError("Invalid check digit")`` with the inner quotes
+    unescaped. The JSON string then terminates early and the parser dies with
+    "Expecting ',' delimiter".
+
+    Heuristic: while inside a string, a ``"`` that is *not* followed (after
+    optional whitespace) by ``, : } ]`` or end-of-input is content, not a
+    terminator -- so escape it.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        # -- inside a string -------------------------------------------
+        if ch == "\\":                       # already-escaped pair: keep as-is
+            out.append(ch)
+            if i + 1 < n:
+                out.append(text[i + 1])
+            i += 2
+            continue
+
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            nxt = text[j] if j < n else ""
+            if nxt in (":", ",", "}", "]", ""):
+                out.append('"')              # genuine terminator
+                in_string = False
+            else:
+                out.append('\\"')            # stray quote inside content
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_variants(text: str) -> list[str]:
+    """Progressively repaired variants of near-miss JSON, cheapest first."""
+    variants = [text]
+
+    # 1. Escape stray double quotes inside string values (the ``code`` field
+    #    blowing up on Python string literals).
+    quoted = _fix_unescaped_quotes(text)
+    if quoted != text:
+        variants.append(quoted)
+
+    # 2. Drop invalid escape sequences (``\'`` -> ``'``). JSON only permits
+    #    " \ / b f n r t u after a backslash; models borrow Python's ``\'``.
+    for variant in list(variants):
+        unescaped = _VALID_ESCAPE_RE.sub("", variant)
+        if unescaped != variant:
+            variants.append(unescaped)
+
+    # 3. Remove trailing commas before a closing brace/bracket.
+    for variant in list(variants):
+        squeezed = _TRAILING_COMMA_RE.sub(r"\1", variant)
+        if squeezed != variant:
+            variants.append(squeezed)
+
+    return variants
+
+
+def _loads_repairing(text: str) -> Any | None:
+    """Parse JSON, tolerating the defects small models actually produce.
+
+    Tries each repair variant twice: once strictly, once with ``strict=False``
+    so literal control characters (raw newlines inside a ``code`` string) are
+    accepted instead of aborting the parse.
+    """
+    for variant in _repair_variants(text):
+        for strict in (True, False):
+            try:
+                data = json.loads(variant, strict=strict)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, (dict, list)):
+                return data
+    return None
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
@@ -60,19 +161,17 @@ def extract_json_any(text: str) -> Any | None:
     """Like `extract_json`, but also returns JSON arrays.
 
     Strategy: try the raw text first (fast path when the LLM output is already
-    clean JSON). Fall back to fence extraction and regex heuristics only when
-    the raw text fails to parse.
+    clean JSON). Fall back to fence extraction, brace/bracket extraction, then
+    *repair* of near-miss JSON. Small models routinely emit envelopes that are
+    structurally right but fail strict parsing -- see `_loads_repairing`.
     """
     if not text:
         return None
 
     # Fast path: the output IS JSON already
-    try:
-        data = json.loads(text)
-        if isinstance(data, (dict, list)):
-            return data
-    except json.JSONDecodeError:
-        pass
+    data = _loads_repairing(text)
+    if data is not None:
+        return data
 
     # Heuristic: extract content from ``` fences (most reliable)
     candidates: list[str] = []
@@ -98,12 +197,9 @@ def extract_json_any(text: str) -> Any | None:
         cand = cand.strip()
         if not cand:
             continue
-        try:
-            data = json.loads(cand)
-            if isinstance(data, (dict, list)):
-                return data
-        except json.JSONDecodeError:
-            continue
+        data = _loads_repairing(cand)
+        if data is not None:
+            return data
     return None
 
 
@@ -132,10 +228,32 @@ Return STRICT JSON only, no prose, with this shape:
 Rules:
 - The function must be pure Python stdlib unless the description says otherwise.
 - No imports outside the standard library. No file writes unless effect_signature says so.
-- Raise ValueError with a clear message on bad input; never silently return None.
+- TOTALITY — the verifier enforces this and rejects the tool if you break it:
+  never raise, and never return None. On input you cannot process, return a
+  short string starting "INVALID:" with the reason, e.g.
+  "INVALID: not a 10- or 13-digit ISBN". On success return the result itself.
+  The verifier fuzzes every parameter with empty strings, whitespace, very long
+  strings, emoji, digits-only, and None-ish tokens ("NULL", "None", "nan"). Any
+  raise fails the tool, so guard every parse and index with a length or
+  validity check first.
+- The invalid result must DIFFER from any valid result, so a wrong-but-total
+  function that returns one constant everywhere is also rejected.
+- Be whitespace-insensitive where whitespace is not content: strip surrounding
+  whitespace before parsing, so "  x  " and "x" behave identically.
+- LABELS ARE DECORATION. If the argument is a labelled identifier, a leading
+  label is noise, not value: "x", "ISBN x", "ISBN: x", "ISBN-13: x" and the URL
+  form must all normalise identically. Strip any such label before parsing. The
+  verifier checks exactly this and rejects a tool that only handles the form you
+  happened to think of.
+- Raise ValueError belongs nowhere; return "INVALID: ..." instead.
+- SELF-CONTAINED means every name your entry function calls must be defined in
+  the same `code` string. Never call a helper you did not write out — inline it
+  into the entry function instead. An undefined name is an execution failure.
+- Be terse. No docstrings, no comments, no validation beyond what totality
+  needs. Short code is less likely to be cut off mid-JSON.
 - Include 2-4 probes. At least one probe must have a negative_query that is
   superficially related but must NOT trigger this tool (guards over-triggering).
-- Keep `code` under 60 lines.
+- Keep `code` under 40 lines.
 """
 
 
@@ -144,6 +262,11 @@ class LLMToolGenerator:
     llm: LLMClient
     system_prompt: str = GENERATOR_SYSTEM
     model: str | None = None
+    # A tool envelope is ~40 lines of code plus metadata. Leaving the cap unset
+    # fails two different ways: a local runtime truncates mid-JSON, and the
+    # AIPING gateway routes the un-capped request to a provider pool that is
+    # currently down (HTTP 503 "暂无可用服务商"). An explicit budget fixes both.
+    max_tokens: int = 3000
 
     def generate(self, need: str, context: str = "") -> GeneratedTool:
         prompt = f"Recurring need:\n{need}\n"
@@ -153,29 +276,81 @@ class LLMToolGenerator:
         resp = self.llm.chat(
             [Message.system(self.system_prompt), Message.user(prompt)],
             tools=None,
+            max_tokens=self.max_tokens,
         )
         data = extract_json(resp.content)
         if data is None:
-            raise ValueError(f"generator returned no parseable JSON: {resp.content[:400]!r}")
-        probes = [
-            TriggerProbe(
-                query=p.get("query", ""),
-                expect=p.get("expect", "call"),
-                negative_query=p.get("negative_query"),
+            choices = resp.raw.get("choices") or [{}]
+            finish = choices[0].get("finish_reason")
+            # This message is echoed back to the model as retry feedback, so the
+            # advice is addressed to the model, not to the operator.
+            hint = (
+                " -- the answer was cut off mid-JSON; emit a shorter, denser"
+                " function with every helper defined inline"
+                if finish == "length" else ""
             )
-            for p in data.get("probes", [])
-            if p.get("query")
-        ]
+            raise ValueError(
+                f"generator returned no parseable JSON "
+                f"(finish_reason={finish!r}, {len(resp.content)} chars){hint}: "
+                f"{resp.content[:400]!r}"
+            )
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"generator returned JSON of type {type(data).__name__}, "
+                f"expected an object: {str(data)[:200]!r}"
+            )
+        # Models sometimes emit probes as bare strings ({"probes": ["..."]}) or
+        # as objects with different key names. Coerce defensively instead of
+        # crashing a whole round on a cosmetic schema slip.
+        raw_probes = data.get("probes") or []
+        if not isinstance(raw_probes, list):
+            raw_probes = [raw_probes]
+        probes: list[TriggerProbe] = []
+        for p in raw_probes:
+            if isinstance(p, str):
+                probes.append(TriggerProbe(query=p.strip(), expect="call"))
+                continue
+            if not isinstance(p, dict):
+                continue
+            query = p.get("query") or p.get("q") or p.get("user_query") or ""
+            if not isinstance(query, str) or not query.strip():
+                continue
+            neg = p.get("negative_query") or p.get("negative") or p.get("should_not")
+            probes.append(TriggerProbe(
+                query=query.strip(),
+                expect=p.get("expect", "call"),
+                negative_query=neg if isinstance(neg, str) else None,
+            ))
+        def _s(key: str, default: str = "") -> str:
+            """Coerce a possibly-non-string field to a stripped string."""
+            v = data.get(key, default)
+            return v.strip() if isinstance(v, str) else (default if v is None else str(v))
+
+        name = _s("name")
+        if not name:
+            raise ValueError(f"generator omitted tool name: {str(data)[:200]!r}")
+        code = _s("code")
+        if not code:
+            raise ValueError(f"generator omitted code for {name!r}")
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        params = data.get("parameters")
+        if not isinstance(params, dict):
+            params = {}
+        # Shape normalisation (bare type names, properties-as-string) is owned by
+        # GeneratedTool.__post_init__ -- one choke point, every caller.
+
         return GeneratedTool(
-            name=data.get("name", "").strip(),
-            description=data.get("description", "").strip(),
-            code=data.get("code", "").strip(),
-            parameters=data.get("parameters") or {"type": "object", "properties": {}},
-            entry=data.get("entry") or data.get("name", ""),
+            name=name,
+            description=_s("description"),
+            code=code,
+            parameters=params,
+            entry=_s("entry") or name,
             probes=probes,
-            effect_signature=data.get("effect_signature", "pure"),
-            tags=list(data.get("tags") or []),
-            rationale=data.get("rationale", ""),
+            effect_signature=_s("effect_signature", "pure") or "pure",
+            tags=[str(t) for t in tags] if isinstance(tags, list) else [],
+            rationale=_s("rationale"),
         )
 
 

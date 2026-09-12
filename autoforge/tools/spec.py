@@ -97,6 +97,54 @@ class ToolStats:
         return d
 
 
+_JSON_TYPES = frozenset(
+    {"string", "number", "integer", "boolean", "object", "array", "null"}
+)
+
+
+def normalise_parameters(params: Any) -> dict[str, Any]:
+    """Force a JSON-Schema object whose ``properties`` values are schemas.
+
+    Two habits — one from models, one from hand-written JSON — break every
+    downstream consumer with ``AttributeError: 'str' object has no attribute
+    'get'``, raised three modules away from the cause::
+
+        {"properties": {"isbn": "string"}}    # bare type name, not a schema
+        {"properties": "isbn: string"}        # properties as free text
+
+    The verifier, the fuzzer and the adversarial gate each read
+    ``schema.get("type", ...)`` per property, so the shape is settled once, at
+    the trust boundary where untrusted parameters enter (LLM output, stored
+    JSON) — not in ``ToolSpec`` itself, whose many construction sites and
+    hash-dependent lifecycle want exactly what the caller passed.
+    """
+    if not isinstance(params, dict) or not params:
+        return {"type": "object", "properties": {}}
+
+    out = dict(params)
+    out.setdefault("type", "object")
+
+    props = out.get("properties")
+    props = props if isinstance(props, dict) else {}
+    fixed: dict[str, Any] = {}
+    for name, schema in props.items():
+        if isinstance(schema, str):
+            token = schema.strip().lower()
+            schema = {"type": token if token in _JSON_TYPES else "string"}
+        elif not isinstance(schema, dict):
+            schema = {"type": "string"}
+        fixed[str(name)] = schema
+    out["properties"] = fixed
+
+    required = out.get("required")
+    if required is not None:
+        out["required"] = (
+            [str(r) for r in required] if isinstance(required, list)
+            else [str(required)] if isinstance(required, str) else []
+        )
+    return out
+
+
 @dataclass
 class ToolSpec:
     """A self-made tool, contract and all."""

@@ -1,0 +1,8 @@
+# Line endings for the files that actually care.
+#
+# core.autocrlf=true (this repo's default on Windows) would otherwise hand the
+# POSIX launcher CRLF endings, and `#!/usr/bin/env sh\r` is not a shebang on
+# macOS or Linux -- it is "bad interpreter: No such file or directory".
+auto      text eol=lf
+auto.cmd  text eol=crlf
+*.sh      text eol=lf

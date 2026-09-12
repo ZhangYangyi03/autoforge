@@ -216,6 +216,52 @@ class TestVerifierIntegration:
         assert not any(c.name == "robustness" and c.passed for c in report.checks)
 
 
+# ======================================================================
+# the retry prompt must be actionable
+# ======================================================================
+class TestViolationReport:
+    """A failure report the model cannot act on wastes the retry.
+
+    Live with qwen2.5:7b: round 1 and round 2 produced identical failures
+    because the feedback said only "2 invariance violation(s)" -- the count,
+    never which relation or which call disagreed. Naming them is what makes
+    the second round differ from the first.
+    """
+
+    def _prefix_bug_summary(self) -> str:
+        return run_robustness_checks(spec(isbn_with_prefix_bug)).summary()
+
+    def test_summary_names_the_violated_relation(self):
+        text = self._prefix_bug_summary()
+        assert "normalise:isbn_prefix" in text
+        assert "normalise:surrounding_whitespace" in text
+
+    def test_summary_shows_the_disagreeing_calls(self):
+        """The evidence, not just the verdict: which input flipped the output."""
+        text = self._prefix_bug_summary()
+        assert "ISBN " in text, "the mutated input is not shown"
+        assert "->" in text, "clean -> mutated outputs are not shown"
+
+    def test_summary_says_why_it_matters(self):
+        assert "matching on decoration, not on the value" in self._prefix_bug_summary()
+
+    def test_passing_summary_stays_terse(self):
+        """Do not pad a passing report with evidence nobody needs."""
+        text = run_robustness_checks(spec(isbn_correct)).summary()
+        assert "violation" not in text
+
+    def test_deterministic_violation_shows_both_values(self):
+        counter = {"n": 0}
+
+        def flaky(isbn: str = "") -> bool:
+            counter["n"] += 1
+            return counter["n"] % 2 == 0
+
+        text = check_invariances(spec(flaky)).summary()
+        assert "deterministic" in text
+        assert "!=" in text
+
+
 @pytest.mark.parametrize("tool_name", ["isbn", "isbn13", "isbn_13", "isbn10"])
 def test_token_name_variants_all_fire(tool_name):
     """Common spellings of the param name all opt into token semantics."""

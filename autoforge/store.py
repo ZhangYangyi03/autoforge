@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .tools.spec import ToolSpec, ToolState, ToolStats, TriggerProbe
+from .tools.spec import ToolSpec, ToolState, ToolStats, TriggerProbe, normalise_parameters
 
 _DEFAULT_DB = "autoforge.db"
 
@@ -155,7 +155,7 @@ class ToolRecord:
         spec = ToolSpec(
             name=self.name,
             description=self.description,
-            parameters=self.parameters,
+            parameters=normalise_parameters(self.parameters),
             fn=fn or (lambda **_: ""),
             runner=runner,
             code=self.code,

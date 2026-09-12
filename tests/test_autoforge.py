@@ -336,6 +336,67 @@ class TestForgePipeline:
         res = pipeline.forge("I need to reverse text")
         assert res.ok and res.rounds == 2
 
+    def test_retry_feedback_is_not_duplicated(self):
+        """The repair prompt must carry the failure once, not twice.
+
+        Round 2 used to get the feedback twice: once spliced into the need by
+        _repair_prompt, once prefixed by forge() itself. On a token-starved
+        local model that doubling is not free -- it is roughly half the budget
+        spent saying the same thing twice.
+        """
+        prompts: list[str] = []
+        good = sample_generated()
+        broken = sample_generated()
+        broken.code = "def reverse_text(text=''):\n    raise RuntimeError('boom')\n"
+
+        class RecordingGen:
+            def generate(self, need, context=""):
+                prompts.append(need)
+                return broken if len(prompts) == 1 else good
+
+        llm = MockLLMClient(handler=reverse_model)
+        sandbox = Sandbox(timeout=8)
+        pipeline = ForgePipeline(
+            RecordingGen(), ToolVerifier(llm, sandbox=sandbox), ToolRegistry(),
+            sandbox=sandbox, config=ForgeConfig(promote_on_pass=True, max_rounds=3),
+        )
+        res = pipeline.forge("I need to reverse text")
+        assert res.ok and res.rounds == 2
+
+        assert len(prompts) == 2
+        retry = prompts[1]
+        assert retry.count("Failed checks:") == 1, "failure detail sent twice"
+        assert "Previous attempt failed" not in retry, "two competing banners"
+        assert "Fix the root cause" in retry, "the model is told what to do"
+        assert prompts[0].count("Failed checks:") == 0, "round 1 gets no feedback"
+
+    def test_exception_is_logged_with_a_traceback(self):
+        """A swallowed traceback is a debugging dead end; keep it in the log.
+
+        The generic except used to reduce every internal failure to
+        "TypeName: message", which is unactionable when the fault is in the
+        pipeline rather than in the generated tool.
+        """
+        class BoomGen:
+            def generate(self, need, context=""):
+                raise RuntimeError("kaboom")
+
+        llm = MockLLMClient(handler=reverse_model)
+        sandbox = Sandbox(timeout=8)
+        pipeline = ForgePipeline(
+            BoomGen(), ToolVerifier(llm, sandbox=sandbox), ToolRegistry(),
+            sandbox=sandbox, config=ForgeConfig(promote_on_pass=True, max_rounds=1),
+        )
+        res = pipeline.forge("I need to reverse text")
+
+        assert not res.ok
+        assert res.attempts[0].error == "RuntimeError: kaboom"
+        errs = [e for e in pipeline.log if e["kind"] == "forge_error"]
+        assert len(errs) == 1
+        tb = errs[0]["traceback"]
+        assert "Traceback (most recent call last)" in tb
+        assert "kaboom" in tb
+
     def test_event_log_records_attempts(self):
         pipeline, _ = self._pipeline()
         pipeline.forge("I need to reverse text")
@@ -388,6 +449,26 @@ class TestVerifier:
         report = v.verify(spec)
         assert not report.passed
         assert "KeyError" in report.checks[0].detail
+
+    def test_bare_type_name_in_parameters_no_longer_crashes_the_battery(self):
+        """The live defect, end to end.
+
+        qwen2.5:7b emitted {"properties": {"isbn": "string"}} -- a bare type
+        name where a schema belongs. With no explicit sample_args the verifier
+        fell into _infer_args, which did schema.get("type") on a str and raised
+        AttributeError three frames away from the cause, costing a whole round.
+        """
+        v = ToolVerifier(MockLLMClient(), sandbox=Sandbox(timeout=8),
+                         run_trigger_check=False, run_negative_check=False)
+        spec = ToolSpec(
+            name="normalize_isbn", description="x",
+            parameters={"type": "object", "properties": {"isbn": "string"}},
+            code="def normalize_isbn(isbn=''):\n    return isbn\n", fn=lambda **_: "",
+        )
+        report = v.verify(spec)          # sample_args=None -> _infer_args runs
+
+        assert any(c.name == "execution" and c.passed for c in report.checks)
+        assert spec.parameters["properties"]["isbn"] == {"type": "string"}
 
 
 # ======================================================================

@@ -31,15 +31,22 @@ def rule(t: str) -> None:
 
 
 def main() -> int:
-    key = os.environ.get("AIPING_API_KEY")
+    # Provider-agnostic: defaults reproduce the historical AIPING run, but any
+    # OpenAI-compatible endpoint works. A local Ollama needs no key and no
+    # proxy, which is what makes this demo reproducible after a gateway flap.
+    base = os.environ.get("AUTOFORGE_BASE_URL", "https://aiping.cn/api/v1")
+    model = os.environ.get("AUTOFORGE_MODEL", "DeepSeek-V4.1-Flash")
+    local = any(h in base for h in ("127.0.0.1", "localhost"))
+
+    key = os.environ.get("AUTOFORGE_API_KEY") or os.environ.get("AIPING_API_KEY") or ""
     if not key:
-        print("AIPING_API_KEY not set")
-        return 1
+        if not local:
+            print("AIPING_API_KEY not set (or pass AUTOFORGE_BASE_URL/AUTOFORGE_MODEL)")
+            return 1
+        key = "ollama"
 
-    base = "https://aiping.cn/api/v1"
-    model = "DeepSeek-V4.1-Flash"
-
-    use_proxy = os.environ.get("AUTOFORGE_PROXY", "1") == "1"
+    default_proxy = "0" if local else "1"
+    use_proxy = os.environ.get("AUTOFORGE_PROXY", default_proxy) == "1"
     llm = OpenAICompatClient(
         model=model,
         base_url=base,
