@@ -76,7 +76,13 @@ _EFFECT_PATTERNS: tuple[EffectPattern, ...] = (
     ),
     EffectPattern(
         "dynamic_code_execution",
-        re.compile(r"\b(?:eval|exec|compile|__import__)\s*\("),
+        # Builtins are reached as bare names, never through attribute access,
+        # so require that the name is not preceded by a word char or a dot.
+        # Plain \b treated `re.compile(...)` — a regex compile — as dynamic
+        # code execution, which made any regex-using tool permanently unable
+        # to clear its own scope gate (its declared `pure` scope could never
+        # permit the phantom label).
+        re.compile(r"(?<![\w.])(?:eval|exec|compile|__import__)\s*\("),
     ),
     EffectPattern(
         "network_egress",

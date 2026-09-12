@@ -184,6 +184,51 @@ class TestIndependentValidityGate:
             better, baseline=FrozenBaseline.capture(parent), context="public")
         assert verdict.admissible, verdict.summary()
 
+    def test_regex_compile_is_not_dynamic_code_execution(self):
+        """A regex compile was read as a code-exec escape hatch.
+
+        The effect tripwire matched a bare ``\\bcompile\\s*\\(``, so
+        `re.compile(r'...')` stamped a phantom `dynamic_code_execution` label
+        on every regex-using tool. No `pure` declaration can permit that
+        label, so such a tool failed its own scope gate on every proposal —
+        even a proposal that changed nothing — and was silently unfixable:
+        it could never be re-committed, updated, or repaired. Reproduce the
+        phantom first, then assert it dead.
+        """
+        regex_tool = CLEAN + (
+            "import re\n"
+            "PATTERNS = [(re.compile(r'sk-[A-Za-z0-9]{8,}'), '[KEY]')]\n"
+            "def scrub(text=''):\n"
+            "    for pat, tag in PATTERNS:\n"
+            "        text = pat.sub(tag, text)\n"
+            "    return text\n"
+        )
+
+        # the exploit: the old bare-\b tripwire fired on the attribute call
+        import re as _re
+        assert _re.search(r"\b(?:eval|exec|compile|__import__)\s*\(", regex_tool)
+
+        # dead: no phantom label ...
+        assert "dynamic_code_execution" not in {
+            f.label for f in audit_effects(regex_tool)}
+        # ... so the tool clears its own gate instead of being unfixable
+        parent = spec_for(regex_tool)
+        verdict = ValidityGate(require_scope_declaration=True).evaluate(
+            spec_for(regex_tool), baseline=FrozenBaseline.capture(parent),
+            context="public")
+        assert verdict.admissible, verdict.summary()
+
+    def test_real_dynamic_code_execution_is_still_caught(self):
+        """The regex fix must not blunt the tripwire it repaired."""
+        # These are inert string literals, never executed: each is fed to
+        # audit_effects() as text and asserted to be *detected* as dangerous.
+        for snippet in ("payload = eval(user_input)",
+                        "exec(compiled)",
+                        "compile('1+1', '<s>', 'eval')",
+                        "mod = __import__('os')"):
+            assert "dynamic_code_execution" in {
+                f.label for f in audit_effects(snippet)}, snippet
+
 
 # ======================================================================
 # the baseline ratchet — the exam can only grow
