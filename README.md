@@ -27,7 +27,7 @@ ledger        degraded?       quarantine / rehab / retire
 ```bash
 cd 项目_开发/autoforge
 python examples/demo_offline.py     # full framework, zero API keys
-python -m pytest tests/ -o addopts= -q   # 135 tests
+python -m pytest tests/ -o addopts= -q   # 158 tests
 ```
 
 Use a real model:
@@ -83,6 +83,7 @@ autoforge/
 │   ├── verifier.py    # execution + robustness + adversarial + trigger + negative
 │   ├── pipeline.py    # forge→verify→seal, plus judge/rehab
 │   ├── fuzzer.py      # 30+ edge probes per tool (robustness)
+│   ├── invariance.py  # metamorphic oracles — probes mean nothing without them
 │   ├── adversary.py   # an LLM attacker that tries to break each tool
 │   ├── evolution.py   # population competition — mutants race, best survives
 │   ├── validity.py    # independent gate + frozen baseline (anti-misevolution)
@@ -182,6 +183,37 @@ population goes wrong, then asserts each is closed:
 | Shrink the exam | 6-probe tool tied a 50-probe tool | Evidence mass decides, and saturates so it can't be farmed |
 | Silent scope creep | Undetected | Boolean veto, audited, before fitness is ever computed |
 
+A fourth exploit lived one layer down, in the robustness check itself — and it
+was the worst of the set, because it sat on the **forge** path, where every tool
+ever created has to pass through it:
+
+| Exploit | Old behaviour | Now |
+|:---|:---|:---|
+| Ignore `"ISBN "` prefix | 19/19 probes survived, **passed** | Fails: output changes under a transform that must not change it |
+| Return a constant `"nope"` | 19/19 probes survived, **passed** | Fails: degenerate — validates nothing |
+| Return constant `True` | 19/19 probes survived, **passed** | Fails: degenerate — accepts everything |
+
+The probes were never the problem — the `ISBN ` probe was already being
+generated. The problem was the oracle: a probe was scored `survived` iff the
+tool did not raise (`ok = out is not None`), so *wrong-but-total* functions
+scored 100%. A probe means nothing without a verdict behind it.
+
+`forge/invariance.py` supplies verdicts of two kinds, neither authored by the
+tool being scored:
+
+- **computed** — true of any honest implementation, so the verifier derives
+  them: `defined`, `deterministic`, and `non_degenerate` (a tool must not emit
+  one constant across well-formed *and* garbage input).
+- **declared** — semantic obligations needing domain knowledge the verifier
+  lacks (is `"ISBN "` part of the value or noise around it?). The generator
+  asserts these at birth; `FrozenBaseline` then keeps them, so a later mutant
+  cannot quietly drop one.
+
+They are metamorphic, not exact: nothing labels the correct output for a novel
+input, but you can still assert how outputs must *relate*. Scope is
+deliberately narrow — free-text parameters like `title` get no relations at
+all, because there the whitespace and casing are the content.
+
 The fix has three parts, and none of them is a bigger penalty term:
 
 1. **The denominator is fixed.** `_compute_fitness` scores against
@@ -222,14 +254,19 @@ OpenAICompatClient(model=..., base_url=..., api_key=..., proxies={...})
 
 ## Status
 
-v0.3.0 — the self-growth layer is complete: forge → verify (execution,
+v0.4.0 — the self-growth layer is complete: forge → verify (execution,
 robustness, adversarial, trigger, negative) → seal, plus evolution, proactive
 gap-filling, tool composition, self-modification with an audit trail, agent
-spawning, and self-designed multi-agent topology. On top of it, an
+spawning, and self-designed multi-agent topology. On top of it an
 anti-misevolution layer: an independent validity gate, a fitness function the
-mutant cannot author, a frozen baseline that only ratchets forward, and
-Pareto selection so safety cannot be paid for with capability. 135 tests
-passing. MIT.
+mutant cannot author, a frozen baseline that only ratchets forward, Pareto
+selection so safety cannot be paid for with capability, and metamorphic
+oracles so the robustness layer actually has a verdict. 158 tests passing.
+MIT.
+
+**Breaking since v0.3.0:** the robustness check now has an oracle. Tools that
+previously passed it by not raising will fail if they are degenerate or break a
+declared normalisation relation.
 
 Known limits: the default sandbox is process isolation, not a security
 boundary against adversarial code (`restrict_builtins` narrows it; use a

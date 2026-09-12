@@ -110,6 +110,10 @@ class ToolSpec:
     generator: str = ""            # model that wrote it
     probes: list[TriggerProbe] = field(default_factory=list)
     effect_signature: str = ""     # what it touches; used for re-verification
+    invariances: list[str] = field(default_factory=list)  # token types whose
+    # decoration must not change the answer (e.g. "isbn"). Declared at birth by
+    # the generator, then frozen into FrozenBaseline — a later mutant cannot
+    # drop one without failing the regression gate.
     state: ToolState = ToolState.DRAFT
     stats: ToolStats = field(default_factory=ToolStats)
     verification: dict[str, Any] = field(default_factory=dict)

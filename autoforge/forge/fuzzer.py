@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..tools.spec import ToolSpec
+from .invariance import InvarianceResult, check as check_invariances
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +166,20 @@ class RobustnessResult:
     survived: int = 0
     failures: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: float = 0.0
+    invariance: InvarianceResult | None = None
 
     @property
     def survival_rate(self) -> float:
         return self.survived / self.total if self.total else 0.0
 
     def summary(self) -> str:
-        return f"{self.name}: {self.survived}/{self.total} robustness probes survived"
+        base = f"{self.name}: {self.survived}/{self.total} robustness probes survived"
+        if self.invariance is not None:
+            base += f"; {self.invariance.summary()}"
+        return base
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "tool": self.name,
             "passed": self.passed,
             "survival_rate": round(self.survival_rate, 3),
@@ -185,6 +190,9 @@ class RobustnessResult:
                 for f in self.failures[:5]
             ],
         }
+        if self.invariance is not None:
+            d["invariance"] = self.invariance.to_dict()
+        return d
 
 
 def run_robustness_checks(
@@ -193,8 +201,15 @@ def run_robustness_checks(
     sandbox: Any = None,
     require_survival_rate: float = 1.0,
     max_probes: int = 50,
+    check_invariance: bool = True,
 ) -> RobustnessResult:
-    """Run all robustness probes against the tool."""
+    """Run all robustness probes against the tool.
+
+    Definedness alone is not an oracle — "did not raise" is satisfied by a
+    function that returns a constant. When `check_invariance` is on, the
+    metamorphic battery in `..forge.invariance` is run too, and a tool that is
+    degenerate or breaks a normalisation relation fails the check outright.
+    """
     probes = generate_robustness_probes(spec, max_probes)
     started = time.perf_counter()
     failures: list[dict[str, Any]] = []
@@ -204,8 +219,9 @@ def run_robustness_checks(
         try:
             if sandbox is not None and spec.code:
                 r = sandbox.run(spec.code, spec.name, probe.args)
-                ok = r.ok
-                err = r.error if not ok else None
+                ok = r.ok and r.output is not None
+                err = r.error if not r.ok else (
+                    None if r.output is not None else "returned None")
             else:
                 out = spec.fn(**probe.args)
                 ok = out is not None
@@ -219,16 +235,52 @@ def run_robustness_checks(
         else:
             failures.append({"label": probe.label, "args": str(probe.args)[:200], "error": err})
 
+    invariance = None
+    if check_invariance:
+        invariance = check_invariances(
+            spec,
+            sandbox=sandbox,
+            reference_args=_reference_args(spec),
+            probe_args=[p.args for p in probes],
+        )
+
     duration = (time.perf_counter() - started) * 1000
     rate = survived / len(probes) if probes else 1.0
+    defined_ok = rate >= require_survival_rate
     return RobustnessResult(
         name=spec.name,
-        passed=rate >= require_survival_rate,
+        passed=defined_ok and (invariance is None or invariance.passed),
         total=len(probes),
         survived=survived,
         failures=failures,
         duration_ms=duration,
+        invariance=invariance,
     )
+
+
+def _reference_args(spec: ToolSpec) -> dict[str, Any]:
+    """The positive control: a plausible, well-formed call.
+
+    Mirrors ToolVerifier._infer_args. Kept local rather than imported so the
+    fuzzer stays free of a verifier dependency.
+    """
+    props = spec.parameters.get("properties") or {}
+    args: dict[str, Any] = {}
+    for name, schema in props.items():
+        t = schema.get("type", "string")
+        if t == "string":
+            args[name] = "978-0-306-40615-7"
+        elif t in ("number", "integer"):
+            args[name] = 1
+        elif t == "boolean":
+            args[name] = True
+        elif t == "object":
+            args[name] = {}
+        elif t == "array":
+            args[name] = []
+        else:
+            args[name] = "test"
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -272,4 +324,5 @@ __all__ = [
     "run_robustness_checks",
     "generate_robustness_probes",
     "ProbeInput",
+    "check_invariance",
 ]

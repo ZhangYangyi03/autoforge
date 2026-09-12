@@ -142,7 +142,9 @@ class ToolVerifier:
             "robustness", result.passed,
             result.summary(),
             {"survival_rate": round(result.survival_rate, 3),
-             "survived": result.survived, "total": result.total},
+             "survived": result.survived, "total": result.total,
+             "invariance": (result.invariance.to_dict()
+                            if result.invariance is not None else None)},
         )
 
     def check_adversarial(self, spec: ToolSpec, sample_args: dict[str, Any] | None = None) -> CheckResult:
