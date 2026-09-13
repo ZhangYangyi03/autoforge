@@ -402,10 +402,10 @@ class TestConfig:
         assert servers[0].args == ["-y", "server-fs"]
         assert servers[0].scope == IMPORTED_SCOPE
 
-    def test_a_server_without_a_command_is_reported_not_raised(self):
+    def test_a_server_without_a_command_or_url_is_reported_not_raised(self):
         servers, problems = servers_from_config({"mcp": {"servers": {"x": {"args": []}}}})
         assert servers == []
-        assert "no 'command'" in problems[0]
+        assert "needs either a 'command'" in problems[0] and "'url'" in problems[0]
 
     def test_a_bad_entry_does_not_lose_the_good_ones(self):
         servers, problems = servers_from_config({"mcp": {"servers": {
@@ -654,9 +654,9 @@ class TestThroughTheAgent:
                        store=ToolStore(str(tmp_path / "agent.db")))
         try:
             assert a.mcp_servers == []
-            assert a._mcp_problems and "no 'command'" in a._mcp_problems[0]
+            assert a._mcp_problems and "needs either a 'command'" in a._mcp_problems[0]
             # Reported through the tool, where the agent will see it.
-            assert "no 'command'" in a.registry.call("mcp_servers", {}).output
+            assert "needs either a 'command'" in a.registry.call("mcp_servers", {}).output
         finally:
             a.mcp.close()
 

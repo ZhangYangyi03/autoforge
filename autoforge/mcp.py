@@ -70,6 +70,36 @@ class MCPError(RuntimeError):
     """Anything that stops a server from being usable, said in one sentence."""
 
 
+def _seconds(value: Any, fallback: float, name: str, field_name: str) -> float:
+    """A timeout written by someone else, read as a number or refused loudly.
+
+    Imported configs are not always well-formed, and a string where a number
+    belongs would otherwise surface much later as a `TypeError` inside a socket
+    call — a traceback naming neither the server nor the field.
+    """
+    if value is None:
+        return fallback
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise MCPError(f"server {name!r}: {field_name} {value!r} is not a number") from None
+    if seconds <= 0:
+        raise MCPError(f"server {name!r}: {field_name} must be positive, got {value!r}")
+    return seconds
+
+
+def _boolish(value: Any) -> bool:
+    """`true`/`false` as YAML, TOML and several not-quite-JSON writers spell it.
+
+    `bool("false")` is `True`, so a config that disables a server with the
+    string "false" would silently enable it — the kind of bug that is invisible
+    until someone wonders why a server they switched off is running.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off", ""}
+    return bool(value)
+
+
 # ----------------------------------------------------------------------
 # configuration
 # ----------------------------------------------------------------------
@@ -77,13 +107,19 @@ class MCPError(RuntimeError):
 class MCPServerConfig:
     """One server, as the operator described it.
 
+    Two transports live here, and which one is in use is decided by the
+    operator's own description rather than guessed: a `url` means the
+    streamable-HTTP transport, a `command` means a child process speaking
+    JSON-RPC over its own stdin/stdout. Both spellings are accepted because
+    both are written by the tools this config is imported from.
+
     `command` is run directly, never through a shell: a shell would make the
     path a quoting question and would resolve `python` to whatever the platform
     prefers. The operator writes the executable they mean.
     """
 
     name: str
-    command: str
+    command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     scope: str = IMPORTED_SCOPE
@@ -91,30 +127,94 @@ class MCPServerConfig:
     timeout: float = DEFAULT_TIMEOUT
     call_timeout: float = DEFAULT_CALL_TIMEOUT
     enabled: bool = True
+    #: Streamable HTTP: a server already running somewhere, reached over the
+    #: network instead of started here.
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    #: The *name* of a variable holding a bearer token, which is how Codex
+    #: writes it. A name rather than a value on purpose: the token stays in the
+    #: environment, so importing someone's config cannot copy their secret into
+    #: a second file that then has to be protected too.
+    bearer_token_env_var: str = ""
+    #: Tool-level gating, as Codex writes it. `enabled_tools` is an allowlist
+    #: (empty means every tool the server offers); `disabled_tools` is a
+    #: denylist applied afterwards. Both are honoured because a server imported
+    #: from someone else's config must expose exactly the tools *they* chose:
+    #: silently re-enabling a tool they switched off is the import changing the
+    #: operator's security posture rather than reproducing it.
+    enabled_tools: list[str] = field(default_factory=list)
+    disabled_tools: list[str] = field(default_factory=list)
+
+    def allows(self, tool_name: str) -> bool:
+        """Whether this config lets `tool_name` through.
+
+        The short name is matched, not the namespaced one: the config was
+        written against the server's own tool names, long before this framework
+        prefixed them.
+        """
+        if self.enabled_tools and tool_name not in self.enabled_tools:
+            return False
+        return tool_name not in self.disabled_tools
+
+    @property
+    def transport(self) -> str:
+        """`http` or `stdio`. Derived, so the two can never disagree."""
+        return "http" if self.url else "stdio"
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> "MCPServerConfig":
         if not isinstance(d, dict):
             raise MCPError(f"server {name!r}: expected an object, got {type(d).__name__}")
         cmd = d.get("command")
-        if not cmd:
-            raise MCPError(f"server {name!r}: no 'command' to start it with")
+        url = str(d.get("url") or "")
+        if not cmd and not url:
+            # Checked here rather than at start time so the operator hears
+            # about it while they are still looking at the file they wrote.
+            raise MCPError(f"server {name!r}: needs either a 'command' to start "
+                           f"or a 'url' to reach")
         args = d.get("args") or []
         if not isinstance(args, list):
             raise MCPError(f"server {name!r}: 'args' must be a list")
         env = d.get("env") or {}
         if not isinstance(env, dict):
             raise MCPError(f"server {name!r}: 'env' must be an object")
+        headers = d.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise MCPError(f"server {name!r}: 'headers' must be an object")
+        # Every dialect spells its timeouts differently, and all of them mean
+        # "how long to wait for a reply". Reading the aliases here keeps the
+        # difference in one place instead of in every reader.
+        timeout = d.get("timeout", d.get("connect_timeout",
+                                        d.get("startup_timeout_sec", DEFAULT_TIMEOUT)))
+        call_timeout = d.get("call_timeout", d.get("tool_timeout_sec",
+                                                   DEFAULT_CALL_TIMEOUT))
+        enabled_tools = d.get("enabled_tools") or []
+        disabled_tools = d.get("disabled_tools") or []
+        for field_name, value in (("enabled_tools", enabled_tools),
+                                  ("disabled_tools", disabled_tools)):
+            if not isinstance(value, list):
+                raise MCPError(f"server {name!r}: {field_name!r} must be a list")
+        # Cline and Claude's own UI write `"disabled": true` rather than an
+        # `enabled` flag, and read `enabled` as its absence. Same statement,
+        # opposite name — the alias is read here so neither dialect is silent.
+        enabled = d.get("enabled")
+        if enabled is None:
+            enabled = not _boolish(d.get("disabled", False))
         return cls(
             name=name,
-            command=str(cmd),
+            command=str(cmd) if cmd else "",
             args=[str(a) for a in args],
             env={str(k): str(v) for k, v in env.items()},
             scope=str(d.get("scope") or IMPORTED_SCOPE),
             cwd=d.get("cwd"),
-            timeout=float(d.get("timeout", DEFAULT_TIMEOUT)),
-            call_timeout=float(d.get("call_timeout", DEFAULT_CALL_TIMEOUT)),
-            enabled=bool(d.get("enabled", True)),
+            timeout=_seconds(timeout, DEFAULT_TIMEOUT, name, "timeout"),
+            call_timeout=_seconds(call_timeout, DEFAULT_CALL_TIMEOUT, name, "call_timeout"),
+            enabled=_boolish(enabled),
+            url=url,
+            headers={str(k): str(v) for k, v in headers.items()},
+            bearer_token_env_var=str(d.get("bearer_token_env_var") or ""),
+            enabled_tools=[str(t) for t in enabled_tools],
+            disabled_tools=[str(t) for t in disabled_tools],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,7 +222,11 @@ class MCPServerConfig:
             "name": self.name, "command": self.command, "args": list(self.args),
             "env": dict(self.env), "scope": self.scope, "cwd": self.cwd,
             "timeout": self.timeout, "call_timeout": self.call_timeout,
-            "enabled": self.enabled,
+            "enabled": self.enabled, "url": self.url,
+            "headers": dict(self.headers),
+            "bearer_token_env_var": self.bearer_token_env_var,
+            "enabled_tools": list(self.enabled_tools),
+            "disabled_tools": list(self.disabled_tools),
         }
 
 
@@ -445,6 +549,287 @@ class MCPClient:
         self.close()
 
 
+class MCPHttpClient:
+    """One MCP server reached over streamable HTTP.
+
+    Same public surface as `MCPClient` — `start`, `alive`, `close`,
+    `list_tools`, `call_tool`, and the `.tools`/`.error`/`.server_info`/
+    `.protocol` attributes — so the hub does not care which of the two it holds.
+
+    The transport is the streamable-HTTP shape: every message is its own POST
+    carrying one JSON-RPC object, and the reply comes back either as a plain
+    JSON body or as an SSE stream with the answer in a `data:` line. Both are
+    read, because a server may choose per request and several do.
+
+    There is no pipe to inspect, so `alive` means "this client has been started
+    and not closed" rather than "the far end is definitely up". That is the
+    honest reading for a transport that opens a connection per call: a server
+    that has died is discovered on the next call, whose error names it, rather
+    than by a liveness check that would itself be a network request.
+    """
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        self.config = config
+        self._next_id = 0
+        self._id_lock = threading.Lock()
+        self._closed = False
+        self._started = False
+        self._session_id = ""
+        self._notes: list[dict[str, Any]] = []
+        self.error = ""
+        self.server_info: dict[str, Any] = {}
+        self.protocol: str = ""
+        self.tools: list[dict[str, Any]] = []
+
+    # -- lifecycle -----------------------------------------------------
+    def start(self) -> bool:
+        """Handshake. False (with `.error` set) if the server would not talk."""
+        if self._closed:
+            self.error = f"server {self.config.name!r} was closed; a closed client does not restart"
+            return False
+        if self._started:
+            return True
+        if not self.config.url:
+            self.error = f"server {self.config.name!r} has no url to reach"
+            return False
+        try:
+            result = self._request("initialize", {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": CLIENT_NAME, "version": "1"},
+            })
+        except MCPError as exc:
+            self.error = f"{self.config.name!r} failed to initialise: {exc}"
+            return False
+        self.server_info = result.get("serverInfo") or {}
+        self.protocol = str(result.get("protocolVersion") or "")
+        self._started = True
+        # A notification has no reply, so it is not part of the handshake's
+        # success. Failing to deliver it is recorded and the server is still
+        # used: a strict implementation that never sees it answers `tools/list`
+        # with an error naming the cause, which is a better diagnostic than a
+        # startup that failed for a reason the operator cannot see.
+        try:
+            self._notify("notifications/initialized", {})
+        except MCPError as exc:
+            self._notes.append({"notification": "initialized", "error": str(exc)})
+        return True
+
+    @property
+    def alive(self) -> bool:
+        return self._started and not self._closed
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop using the session. Idempotent.
+
+        The server is told the session is over, which lets it release whatever
+        it held for it. A refusal is not an error worth raising: the session is
+        going away regardless, and the operator cannot act on it.
+        """
+        self._closed = True
+        self._started = False
+        if not self._session_id:
+            return
+        sid, self._session_id = self._session_id, ""
+        try:
+            import requests
+            requests.delete(self.config.url, headers=self._headers(session=sid),
+                            timeout=timeout)
+        except Exception:
+            pass
+
+    # -- transport -----------------------------------------------------
+    def _headers(self, *, session: str | None = None) -> dict[str, str]:
+        """The headers every message carries, plus whatever was configured.
+
+        The bearer token is read from the environment at send time, not stored
+        on this object, so a token that changes is picked up and a token that
+        is absent produces a request without the header rather than a config
+        file holding a secret.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            # Both are acceptable, because the server chooses: a plain JSON
+            # body for a quick answer, SSE when it wants to stream.
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": self.protocol or PROTOCOL_VERSION,
+        }
+        headers.update(self.config.headers)
+        token_var = self.config.bearer_token_env_var
+        if token_var:
+            token = os.environ.get(token_var, "")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        sid = self._session_id if session is None else session
+        if sid:
+            headers["Mcp-Session-Id"] = sid
+        return headers
+
+    def _next(self) -> int:
+        with self._id_lock:
+            self._next_id += 1
+            return self._next_id
+
+    def _post(self, msg: dict[str, Any], timeout: float) -> Any:
+        """One POST. Returns the parsed JSON-RPC reply, or None for an ack.
+
+        Raises MCPError for everything that went wrong, because every caller
+        here wants a sentence rather than an exception type they must map.
+        """
+        import requests
+
+        try:
+            resp = requests.post(self.config.url, json=msg,
+                                 headers=self._headers(), timeout=timeout, stream=True)
+        except requests.RequestException as exc:
+            raise MCPError(f"server {self.config.name!r} is unreachable: {exc}") from exc
+        try:
+            # A server may hand out a session id on any reply; the initialize
+            # reply is where it normally appears. Kept whenever it is offered.
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self._session_id = sid
+            if resp.status_code >= 400:
+                body = _peek(resp)
+                raise MCPError(f"server {self.config.name!r} answered "
+                               f"{resp.status_code}: {body}")
+            return self._decode(resp, msg.get("id"))
+        finally:
+            resp.close()
+
+    def _decode(self, resp: Any, wanted_id: Any) -> Any:
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype == "text/event-stream":
+            return self._read_stream(resp, wanted_id)
+        if resp.status_code == 202 or not resp.content:
+            return None                     # an acknowledgement, nothing to read
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise MCPError(f"server {self.config.name!r} sent a body that is not "
+                           f"JSON: {exc}") from None
+
+    def _read_stream(self, resp: Any, wanted_id: Any) -> dict[str, Any] | None:
+        """Read an SSE stream until the reply to `wanted_id` arrives.
+
+        A stream may carry several messages before the one asked for — a
+        notification, or a reply to an earlier call the caller gave up on — so
+        the whole stream is walked rather than reading the first event. Events
+        not addressed to `wanted_id` are kept in `_notes` and skipped, which is
+        the same rule the stdio reader follows.
+        """
+        import requests
+
+        data: list[str] = []
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                line = (raw or "").strip()
+                if line.startswith("data:"):
+                    data.append(line[5:].strip())
+                    continue
+                if line:
+                    continue                # `event:`, `id:`, `retry:`, comments
+                if not data:                # blank line with nothing buffered
+                    continue
+                payload, data = "\n".join(data), []
+                try:
+                    msg = json.loads(payload)
+                except ValueError:
+                    self._notes.append({"unparsed_event": payload[:500]})
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "id" not in msg:
+                    self._notes.append(msg)
+                    continue
+                if msg.get("id") != wanted_id:
+                    continue
+                return msg
+        except requests.RequestException as exc:
+            raise MCPError(f"server {self.config.name!r} stopped streaming: {exc}") from exc
+        return None
+
+    def _notify(self, method: str, params: dict[str, Any]) -> bool:
+        self._post({"jsonrpc": "2.0", "method": method, "params": params},
+                   self.config.timeout)
+        return True
+
+    def _request(self, method: str, params: dict[str, Any],
+                 timeout: float | None = None) -> dict[str, Any]:
+        """Send a request and read *its* reply."""
+        rid = self._next()
+        msg = self._post({"jsonrpc": "2.0", "id": rid, "method": method, "params": params},
+                         timeout or self.config.timeout)
+        if msg is None:
+            raise MCPError(f"{method}: server {self.config.name!r} acknowledged "
+                           f"without an answer")
+        if not isinstance(msg, dict):
+            if isinstance(msg, list):
+                for item in msg:
+                    if isinstance(item, dict) and item.get("id") == rid:
+                        msg = item
+                        break
+                else:
+                    raise MCPError(f"{method}: no reply for id {rid} in a batch")
+            else:
+                raise MCPError(f"{method}: unexpected reply {type(msg).__name__}")
+        if "error" in msg:
+            err = msg["error"]
+            detail = err.get("message", err) if isinstance(err, dict) else err
+            raise MCPError(f"{method}: {detail}")
+        result = msg.get("result")
+        return result if isinstance(result, dict) else {"value": result}
+
+    # -- the two useful verbs ------------------------------------------
+    def list_tools(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        if not self.alive and not self.start():
+            raise MCPError(self.error or f"server {self.config.name!r} is not running")
+        result = self._request("tools/list", {}, timeout=timeout)
+        tools = result.get("tools")
+        if tools is None:
+            tools = []
+        if not isinstance(tools, list):
+            raise MCPError(f"tools/list returned {type(tools).__name__}, not a list")
+        self.tools = [t for t in tools if isinstance(t, dict) and t.get("name")]
+        return self.tools
+
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None,
+                  timeout: float | None = None) -> dict[str, Any]:
+        if not self.alive and not self.start():
+            raise MCPError(self.error or f"server {self.config.name!r} is not running")
+        return self._request(
+            "tools/call",
+            {"name": name, "arguments": arguments or {}},
+            timeout=timeout or self.config.call_timeout,
+        )
+
+    def __enter__(self) -> "MCPHttpClient":
+        self.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def _peek(resp: Any, limit: int = 300) -> str:
+    """A short, safe piece of an error body, for the sentence that reports it."""
+    try:
+        text = (resp.text or "").strip()
+    except Exception:
+        return "(body unreadable)"
+    return text[:limit] if text else "(empty body)"
+
+
+def client_for(config: MCPServerConfig) -> "MCPClient | MCPHttpClient":
+    """The client that speaks this server's transport.
+
+    A factory rather than a branch at each call site: which transport a config
+    describes is the config's own property, and asking here means the answer
+    cannot drift between the hub, the CLI and the tests.
+    """
+    return MCPHttpClient(config) if config.transport == "http" else MCPClient(config)
+
+
 def render_result(result: dict[str, Any]) -> tuple[bool, str]:
     """Turn an MCP tools/call result into (ok, text).
 
@@ -584,7 +969,7 @@ class MCPHub:
 
     def __init__(self, servers: list[MCPServerConfig] | None = None) -> None:
         self.servers = list(servers or [])
-        self.clients: dict[str, MCPClient] = {}
+        self.clients: dict[str, MCPClient | MCPHttpClient] = {}
         self.report = ImportReport()
 
     def add(self, cfg: MCPServerConfig) -> None:
@@ -599,7 +984,7 @@ class MCPHub:
         """
         wanted = [s for s in self.servers if only is None or s.name in only]
         for cfg in wanted:
-            client = MCPClient(cfg)
+            client = client_for(cfg)
             self.clients[cfg.name] = client
             try:
                 if not client.start():
@@ -610,6 +995,18 @@ class MCPHub:
                 self.report.problems.append(f"{cfg.name}: {exc}")
                 client.close()
                 continue
+            # The config's tool gating is applied here, on the list the hub
+            # goes on to use, rather than at call time. A tool the operator
+            # switched off is then absent — not present and refusing — so the
+            # report the agent reads and the registry it calls cannot disagree
+            # about what this server offers.
+            refused = [str(t["name"]) for t in tools if not cfg.allows(str(t["name"]))]
+            if refused:
+                tools = [t for t in tools if cfg.allows(str(t["name"]))]
+                client.tools = tools
+                self.report.problems.append(
+                    f"{cfg.name}: {len(refused)} tool(s) not imported as configured: "
+                    f"{', '.join(sorted(refused))}")
             self.report.servers += 1
             self.report.tools += len(tools)
             for t in tools:
@@ -647,7 +1044,7 @@ class MCPHub:
 
 
 __all__ = [
-    "MCPClient", "MCPHub", "MCPError", "MCPServerConfig", "ImportReport",
-    "PROTOCOL_VERSION", "IMPORTED_SCOPE", "servers_from_config",
-    "spec_from_remote", "tool_name", "render_result",
+    "MCPClient", "MCPHttpClient", "MCPHub", "MCPError", "MCPServerConfig",
+    "ImportReport", "PROTOCOL_VERSION", "IMPORTED_SCOPE", "client_for",
+    "servers_from_config", "spec_from_remote", "tool_name", "render_result",
 ]
