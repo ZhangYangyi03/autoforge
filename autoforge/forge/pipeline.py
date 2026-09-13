@@ -132,6 +132,12 @@ class ForgePipeline:
         feedback = ""
         existing = ", ".join(self.registry.names()) or "(none)"
 
+        # Announce up front: round 1 starts with a model call that can take a
+        # while, and without this the very first thing a user sees is silence.
+        self._emit("forge_start", {
+            "need": need, "max_rounds": self.config.max_rounds,
+        })
+
         for round_no in range(1, self.config.max_rounds + 1):
             started = time.perf_counter()
             attempt = ForgeAttempt(need, round_no)
@@ -203,7 +209,10 @@ class ForgePipeline:
             if attempt.accepted or futile:
                 break
 
-        self._emit("forge_done", {"need": need, "ok": result.ok, "rounds": result.rounds})
+        self._emit("forge_done", {
+            "need": need, "ok": result.ok, "rounds": result.rounds,
+            "name": getattr(result.spec, "name", None),
+        })
         return result
 
     # -- helpers ---------------------------------------------------------

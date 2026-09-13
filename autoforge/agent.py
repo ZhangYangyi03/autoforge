@@ -29,6 +29,8 @@ The meta-tools it exposes to itself (all decided by policy):
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -161,6 +163,69 @@ def _coerce_weights(value: Any, current: Any) -> tuple[Any | None, str | None]:
     return RoutingWeights(**kwargs), None
 
 
+HOST_FACTS_HEADER = "HOST (measured on this machine — do not assume commands from habit):"
+
+
+def host_facts(sandbox: Any = None) -> list[str]:
+    """What this machine actually is, probed rather than assumed.
+
+    The failure this exists for: asked to search for a program by name, the
+    agent forged a probe built on `ps` and reported "no such process". On
+    Windows `ps` is not on the default PATH, and — this is the dangerous part —
+    a missing binary surfaces as an empty result, not an error. So the agent
+    read its own blind spot as evidence of absence, which is the one kind of
+    wrong answer a self-reporting agent must never give.
+
+    Resolution is done against the *sandbox's* PATH when a sandbox is given,
+    because that is the environment forged code runs in; the agent's own shell
+    may see binaries the sandbox cannot.
+    """
+    import platform
+
+    system = platform.system()
+    lines = [
+        HOST_FACTS_HEADER,
+        f"- OS: {system} {platform.release()} ({platform.machine()}), "
+        f"Python {sys.version.split()[0]}.",
+        f"- This is {'a Windows' if system == 'Windows' else 'a POSIX'} host: "
+        f"paths use {os.sep!r}, lines end with {os.linesep!r}.",
+    ]
+
+    probes = ("tasklist", "ps", "pgrep", "wmic", "powershell", "cmd", "sh")
+    if sandbox is not None:
+        present, absent = sandbox.reachable(probes)
+        where = "inside the sandbox"
+    else:
+        import shutil
+
+        present = [c for c in probes if shutil.which(c)]
+        absent = [c for c in probes if c not in present]
+        where = "on PATH"
+
+    if "tasklist" in present:
+        lines.append("- Processes: use `tasklist` — it is the native lister here.")
+        posix_gone = [c for c in ("ps", "pgrep") if c in absent]
+        if posix_gone:
+            lines += [
+                f"  {', '.join(posix_gone)} is not resolvable {where}: a probe built on",
+                "  it returns *nothing* instead of failing, and empty output reads",
+                "  exactly like \"no such process\". An empty result is not evidence of",
+                "  absence — check what the probe actually ran before believing it.",
+            ]
+    elif "ps" in present:
+        lines.append(f"- Processes: `ps` is resolvable {where} — use it.")
+    else:
+        lines.append("- Processes: no known process lister "
+                     f"{where} — read /proc directly, or say you cannot check.")
+
+    if present:
+        lines.append(f"- Resolvable {where}: {', '.join(sorted(present))}.")
+    if absent:
+        lines.append(f"- NOT resolvable {where}: {', '.join(sorted(absent))} — "
+                     f"invoking these yields empty output, not an error.")
+    return lines
+
+
 @dataclass
 class ForgeAgent:
     llm: LLMClient
@@ -223,6 +288,9 @@ class ForgeAgent:
         )
 
         self.topology_designer = TopologyDesigner(self.llm)
+
+        # Live observer, attached only for the duration of a run (see `run`).
+        self._progress: Any = None
 
         self._register_meta_tools()
 
@@ -1102,25 +1170,58 @@ class ForgeAgent:
 
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
+        # Forward to the live observer, if one is attached, so forging shows up
+        # while it happens instead of being rendered once the task is over.
+        if self._progress is not None:
+            try:
+                self._progress(kind, payload)
+            except Exception:                    # a bad observer must not run the task
+                pass
 
     # ------------------------------------------------------------------
     def _effective_prompt(self) -> str:
-        """The prompt actually sent: the base, plus the measured self-report.
+        """The prompt actually sent: the base, plus what was measured.
 
         Recomputed per run, so the numbers are current even after the agent has
-        amended its own prompt.
+        amended its own prompt — and so the host block describes the sandbox
+        this process will actually fork, not the machine the agent imagines.
         """
-        return f"{self.system_prompt}\n\n{self._self_report()}"
+        facts = "\n".join(host_facts(self.sandbox))
+        return f"{self.system_prompt}\n\n{self._self_report()}\n\n{facts}"
 
     # ------------------------------------------------------------------
-    def run(self, task: str, history: list[Message] | None = None) -> AgentResult:
+    def run(self, task: str, history: list[Message] | None = None,
+            progress: Callable[[str, dict[str, Any]], None] | None = None) -> AgentResult:
+        """Run one task.
+
+        `progress(kind, payload)` is called as the loop moves — `request` before
+        each model call, `call`/`result` around each tool. The CLI uses it to
+        print live status, so a slow model reads as "waiting", not "hung".
+        """
+        def _emit(kind: str, **payload: Any) -> None:
+            if progress:
+                progress(kind, payload)
+
+        # Also attach it to the trace, so records written by forging and
+        # self-modification stream live too — not just the loop's own events.
+        self._progress = progress
+        try:
+            return self._run_locked(task, history, _emit)
+        finally:
+            self._progress = None
+
+    def _run_locked(self, task: str, history: list[Message] | None,
+                    _emit: Callable[..., None]) -> AgentResult:
         agent = Agent(
             self.llm, self.registry,
             system_prompt=self._effective_prompt(),
             max_turns=self.max_turns,
             allow_self_terminate=self.policy.self_terminate,
+            on_request=lambda turn: _emit("request", turn=turn),
             on_tool_call=lambda n, a: self._record("call", {"tool": n}),
-            on_tool_result=lambda n, r: self._record("result", {"tool": n, "ok": getattr(r, "ok", None)}),
+            on_tool_result=lambda n, r: self._record(
+                "result", {"tool": n, "ok": getattr(r, "ok", None)}),
+            on_turn=lambda turn, msg: _emit("turn", turn=turn),
         )
         result = agent.run(task, history)
         self._record("finish", {

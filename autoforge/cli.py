@@ -32,6 +32,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -279,19 +281,38 @@ def _describe(cfg: dict, agent: ForgeAgent) -> None:
 # ----------------------------------------------------------------------
 # trace rendering (shared by chat and forge)
 # ----------------------------------------------------------------------
-def _show_trace(agent: ForgeAgent, from_idx: int) -> None:
+def _show_trace(agent: ForgeAgent, from_idx: int, skip_streamed: bool = False) -> None:
+    """The decision log for one task.
+
+    With `skip_streamed`, the kinds the live line already narrated are dropped —
+    so a run that was watched live ends with the few events that need saying
+    twice, not a replay of everything already on screen.
+    """
+    err_rounds = {ev.get("round") for ev in agent.trace[from_idx:]
+                  if ev.get("kind") == "forge_error"}
     for ev in agent.trace[from_idx:]:
         kind = ev.get("kind", "")
+        if skip_streamed and kind in _LiveRun.STREAMED:
+            continue
         if kind == "call":
             print(_c(_D, f"  -> {ev.get('tool')}"))
         elif kind == "forge_attempt":
-            print(f"{_c(_Y, '  forging')} {str(ev.get('need', ''))[:64]}...")
+            # Failures only: a success is reported once, by forge_done. A round
+            # already narrated as a forge_error is not repeated here either.
+            if ev.get("accepted") or ev.get("round") in err_rounds:
+                continue
+            err = str(ev.get("error") or "verification failed")[:64]
+            print(f"{_c(_Y, '  round')} {ev.get('round')}: {err}")
         elif kind == "forge_done":
             ok = ev.get("ok")
             name = ev.get("name") or ev.get("tool") or "?"
             print(f"  {_c(_G, 'sealed') if ok else _c(_Y, 'rejected')} {name}")
         elif kind == "auto_quarantine":
             print(f"{_c(_Y, '  quarantined')} {ev.get('name', '?')} (failed review)")
+        else:
+            line = _LiveRun._milestone(kind, ev)
+            if line:
+                print(f"  {line}")
 
 
 def _print_checks(result) -> None:
@@ -302,6 +323,199 @@ def _print_checks(result) -> None:
             for c in a.report.checks:
                 tag = _c(_G, "PASS") if c.passed else _c(_Y, "FAIL")
                 print(f"    [{tag}] {c.name}: {str(c.detail)[:96]}")
+
+
+# ----------------------------------------------------------------------
+# live progress — a slow model must read as "waiting", never as "hung"
+# ----------------------------------------------------------------------
+class _LiveRun:
+    """Prints what the loop is doing while it does it.
+
+    The reason this exists: `run` used to render the trace only after the whole
+    task finished, so a model taking 40s per turn produced pure silence and no
+    way to tell a slow request from a wedged process. Two signals fix that —
+    an immediate line the moment each request goes out, and a ticking counter
+    on that same line while the response is in flight.
+    """
+
+    WIDTH = 72
+
+    def __init__(self, stream=None) -> None:
+        self.stream = stream or sys.stdout
+        self.t0 = time.time()
+        self.live = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._waiting_since: float | None = None
+        self._ticks = 0
+        self._thread: threading.Thread | None = None
+        # The round whose failure was already narrated as a forge_error, so the
+        # attempt line that follows it doesn't say the same thing twice.
+        self._err_round: int | None = None
+
+    # -- plumbing ------------------------------------------------------
+    def _write(self, text: str) -> None:
+        with self._lock:
+            self.stream.write(text)
+            self.stream.flush()
+
+    def _tickline(self, text: str) -> None:
+        if self.live:
+            self._write("\r" + text.ljust(self.WIDTH)[: self.WIDTH])
+        else:
+            self._write(text + "\n")
+
+    def _clear(self) -> None:
+        if self.live:
+            self._write("\r" + " " * self.WIDTH + "\r")
+
+    def _stamp(self) -> str:
+        return time.strftime("%H:%M:%S")
+
+    def _elapsed(self) -> str:
+        return f"{time.time() - self.t0:.1f}s"
+
+    # -- lifecycle -----------------------------------------------------
+    def start(self) -> "_LiveRun":
+        if self.live:
+            self._thread = threading.Thread(target=self._beat, daemon=True)
+            self._thread.start()
+        return self
+
+    def _beat(self) -> None:
+        while not self._stop.wait(1.0):
+            if self._waiting_since is None:
+                continue
+            secs = int(time.time() - self._waiting_since)
+            if secs >= 1 and secs != self._ticks:
+                self._ticks = secs
+                self._tickline(f"      … waiting on model ({secs}s)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._clear()
+
+    # -- the callback handed to ForgeAgent.run -------------------------
+    def __call__(self, kind: str, payload: dict) -> None:
+        if kind == "request":
+            self._clear()
+            self._waiting_since = time.time()
+            self._ticks = 0
+            self._write(f"  [{self._stamp()}] turn {payload.get('turn')} "
+                        f"+{self._elapsed()}  asking the model…\n")
+        elif kind == "call":
+            self._clear()
+            self._waiting_since = None
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"-> {payload.get('tool')}\n")
+        elif kind == "result":
+            self._waiting_since = time.time()      # model turn resumes
+            self._ticks = 0
+        elif kind == "forge_start":
+            # Forging costs a model turn per round — the longest silence in the
+            # whole run, so it starts the heartbeat before the first request.
+            self._clear()
+            self._waiting_since = time.time()
+            self._ticks = 0
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"forging {str(payload.get('need', ''))[:48]}…\n")
+        elif kind == "forge_attempt":
+            # Only failures are worth a line: a success is reported once, by
+            # forge_done, so the reader never sees "round 1: accepted" followed
+            # immediately by "sealed". Failures are the interesting case anyway
+            # — they are why a forge takes more than one round.
+            if not payload.get("accepted"):
+                if payload.get("round") == self._err_round:
+                    # Same failure, already reported as a forge_error above.
+                    return
+                self._clear()
+                self._waiting_since = time.time()   # another round is coming
+                err = str(payload.get("error") or "verification failed")[:60]
+                self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                            f"round {payload.get('round')}: {err}\n")
+        elif kind == "forge_error":
+            # The exception that ended a round — louder than the attempt line,
+            # so it takes the round slot and the attempt stays quiet.
+            self._clear()
+            self._waiting_since = None
+            self._err_round = payload.get("round")
+            futile = " (no point retrying)" if payload.get("futile") else ""
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"forge error: {str(payload.get('error', ''))[:60]}{futile}\n")
+        elif kind == "forge_done":
+            self._clear()
+            self._waiting_since = None
+            ok = payload.get("ok")
+            name = payload.get("name") or payload.get("need") or "?"
+            rounds = payload.get("rounds")
+            verdict = "sealed" if ok else "forge failed"
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"{verdict} {name} ({rounds} round(s))\n")
+        elif kind == "auto_quarantine":
+            self._clear()
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"quarantined {payload.get('name', '?')}\n")
+        elif kind in ("amendment",):
+            self._clear()
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"amended self: {payload.get('field', '?')}\n")
+        elif kind == "turn":
+            self._waiting_since = None
+        else:
+            line = self._milestone(kind, payload)
+            if line:
+                self._clear()
+                self._write(f"  [{self._stamp()}] +{self._elapsed()}  {line}\n")
+
+    # -- the rare, load-bearing events ---------------------------------
+    # Not every record deserves a line. These do: they change what the agent
+    # *is* (its tools, its prompt, its team), and they were previously invisible
+    # until the task ended — the exact silence this class exists to remove.
+    @staticmethod
+    def _milestone(kind: str, p: dict) -> str | None:
+        if kind == "evolve":
+            verdict = "improved" if p.get("improved") else "no improvement"
+            vetoed = len(p.get("vetoed") or [])
+            tail = f", {vetoed} mutant(s) vetoed" if vetoed else ""
+            return f"evolved {p.get('tool', '?')}: {verdict}{tail}"
+        if kind == "spawn":
+            name = p.get("name") or p.get("child") or "child"
+            if p.get("error"):
+                return f"spawn {name} failed: {str(p['error'])[:60]}"
+            return f"spawned {name} ({p.get('mode', 'child')})"
+        if kind == "design_team":
+            n, e = p.get("agents"), p.get("edges")
+            note = " (degraded to solo)" if p.get("degraded") else ""
+            return f"designed a team: {n} agent(s), {e} edge(s){note}"
+        if kind == "retire":
+            return f"retired {p.get('tool', '?')}: {str(p.get('rationale', ''))[:50]}"
+        if kind == "promote_withheld":
+            return f"promoted {p.get('name', p.get('tool', '?'))} out of quarantine"
+        if kind in ("gpu_compile", "gpu_bench"):
+            what = "compiled" if kind == "gpu_compile" else "benchmarked"
+            ok = "ok" if p.get("ok") else "failed"
+            return f"{what} {p.get('name', '?')} on GPU: {ok}"
+        if kind == "forge_error":
+            return f"forge error: {str(p.get('error', ''))[:60]}"
+        if kind == "evaluate":
+            return f"evaluated {p.get('tool', p.get('name', '?'))}"
+        return None
+
+    # Kinds `__call__` already narrates live. `_show_trace` skips them, so the
+    # end-of-task summary never repeats what the reader just watched scroll by.
+    STREAMED = ("request", "turn", "call", "result", "finish",
+                "forge_start", "forge_attempt", "forge_done", "forge_error",
+                "auto_quarantine", "amendment", "evolve", "spawn",
+                "design_team", "retire", "promote_withheld",
+                "gpu_compile", "gpu_bench", "evaluate")
+
+    def done(self, result) -> None:
+        self._clear()
+        n_calls = len(result.tool_calls) if isinstance(result.tool_calls, list) else result.tool_calls
+        self._write(f"  [{self._stamp()}] +{self._elapsed()}  done — "
+                    f"{result.turns} turn(s), {n_calls} tool call(s)\n")
 
 
 # ----------------------------------------------------------------------
@@ -359,17 +573,22 @@ def cmd_chat(args: argparse.Namespace) -> int:
             continue
 
         mark = len(agent.trace)
+        live = _LiveRun().start()
         try:
-            result = agent.run(line, history=history)
+            result = agent.run(line, history=history, progress=live)
         except KeyboardInterrupt:
+            live.stop()
             print(f"\n{_c(_D, 'interrupted')}")
             continue
         except Exception as exc:                                   # noqa: BLE001
+            live.stop()
             print(f"{_c(_Y, 'error:')} {type(exc).__name__}: {exc}")
             continue
+        live.stop()
+        live.done(result)
 
         print()
-        _show_trace(agent, mark)
+        _show_trace(agent, mark, skip_streamed=True)
         if result.content:
             print(f"\n{_c(_C, 'agent>')} {result.content}")
         if result.self_terminated:
@@ -388,8 +607,14 @@ def cmd_forge(args: argparse.Namespace) -> int:
     print(f"\n{_c(_D, 'need:')} {need}\n")
 
     mark = len(agent.trace)
-    result = agent.pipeline.forge(need)
-    _show_trace(agent, mark)
+    live = _LiveRun().start()
+    agent._progress = live          # the pipeline records through the agent
+    try:
+        result = agent.pipeline.forge(need)
+    finally:
+        agent._progress = None
+        live.stop()
+    _show_trace(agent, mark, skip_streamed=True)
     _print_checks(result)
 
     if not result.ok:
@@ -527,8 +752,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(_c(_D, f"mode {args.mode}  |  model {cfg['model']}  |  {cfg['base']}  |  "
                  f"policy={cfg.get('policy', 'full')}"))
     task = " ".join(args.task)
-    result = agent.run(task)
-    _show_trace(agent, 0)
+    live = _LiveRun().start()
+    try:
+        result = agent.run(task, progress=live)
+    finally:
+        live.stop()
+    live.done(result)
     if result.content:
         print(f"\n{result.content}")
     if result.self_terminated:

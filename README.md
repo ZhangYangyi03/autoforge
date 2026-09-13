@@ -83,6 +83,8 @@ override never means re-running the wizard:
 auto --model other-model                    # this invocation only
 AUTOFORGE_MODEL=other-model auto            # this shell only
 auto --base-url http://127.0.0.1:11434/v1 --model qwen2.5:7b --no-proxy
+auto --policy supervised                    # keep the harness, drop the latitude
+AUTOFORGE_POLICY=supervised auto            # same, this shell only
 ```
 
 Why bother with a file when environment variables exist: a variable exported
@@ -253,6 +255,15 @@ context but `force=True` still runs it. `rehab()` puts it back on trial.
 score = w_text·similarity + w_success·success_rate + w_trust·state_trust
         − w_cost·cost_penalty − w_over·over_trigger_penalty
 ```
+
+**Every freedom is declared, and each declaration is classified.** Two presets
+ship — `full` (the default: nothing denied) and `supervised` — selected with
+`--policy` or `AUTOFORGE_POLICY`, and `autoforge config` prints which is live.
+Each field in the policy is labelled *enforced* (a gate you can watch close),
+*partial*, or *declared-only* (a promise no code path keeps yet). The report is
+not decoration: `my_capabilities` hands the same classification to the agent,
+and `set_autonomy` warns when you switch off a freedom nothing obeys — so
+"switched off" can never quietly mean "still on".
 
 ---
 

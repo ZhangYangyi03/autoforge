@@ -27,7 +27,7 @@
 
 ---
 
-## 二、由此得出的七条架构决策
+## 二、由此得出的八条架构决策
 
 ### 1. 工具即数据，热插拔（反 Hermes 的 `/reset` 妥协）
 registry 持有 schema 列表，新工具下一轮即可用。prompt caching 的代价我们选择用**分级暴露**来付：只有 ACTIVE 工具进上下文，DRAFT/QUARANTINED 默认不进。→ 取自 Hermes 的分层思想，但拒绝它的重启要求。
@@ -59,6 +59,9 @@ registry 持有 schema 列表，新工具下一轮即可用。prompt caching 的
 
 ### 7. 动作即代码，但代码是资产（取 CodeAct，扔其上下文膨胀）
 工具是 Python 函数，可被组合、可被复用、可被序列化进库。但**不是所有代码都进上下文** —— 只有 ACTIVE 的 schema 进。→ CodeAct 的表达力 + 分级暴露的克制。
+
+### 8. 限制必须可强制，否则如实标注（反「声称有门其实没门」）
+`AutonomyPolicy` 里每个自由度都归三类之一：**enforced**（有代码路径在查，关掉就真有一道门合上）、**partial**、**declared-only**（`may_read_filesystem`／`may_write_filesystem`／`may_access_network`／`may_install_packages` —— 沙箱限的是**爆炸半径**不是能力上限，所以关掉这四个**不产生任何效果**）。这不是文档措辞，是数据结构：`enforcement_table()` 逐字段给结论，`unenforced` 列出「假装有门」的项，`set_autonomy` 关一个 inert 自由度时当场警告，`my_capabilities` 把同一张表交给 agent 自己。两个预设：`full`（默认，无否决）与 `supervised`（`--policy` 或 `AUTOFORGE_POLICY` 选）。→ 一个「已关闭」的开关若没人守，**比开着更危险** —— 它让人以为有边界。同一规则也管自述：`my_capabilities` 绝不打印没有内容的表头（曾报「Switched off, and actually enforced:」却零条，读起来像一道并不存在的限制）。
 
 ---
 

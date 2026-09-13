@@ -122,16 +122,29 @@ def test_parser_exposes_every_subcommand():
 def test_trace_renders_forge_lifecycle(capsys):
     agent = argparse.Namespace(trace=[
         {"kind": "call", "tool": "forge_tool"},
-        {"kind": "forge_attempt", "need": "normalise ISBNs"},
+        {"kind": "forge_attempt", "need": "normalise ISBNs", "round": 1,
+         "accepted": False, "error": "no ISBN found"},
         {"kind": "forge_done", "ok": True, "name": "isbn_normalizer"},
         {"kind": "auto_quarantine", "name": "bad_tool"},
     ])
     cli._show_trace(agent, 0)
     out = capsys.readouterr().out
     assert "forge_tool" in out
-    assert "forging" in out and "isbn_normalizer" in out
-    assert "sealed" in out
+    assert "round 1" in out and "no ISBN found" in out
+    assert "sealed" in out and "isbn_normalizer" in out
     assert "quarantined" in out and "bad_tool" in out
+
+
+def test_a_successful_attempt_is_not_announced_twice(capsys):
+    """A round that passed says nothing of its own — forge_done reports it."""
+    agent = argparse.Namespace(trace=[
+        {"kind": "forge_attempt", "need": "x", "round": 1, "accepted": True},
+        {"kind": "forge_done", "ok": True, "name": "thing"},
+    ])
+    cli._show_trace(agent, 0)
+    out = capsys.readouterr().out
+    assert out.count("thing") == 1
+    assert "round" not in out
 
 
 def test_trace_from_index_skips_earlier_events(capsys):

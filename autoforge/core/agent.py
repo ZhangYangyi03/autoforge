@@ -62,6 +62,21 @@ class _TerminateSignal(BaseException):
         self.reason = reason
 
 
+def _notify(hook: Callable[..., None] | None, *args: Any) -> None:
+    """Call an observer hook, swallowing whatever it throws.
+
+    Every hook here is a *reporter* — progress lines, trace records, UI. None of
+    them decide anything, so a broken reporter must not take the run down with
+    it. Before this, a CLI writing to a closed stream killed the task mid-loop.
+    """
+    if hook is None:
+        return
+    try:
+        hook(*args)
+    except Exception:  # noqa: BLE001 — reporting is never load-bearing
+        pass
+
+
 class Agent:
     """A tool-using loop over an LLMClient and a ToolRegistry.
 
@@ -87,6 +102,7 @@ class Agent:
         on_tool_call: Callable[[str, dict], None] | None = None,
         on_tool_result: Callable[[str, Any], None] | None = None,
         on_turn: Callable[[int, Message], None] | None = None,
+        on_request: Callable[[int], None] | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -96,6 +112,7 @@ class Agent:
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
         self.on_turn = on_turn
+        self.on_request = on_request
         self._terminated: _TerminateSignal | None = None
         if allow_self_terminate:
             self._register_terminate_tool()
@@ -149,18 +166,17 @@ class Agent:
                     msgs, turn - 1, used,
                 )
 
+            _notify(self.on_request, turn)
             resp = self.llm.chat(msgs, tools=self.registry.schemas())
             msgs.append(Message.assistant(resp.content, resp.tool_calls))
-            if self.on_turn:
-                self.on_turn(turn, msgs[-1])
+            _notify(self.on_turn, turn, msgs[-1])
 
             if not resp.tool_calls:
                 return AgentResult(resp.content, msgs, turn, used)
 
             for tc in resp.tool_calls:
                 used.append(tc.name)
-                if self.on_tool_call:
-                    self.on_tool_call(tc.name, tc.arguments)
+                _notify(self.on_tool_call, tc.name, tc.arguments)
                 try:
                     result = self.registry.call(tc.name, tc.arguments)
                 except _TerminateSignal as sig:
@@ -169,8 +185,7 @@ class Agent:
                         sig.summary, msgs, turn, used,
                         self_terminated=True, termination_reason=sig.reason,
                     )
-                if self.on_tool_result:
-                    self.on_tool_result(tc.name, result)
+                _notify(self.on_tool_result, tc.name, result)
                 msgs.append(Message.tool(result.output, tc.id, tc.name))
 
 

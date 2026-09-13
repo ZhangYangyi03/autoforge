@@ -116,6 +116,27 @@ class Sandbox:
     )
     runner: Callable[[str, str, dict[str, Any]], SandboxResult] | None = None
 
+    def effective_env(self) -> dict[str, str]:
+        """The environment forged code actually gets — not the agent's own.
+
+        Names missing from `env_allow` are dropped, so a command that resolves
+        for the agent process (a git-bash `ps`, say) can be unreachable from
+        inside the sandbox. Everything the prompt claims about this host is
+        built from *this* mapping, never from `os.environ`.
+        """
+        env = {k: v for k, v in os.environ.items() if k in self.env_allow}
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        return env
+
+    def reachable(self, names) -> tuple[list[str], list[str]]:
+        """Split `names` into (resolvable, not) from inside the sandbox."""
+        import shutil
+
+        path = self.effective_env().get("PATH")
+        found = [n for n in names if shutil.which(n, path=path)]
+        missing = [n for n in names if n not in found]
+        return found, missing
+
     def run(self, code: str, entry: str, args: dict[str, Any] | None = None) -> SandboxResult:
         if self.runner is not None:
             return self.runner(code, entry, args or {})
@@ -137,8 +158,7 @@ class Sandbox:
             with open(runner_path, "w", encoding="utf-8") as fh:
                 fh.write(_RUNNER)
 
-            env = {k: v for k, v in os.environ.items() if k in self.env_allow}
-            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env = self.effective_env()
 
             started = time.perf_counter()
             try:
