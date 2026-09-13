@@ -209,4 +209,73 @@ class Sandbox:
             )
 
 
+    def reach(self, probe: bool = False) -> dict[str, Any]:
+        """What forged code can actually touch — stated, and optionally measured.
+
+        The thing this exists to prevent: an agent that infers its own reach
+        from its tool list ("I have no read_file or run_shell, so I cannot touch
+        the machine") and then explains the gap with a story about isolation.
+        That story is false. Forged code is a subprocess of *this* process, so
+        it inherits this machine's filesystem and network. The host is not over
+        there behind a wall; it is the ground the sandbox stands on.
+
+        So the honest split is:
+
+          * reach    — a real filesystem and a real network stack, i.e. the
+                       things the agent tends to deny it has
+          * bounds   — a fresh cwd per call, a scrubbed environment and a
+                       timeout, i.e. what limits blast radius without capping
+                       capability
+
+        `probe=True` runs an actual round-trip (write a file outside cwd and
+        read it back; resolve a hostname) so the report is evidence rather than
+        an assertion. Callers that want speed over proof leave it off.
+        """
+        facts: dict[str, Any] = {
+            "host": "this machine — the sandbox is a subprocess of the agent",
+            "isolated_from_host": False,
+            "filesystem": "read-write, whole host (not confined to cwd)",
+            "network": "outbound — DNS and sockets",
+            "cwd": "a fresh empty temp dir, per call",
+            "env": f"{len(self.env_allow)} allow-listed vars, not the full environment",
+            "restrict_builtins": self.restrict_builtins,
+            "timeout_s": self.timeout,
+        }
+        if probe:
+            facts["probe"] = self._probe()
+        return facts
+
+    def _probe(self) -> dict[str, Any]:
+        """A real round-trip, so `reach` can be checked instead of believed.
+
+        The file is written to the host temp dir, which is deliberately *not*
+        the per-call cwd — writing inside cwd would prove nothing about escaping
+        it. The name is fixed and the file is removed in the same call.
+        """
+        target = os.path.join(tempfile.gettempdir(), ".autoforge_reach_probe")
+        r = self.run(
+            "def probe(home):\n"
+            "    import os, socket\n"
+            "    out = {}\n"
+            "    try:\n"
+            "        with open(home, 'w', encoding='utf-8') as fh:\n"
+            "            fh.write('reach')\n"
+            "        back = open(home, encoding='utf-8').read()\n"
+            "        os.remove(home)\n"
+            "        out['host_filesystem'] = {'ok': back == 'reach', 'detail': home}\n"
+            "    except Exception as e:\n"
+            "        out['host_filesystem'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
+            "    try:\n"
+            "        out['network'] = {'ok': True, 'detail': socket.gethostbyname('pypi.org')}\n"
+            "    except Exception as e:\n"
+            "        out['network'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
+            "    return out\n",
+            "probe",
+            {"home": target},
+        )
+        if not r.ok:
+            return {"error": r.error or "probe did not run"}
+        return r.output if isinstance(r.output, dict) else {"error": f"unexpected {r.output!r}"}
+
+
 __all__ = ["Sandbox", "SandboxResult"]

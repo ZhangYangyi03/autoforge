@@ -276,7 +276,14 @@ class ForgeAgent:
 
         self._add(ToolSpec(
             name="forge_tool",
-            description="Forge a new tool for a recurring need you cannot currently serve.",
+            description=(
+                "Forge a new tool for a recurring need you cannot currently "
+                "serve. The Python you write runs as a real subprocess on THIS "
+                "host — full filesystem and outbound network — so this is your "
+                "file and shell access. There is no separate read_file or "
+                "run_shell tool because forge_tool is that access: to read a "
+                "file or run a command, forge the tool."
+            ),
             parameters={"type": "object", "properties": {
                 "need": {"type": "string", "description": "one-line description of the need"},
             }, "required": ["need"]},
@@ -637,15 +644,17 @@ class ForgeAgent:
         ))
 
     def _tool_capabilities(self) -> None:
-        def my_capabilities() -> str:
+        def my_capabilities(probe: bool = False) -> str:
             """Report what this agent can actually reach — not what it declares.
 
-            The distinction matters: forge_tool executes generated code in the
-            sandbox, which deliberately does not consult the autonomy policy
-            (DESIGN.md §2.5 — bound the blast radius, do not cap capability).
-            So four freedoms here are switched on but unenforced. Saying that
-            plainly beats reporting a policy that reads like a cage and
-            behaves like a comment.
+            The reach half comes from `sandbox.reach()`, so it describes the
+            object that actually runs the code rather than a paragraph that can
+            drift away from it. An agent that reasons about its reach from its
+            tool list gets it wrong; this asks the thing that knows.
+
+            The policy half separates freedoms that are enforced from freedoms
+            that are only declared (DESIGN.md §2.5) — saying which is which
+            beats a policy that reads like a cage and behaves like a comment.
             """
             if not self.policy.expose_policy_to_self:
                 return "Denied by autonomy policy: expose_policy_to_self is off."
@@ -655,15 +664,35 @@ class ForgeAgent:
             partial = [r for r in rows if r["enforced"] == "partial"]
             inert = [r for r in rows if r["enforced"] == "declared-only"]
 
+            reach = self.sandbox.reach(probe=probe)
             lines = [
                 "What I can actually do:",
                 "",
-                "  Reach: forge_tool runs generated Python in a sandbox process.",
-                "         That process can read and write the host filesystem and",
-                "         open sockets. The autonomy policy does NOT gate it —",
-                "         by design, so capability is never capped. Treat a forged",
-                "         tool as shell access with a timeout.",
+                f"  Reach: forge_tool runs generated Python on {reach['host']}.",
+                f"         filesystem — {reach['filesystem']}",
+                f"         network    — {reach['network']}",
+                f"         bounds     — {reach['cwd']}; {reach['env']}; "
+                f"{reach['timeout_s']}s timeout",
+                "         The autonomy policy does NOT gate this, by design, so",
+                "         capability is never capped. A forged tool is shell",
+                "         access with a timeout: to read a file or run a command,",
+                "         forge the tool. 'I have no file tools' is false.",
             ]
+            probe_result = reach.get("probe")
+            if isinstance(probe_result, dict):
+                if probe_result.get("error"):
+                    lines.append(
+                        f"  Live self-test: did not run ({probe_result['error']})")
+                else:
+                    fs = probe_result.get("host_filesystem", {})
+                    net = probe_result.get("network", {})
+                    lines += [
+                        "  Live self-test (measured just now):",
+                        f"    - host filesystem: {'OK' if fs.get('ok') else 'FAILED'}"
+                        f" — {fs.get('detail', '')}",
+                        f"    - network:         {'OK' if net.get('ok') else 'FAILED'}"
+                        f" — {net.get('detail', '')}",
+                    ]
             if self.policy.may_spawn_agents:
                 lines.append("  Children: I can spawn agents that inherit this policy.")
             lines += self._gpu_reach_lines()
@@ -689,9 +718,15 @@ class ForgeAgent:
             name="my_capabilities",
             description=(
                 "Report your real reach: which freedoms are enforced, which are "
-                "declared only, and what the sandbox will let forged code do."
+                "declared only, and what the sandbox lets forged code touch. "
+                "Forged code runs on THIS host with a real filesystem and "
+                "network — pass probe=true to prove it with a live round-trip "
+                "instead of taking it on faith."
             ),
-            parameters={"type": "object", "properties": {}},
+            parameters={"type": "object", "properties": {
+                "probe": {"type": "boolean", "description":
+                          "run a live write/read + DNS round-trip to measure reach"},
+            }},
             fn=my_capabilities, source="builtin", tags=["meta"],
         ))
 
