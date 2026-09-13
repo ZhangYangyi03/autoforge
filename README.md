@@ -359,7 +359,7 @@ spawning, and self-designed multi-agent topology. On top of it an
 anti-misevolution layer: an independent validity gate, a fitness function the
 mutant cannot author, a frozen baseline that only ratchets forward, Pareto
 selection so safety cannot be paid for with capability, and metamorphic
-oracles so the robustness layer actually has a verdict. 397 tests passing.
+oracles so the robustness layer actually has a verdict. 410 tests passing.
 MIT.
 
 **Breaking since v0.3.0:** the robustness check now has an oracle. Tools that
@@ -373,8 +373,13 @@ host: forged code runs as a subprocess of the agent process on the same machine,
 with the whole host filesystem and outbound network. `Sandbox.reach(probe=True)`
 measures that with a real round-trip rather than asserting it, and
 `my_capabilities` reports the measurement — because an agent that answers "can
-you reach my machine?" from its tool list gets the answer wrong. Routing uses
-lexical similarity rather than
-embeddings — swap `text_similarity` for a vector index when the library is big
-enough to need it. `RoleType.FORGE` is declarative only: a topology names a
-forge role, it does not yet change which tools that child can reach.
+you reach my machine?" from its tool list gets the answer wrong. The same rule
+covers memory: the tool ledger is sqlite on disk (`ToolStore.report()`), forged
+tools are persisted so they survive a restart, and `my_history` reads the ledger
+and the self-modification log back. A measured self-report is appended to the
+system prompt on every request, so the agent's description of itself is
+recomputed from the machine instead of drifting as prose. Routing uses lexical
+similarity rather than embeddings — swap `text_similarity` for a vector index
+when the library is big enough to need it. `RoleType.FORGE` is declarative only:
+a topology names a forge role, it does not yet change which tools that child can
+reach.

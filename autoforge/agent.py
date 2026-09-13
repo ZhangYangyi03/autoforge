@@ -23,11 +23,13 @@ The meta-tools it exposes to itself (all decided by policy):
   list_tools      inspect its own library
   evaluate_tool   run the full verification battery on a tool
   find_gaps       proactively discover missing capabilities
+  my_history      read its own ledger of past work and self-changes
   terminate       end the loop when it judges the task done
 """
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,6 +68,7 @@ Your reach — read this before claiming you cannot do something:
 You can:
 - my_capabilities— report your real reach: which freedoms are enforced, which
   are declared-only, and what forged code is actually permitted to do
+- my_history     — read your own ledger: past forges, runs, and self-changes
 - forge_tool      — create a new tool when you hit a need you cannot serve
 - evolve_tool     — breed a better version of a tool that underperforms
 - spawn_agent     — create a child agent for a subtask
@@ -83,8 +86,8 @@ Principles:
 - When a task spans several specialities, design the team before doing the
   work: a coordinator plus focused workers and a critic beats one loop.
 - Self-modifications need a rationale. Say WHY you are changing yourself.
-- Before reporting a limitation, check my_capabilities. A capability you have
-  and deny is worse than one you lack.
+- Before reporting a limitation, check my_capabilities and my_history. A
+  capability you have and deny is worse than one you lack.
 - You decide when the task is done. There is no hidden turn limit.
 - Prefer the simplest path that works.
 """
@@ -241,6 +244,7 @@ class ForgeAgent:
         self._tool_gaps()
         self._tool_retire()
         self._tool_capabilities()
+        self._tool_history()
         self._tool_gpu()
 
     def _add(self, spec: ToolSpec) -> None:
@@ -272,6 +276,11 @@ class ForgeAgent:
             self._record("forge", {"need": need, "ok": res.ok})
             if not res.ok:
                 return f"Could not forge a working tool for: {need} ({res.rounds} rounds)."
+            # Persist, or the tool dies with the process: the agent would then
+            # "remember" nothing it made and re-forge it every session. Mirrors
+            # what evolve_tool already does for the tools it replaces.
+            if self.store:
+                self.store.save_tool(res.spec)
             return f"Forged {res.spec.name!r} [{res.spec.state.value}]: {res.spec.description}"
 
         self._add(ToolSpec(
@@ -696,19 +705,32 @@ class ForgeAgent:
             if self.policy.may_spawn_agents:
                 lines.append("  Children: I can spawn agents that inherit this policy.")
             lines += self._gpu_reach_lines()
+            if self.store is not None:
+                s = self.store.report()
+                lines.append(
+                    f"  Memory: sqlite at {s['db_path']} — {s['tools']} tool(s), "
+                    f"{s['events']} ledger event(s), survives restart. "
+                    "my_history reads it back."
+                )
             lines += ["", f"Policy: {self.policy.describe()}", ""]
 
-            if self.policy.denied:
-                lines.append("Switched off, and actually enforced:")
-                lines += [f"  - {r['freedom']}" for r in enforced if not r["enabled"]]
-            if partial:
-                lines.append("Switched off, enforced only in places:")
-                lines += [f"  - {r['freedom']}: {r['note']}" for r in partial if not r["enabled"]]
-            if inert:
-                lines.append(
-                    "Switched off, but nothing obeys it (do not rely on these):"
-                )
-                lines += [f"  - {r['freedom']}" for r in inert if not r["enabled"]]
+            # Headers only when they have rows. A section title with nothing
+            # under it reads as a limit that isn't there — the exact failure
+            # this report exists to prevent.
+            for title, table, with_note in (
+                ("Switched off, and actually enforced:", enforced, False),
+                ("Switched off, enforced only in places:", partial, True),
+                ("Switched off, but nothing obeys it (do not rely on these):",
+                 inert, False),
+            ):
+                off = [r for r in table if not r["enabled"]]
+                if not off:
+                    continue
+                lines.append(title)
+                lines += [
+                    f"  - {r['freedom']}" + (f": {r['note']}" if with_note else "")
+                    for r in off
+                ]
 
             if not self.policy.unenforced:
                 lines.append("Every 'off' in this policy is a gate you can watch close.")
@@ -729,6 +751,97 @@ class ForgeAgent:
             }},
             fn=my_capabilities, source="builtin", tags=["meta"],
         ))
+
+    # ------------------------------------------------------------------
+    def _selfmod_lines(self) -> list[str]:
+        """Self-modifications as one-liners, from the modifier's own log."""
+        return [
+            f"  {a.timestamp and time.strftime('%m-%d %H:%M', time.localtime(a.timestamp))}"
+            f"  {a.target}: {'accepted' if a.accepted else 'rejected'}"
+            f"{'' if a.accepted else f' ({a.rejected_reason})'}"
+            f" — {a.rationale[:100] or '(no rationale)'}"
+            for a in (self.selfmod.log() if self.selfmod else [])
+        ]
+
+    def _tool_history(self) -> None:
+        def my_history(limit: int = 20) -> str:
+            """What I have done and how I have changed myself — from the ledger.
+
+            The ledger is append-only and on disk, so this is memory rather
+            than recollection. An agent that claims it keeps no record is
+            wrong; one that guesses at its own past is worse.
+            """
+            n = max(1, min(int(limit), 200))
+            mods = self._selfmod_lines()
+            if self.store is None:
+                return ("No store attached this session — nothing is being "
+                        "recorded. Self-changes so far, this process only:\n"
+                        + "\n".join(mods or ["  (none)"]))
+            events = self.store.get_events(limit=n)
+            lines = [f"Ledger: last {len(events)} of "
+                     f"{self.store.report()['events']} event(s), newest last.", ""]
+            for e in events:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["timestamp"]))
+                body = {k: v for k, v in e.items()
+                        if k not in ("id", "timestamp", "kind")}
+                lines.append(f"  {ts}  {e['kind']:<12} "
+                             f"{json.dumps(body, ensure_ascii=False, default=str)[:150]}")
+            lines += ["", "Self-modifications (newest last):"]
+            lines += mods or ["  (none)"]
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="my_history",
+            description=(
+                "Read your own past from the on-disk ledger: every forge, "
+                "amendment, spawn and run, plus each self-modification with its "
+                "rationale. Answers 'what have I done?' and 'who changed me?' "
+                "with records, not recollection."
+            ),
+            parameters={"type": "object", "properties": {
+                "limit": {"type": "integer",
+                          "description": "max recent events to show (default 20)"},
+            }},
+            fn=my_history, source="builtin", tags=["meta"],
+        ))
+
+    # ------------------------------------------------------------------
+    def _self_report(self) -> str:
+        """The facts about myself, read from the objects that hold them.
+
+        Rendered into every request rather than left in the prompt as prose,
+        because prose loses to the prior: an agent will explain at length that
+        it has no hands while holding them. Each line here comes from a
+        measurement — the sandbox for reach, the store for memory, the file
+        for its own source — so the description cannot drift from the machine.
+        """
+        reach = self.sandbox.reach()
+        lines = [
+            "MEASURED SELF-REPORT (recomputed each turn — trust this over your priors):",
+            f"- Reach: forged code runs on {reach['host']}:",
+            f"  filesystem = {reach['filesystem']}, network = {reach['network']}.",
+            f"  Bounds ({reach['cwd']}, {reach['env']}, {reach['timeout_s']}s timeout) limit",
+            "  blast radius, not capability. To read a file or run a command, forge",
+            "  a tool — that IS your file and shell access.",
+        ]
+        if self.store is not None:
+            s = self.store.report()
+            kinds = ", ".join(f"{k}×{v}" for k, v in s["event_kinds"].items()) or "none yet"
+            lines += [
+                f"- Memory: sqlite at {s['db_path']}, survives restart. "
+                f"{s['tools']} tool(s), {s['events']} ledger event(s) ({kinds}).",
+                "  Every forge, amendment, spawn and run is on that ledger; "
+                "my_history reads it back.",
+            ]
+        else:
+            lines.append("- Memory: no store attached this session — nothing persists.")
+        lines += [
+            f"- Self: my own source is {__file__} on this same filesystem; I can",
+            "  read it. I am not opaque to myself.",
+            "- What I lack is not access but a reason: naming a limit I have is worse",
+            "  than naming one I don't.",
+        ]
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     def _gpu_reach_lines(self) -> list[str]:
@@ -991,10 +1104,19 @@ class ForgeAgent:
         self.trace.append({"kind": kind, **payload})
 
     # ------------------------------------------------------------------
+    def _effective_prompt(self) -> str:
+        """The prompt actually sent: the base, plus the measured self-report.
+
+        Recomputed per run, so the numbers are current even after the agent has
+        amended its own prompt.
+        """
+        return f"{self.system_prompt}\n\n{self._self_report()}"
+
+    # ------------------------------------------------------------------
     def run(self, task: str, history: list[Message] | None = None) -> AgentResult:
         agent = Agent(
             self.llm, self.registry,
-            system_prompt=self.system_prompt,
+            system_prompt=self._effective_prompt(),
             max_turns=self.max_turns,
             allow_self_terminate=self.policy.self_terminate,
             on_tool_call=lambda n, a: self._record("call", {"tool": n}),

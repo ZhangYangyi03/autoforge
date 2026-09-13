@@ -372,4 +372,40 @@ class ToolStore:
         return results
 
 
+    # -- self-report ------------------------------------------------------
+    def report(self) -> dict[str, Any]:
+        """What this store actually persists — facts, for the agent's self-model.
+
+        Exists because an agent asked "do you remember across sessions?" should
+        not answer from its prior. The ledger is on disk; ask it what it holds.
+        """
+        def _one(sql: str) -> Any:
+            row = self._conn.execute(sql).fetchone()
+            return row[0] if row else None
+
+        tools = _one("SELECT COUNT(*) FROM tools") or 0
+        states = {
+            r["state"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT state, COUNT(*) n FROM tools GROUP BY state ORDER BY state")
+        }
+        events = _one("SELECT COUNT(*) FROM forge_events") or 0
+        kinds = {
+            r["kind"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT kind, COUNT(*) n FROM forge_events GROUP BY kind ORDER BY kind")
+        }
+        return {
+            "backend": "sqlite",
+            "db_path": os.path.abspath(self.db_path),
+            "survives_restart": True,
+            "tools": tools,
+            "tool_states": states,
+            "events": events,
+            "event_kinds": kinds,
+            "since": _one("SELECT MIN(timestamp) FROM forge_events"),
+            "until": _one("SELECT MAX(timestamp) FROM forge_events"),
+        }
+
+
 __all__ = ["ToolStore", "ToolRecord"]
