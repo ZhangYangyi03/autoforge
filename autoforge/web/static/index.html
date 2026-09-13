@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>autoforge harness</title>
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#12151a; --panel2:#171b21; --line:#22272f;
+    --fg:#d8dee6; --dim:#7c8794; --faint:#4d5560;
+    --blue:#4c9aff; --cyan:#37d3c4; --amber:#e3b341; --green:#4ec97e;
+    --orange:#f0883e; --red:#f25f5c; --purple:#a98bf0; --pink:#e879b9;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--fg);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    display:flex;flex-direction:column;overflow:hidden;
+  }
+  button,input,select,textarea{font:inherit;color:inherit}
+  button{background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    padding:5px 11px;cursor:pointer;transition:.12s}
+  button:hover{border-color:#39414d;background:#1d222a}
+  button.primary{background:#1d4ed8;border-color:#2b5fe0;color:#fff}
+  button.primary:hover{background:#2559e8}
+  button.ghost{background:transparent}
+  button:disabled{opacity:.45;cursor:not-allowed}
+
+  /* ---- top bar ---- */
+  header{display:flex;align-items:center;gap:13px;padding:9px 15px;
+    border-bottom:1px solid var(--line);background:var(--panel);flex:none}
+  .brand{font-weight:650;letter-spacing:-.2px}
+  .brand span{color:var(--faint);font-weight:400}
+  .badge{font:11px/1 var(--mono);color:var(--dim);background:var(--panel2);
+    border:1px solid var(--line);border-radius:20px;padding:4px 9px;white-space:nowrap}
+  .spacer{flex:1}
+  select{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+
+  /* ---- layout ---- */
+  main{flex:1;display:flex;min-height:0}
+  aside{width:225px;flex:none;border-right:1px solid var(--line);
+    background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  aside h3{margin:0;padding:10px 13px 7px;font-size:11px;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--faint);font-weight:600}
+  .list{overflow-y:auto;flex:1;padding:0 8px 10px}
+  .sess{padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:3px;
+    border:1px solid transparent}
+  .sess:hover{background:var(--panel2)}
+  .sess.on{background:#182231;border-color:#24354d}
+  .sess .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess .m{font:10.5px/1.4 var(--mono);color:var(--faint);margin-top:2px}
+
+  section.chat{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+
+  /* ---- transcript ---- */
+  #log{flex:1;overflow-y:auto;padding:18px 22px;display:flex;
+    flex-direction:column;gap:11px}
+  .msg{max-width:min(860px,92%);border-radius:9px;padding:10px 14px;
+    border:1px solid var(--line);background:var(--panel)}
+  .msg .who{font:10.5px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:6px}
+  .msg.user{align-self:flex-end;background:#16202e;border-color:#22344a}
+  .msg.assistant{align-self:flex-start;border-color:#1f3b34}
+  .msg.assistant .who{color:var(--cyan)}
+  .msg.user .who{color:var(--blue)}
+  .msg.system{align-self:center;background:transparent;border-style:dashed;
+    color:var(--dim);font-size:12.5px;max-width:80%}
+  .msg.error{border-color:#5a2b2b;background:#1d1416}
+  .msg.error .who{color:var(--red)}
+  .msg pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-word;
+    font:12.5px/1.55 var(--mono);background:#0d1014;border:1px solid var(--line);
+    border-radius:6px;padding:9px 11px;overflow-x:auto}
+  .msg .body{white-space:pre-wrap;word-break:break-word}
+  .empty{color:var(--faint);text-align:center;margin:auto;max-width:430px;line-height:1.9}
+  .empty code{font:12.5px var(--mono);color:var(--cyan);background:#0d1014;
+    border:1px solid var(--line);border-radius:4px;padding:2px 6px}
+
+  /* ---- checks table ---- */
+  table.checks{width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px}
+  table.checks td{padding:3px 7px;border-bottom:1px solid var(--line);
+    vertical-align:top}
+  table.checks td.k{font:11.5px var(--mono);color:var(--dim);white-space:nowrap;width:1%}
+  .pass{color:var(--green)}.fail{color:var(--red)}
+
+  /* ---- composer ---- */
+  .composer{flex:none;border-top:1px solid var(--line);background:var(--panel);
+    padding:11px 15px}
+  .row{display:flex;gap:9px;align-items:flex-end}
+  textarea{flex:1;resize:none;background:var(--panel2);border:1px solid var(--line);
+    border-radius:8px;padding:10px 12px;min-height:44px;max-height:190px;
+    font-family:inherit;outline:none}
+  textarea:focus{border-color:#31506f}
+  .hint{font:11px/1.6 var(--mono);color:var(--faint);margin-top:6px}
+  .hint b{color:var(--dim);font-weight:500}
+
+  /* ---- trace panel ---- */
+  aside.trace{width:335px;border-right:none;border-left:1px solid var(--line)}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;padding:0 11px 9px}
+  .chip{font:10.5px/1 var(--mono);border:1px solid var(--line);border-radius:20px;
+    padding:4px 8px;cursor:pointer;color:var(--dim);background:transparent}
+  .chip.on{color:#0b0d10;border-color:transparent}
+  .tlist{overflow-y:auto;flex:1;padding:0 11px 14px}
+  .te{border-left:2px solid var(--line);padding:5px 0 6px 9px;margin-bottom:5px}
+  .te .h{font:10px/1.5 var(--mono);color:var(--faint);display:flex;gap:7px}
+  .te .x{font:12px/1.5 var(--mono);word-break:break-word;white-space:pre-wrap}
+  .te[data-s=user]{border-color:var(--blue)}
+  .te[data-s=assistant]{border-color:var(--cyan)}
+  .te[data-s=system]{border-color:var(--faint)}
+  .te[data-s=error]{border-color:var(--red)}
+  .te[data-s=tool_call]{border-color:var(--amber)}
+  .te[data-s=tool_result]{border-color:var(--green)}
+  .te[data-s=forge]{border-color:var(--orange)}
+  .te[data-s=subagent]{border-color:var(--pink)}
+  .te[data-s=selfmod]{border-color:var(--purple)}
+  .tools{padding:0 11px 12px;max-height:190px;overflow-y:auto}
+  .tool{display:flex;justify-content:space-between;gap:8px;font:11.5px var(--mono);
+    padding:3px 0;border-bottom:1px solid #191d23}
+  .tool .st{color:var(--faint)}
+  .live{width:6px;height:6px;border-radius:50%;background:var(--faint);display:inline-block}
+  .live.on{background:var(--green);box-shadow:0 0 7px var(--green)}
+  .hidden{display:none!important}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#2a313a;border-radius:5px}
+  ::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">autoforge <span>harness</span></div>
+  <span class="badge" id="bModel">…</span>
+  <span class="badge" id="bBase"></span>
+  <select id="mode" title="runtime mode">
+    <option value="standard">standard — full forging agent</option>
+    <option value="minimal">minimal — two-tool coding agent</option>
+  </select>
+  <button class="primary" id="bNew">+ New session</button>
+  <div class="spacer"></div>
+  <span class="live" id="live" title="stream"></span>
+  <button class="ghost" id="bTrace">Trace</button>
+  <button class="ghost" id="bTools">Tools</button>
+</header>
+
+<main>
+  <aside>
+    <h3>Sessions</h3>
+    <div class="list" id="sessions"></div>
+  </aside>
+
+  <section class="chat">
+    <div id="log">
+      <div class="empty">
+        <div style="font-size:15px;color:var(--fg);margin-bottom:10px">Give the agent a need. It builds the tool.</div>
+        Try <code>I keep needing to normalise ISBN-10 and ISBN-13 identifiers</code><br>
+        then ask it to use the tool it just made.<br><br>
+        Everything the model sees shows up in the <b>Trace</b> panel, by source.
+      </div>
+    </div>
+    <div class="composer">
+      <div class="row">
+        <textarea id="input" rows="1"
+          placeholder="Tell the agent what you need…  (⏎ send · ⇧⏎ newline)"></textarea>
+        <button class="primary" id="bSend">Send</button>
+        <button id="bForge" title="run the forge pipeline directly on this need">Forge</button>
+      </div>
+      <div class="hint"><b>Forge</b> runs the 5-check gate: execution · robustness · adversarial · trigger · negative</div>
+    </div>
+  </section>
+
+  <aside class="trace">
+    <h3>Trajectory <span id="tCount" style="color:var(--faint)"></span></h3>
+    <div class="chips" id="chips"></div>
+    <div class="tlist" id="trace"></div>
+    <h3>Tools</h3>
+    <div class="tools" id="tools"></div>
+  </aside>
+</main>
+
+<script>
+const SOURCES = ["user","assistant","tool_call","tool_result","forge","system","error","subagent","selfmod","reasoning"];
+const COLOR = {user:"--blue",assistant:"--cyan",tool_call:"--amber",tool_result:"--green",
+  forge:"--orange",system:"--faint",error:"--red",subagent:"--pink",selfmod:"--purple",
+  reasoning:"--purple"};
+
+let current = null;          // session id
+let events = [];             // events of the current session
+let es = null;               // EventSource
+let hidden = new Set();      // source filter
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- api
+async function api(path, opts) {
+  const res = await fetch(path, {
+    headers: {"Content-Type": "application/json"},
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).error || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// ---------------------------------------------------------------- state
+async function loadState() {
+  const s = await api("/api/state");
+  $("bModel").textContent = s.model || "?";
+  $("bBase").textContent = (s.base || "").replace(/^https?:\/\//, "");
+  $("bBase").title = s.base || "";
+  $("mode").value = s.default_mode || "standard";
+  document.title = `autoforge harness — ${s.model || ""}`;
+}
+
+async function loadSessions() {
+  const {sessions} = await api("/api/sessions");
+  const box = $("sessions");
+  if (!sessions.length) {
+    box.innerHTML = `<div style="color:var(--faint);font:11.5px var(--mono);padding:4px 6px">none yet</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const s of sessions) {
+    const el = document.createElement("div");
+    el.className = "sess" + (s.id === current ? " on" : "");
+    const when = new Date(s.updated * 1000).toLocaleTimeString();
+    el.innerHTML = `<div class="t"></div><div class="m">${s.mode} · ${s.events}ev · ${when}${s.busy ? " · ●" : ""}</div>`;
+    el.querySelector(".t").textContent = s.title;
+    el.onclick = () => openSession(s.id);
+    box.appendChild(el);
+  }
+}
+
+async function loadTools() {
+  try {
+    const t = await api("/api/tools");
+    const box = $("tools");
+    const list = t.tools || [];
+    if (!list.length) {
+      box.innerHTML = `<div style="color:var(--faint);font:11.5px var(--mono)">none yet — forge one</div>`;
+      return;
+    }
+    box.innerHTML = list.map(x =>
+      `<div class="tool"><span>${esc(x.name)}</span><span class="st">${esc(x.state || "")}</span></div>`
+    ).join("");
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------- sessions
+async function newSession() {
+  const mode = $("mode").value;
+  const s = await api("/api/sessions", {method: "POST", body: JSON.stringify({mode})});
+  await loadSessions();
+  openSession(s.id);
+}
+
+async function openSession(id) {
+  if (es) { es.close(); es = null; }
+  current = id; events = [];
+  hidden = new Set(); renderChips();
+  $("log").innerHTML = "";
+  $("trace").innerHTML = "";
+  const s = await api(`/api/sessions/${id}`);
+  for (const ev of s.events) ingest(ev);
+  renderLog();
+  subscribe(id, events.length ? events[events.length - 1].seq : 0);
+  loadSessions();
+  $("input").focus();
+}
+
+function subscribe(id, after) {
+  if (es) es.close();
+  es = new EventSource(`/api/sessions/${id}/stream?after=${after}`);
+  es.onopen = () => $("live").classList.add("on");
+  es.onerror = () => { $("live").classList.remove("on"); };
+  es.onmessage = (m) => {
+    let ev; try { ev = JSON.parse(m.data); } catch (e) { return; }
+    if (ev.seq <= (events.at(-1)?.seq || 0)) return;
+    ingest(ev); renderLog(); loadSessions();
+    if (ev.source === "forge" || ev.source === "tool_result") loadTools();
+  };
+}
+
+// ---------------------------------------------------------------- render
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function ingest(ev) {
+  events.push(ev);
+  if (ev.source === "forge" && ev.checks) forges.push(ev);
+  const el = document.createElement("div");
+  el.className = "te";
+  el.dataset.s = ev.source;
+  el.dataset.seq = ev.seq;
+  if (hidden.has(ev.source)) el.classList.add("hidden");
+  const at = new Date(ev.t * 1000).toLocaleTimeString();
+  el.innerHTML = `<div class="h"><span style="color:var(${COLOR[ev.source] || "--dim"})">${esc(ev.source)}</span><span>${at}</span><span>#${ev.seq}</span></div><div class="x"></div>`;
+  el.querySelector(".x").textContent = ev.text || "";
+  $("trace").appendChild(el);
+  $("trace").scrollTop = $("trace").scrollHeight;
+  $("tCount").textContent = `(${events.length})`;
+}
+
+const forges = [];
+
+function renderLog() {
+  const log = $("log");
+  const chatty = events.filter(e => ["user","assistant","system","error","forge"].includes(e.source));
+  if (!chatty.length) return;
+  log.innerHTML = "";
+  for (const ev of chatty) log.appendChild(bubble(ev));
+  log.scrollTop = log.scrollHeight;
+}
+
+function bubble(ev) {
+  const el = document.createElement("div");
+  const who = {user:"you", assistant:"agent", system:"system", error:"error", forge:"forge"}[ev.source] || ev.source;
+  el.className = "msg " + (ev.source === "error" ? "error" : ev.source);
+  el.innerHTML = `<div class="who">${esc(who)}</div><div class="body"></div>`;
+  el.querySelector(".body").textContent = ev.text || "";
+  if (ev.checks && ev.checks.length) {
+    const rows = ev.checks.map(c =>
+      `<tr><td class="k">r${c.round}</td><td class="k">${esc(c.name)}</td>
+       <td class="${c.passed ? "pass" : "fail"}">${c.passed ? "PASS" : "FAIL"}</td>
+       <td>${esc(c.detail)}</td></tr>`).join("");
+    el.insertAdjacentHTML("beforeend", `<table class="checks">${rows}</table>`);
+  }
+  if (ev.source === "error" && ev.detail) {
+    el.insertAdjacentHTML("beforeend", `<pre>${esc(ev.detail)}</pre>`);
+  }
+  return el;
+}
+
+function renderChips() {
+  const box = $("chips");
+  box.innerHTML = "";
+  for (const s of SOURCES) {
+    const c = document.createElement("span");
+    c.className = "chip" + (hidden.has(s) ? "" : " on");
+    c.textContent = s;
+    if (!hidden.has(s)) c.style.background = `var(${COLOR[s]})`;
+    c.onclick = () => {
+      if (hidden.has(s)) hidden.delete(s); else hidden.add(s);
+      renderChips();
+      document.querySelectorAll(".te").forEach(el => {
+        el.classList.toggle("hidden", hidden.has(el.dataset.s));
+      });
+    };
+    box.appendChild(c);
+  }
+}
+
+// ---------------------------------------------------------------- actions
+async function send(kind) {
+  if (!current) { await newSession(); }
+  const box = $("input");
+  const text = box.value.trim();
+  if (!text) return;
+  box.value = ""; box.style.height = "auto";
+  $("bSend").disabled = $("bForge").disabled = true;
+  try {
+    await api(`/api/sessions/${current}/${kind}`,
+      {method: "POST", body: JSON.stringify(kind === "send" ? {text} : {need: text})});
+  } catch (e) {
+    ingest({seq: (events.at(-1)?.seq || 0) + 1, t: Date.now() / 1000, source: "error", text: e.message});
+    renderLog();
+  } finally {
+    $("bSend").disabled = $("bForge").disabled = false;
+    setTimeout(() => { $("bSend").disabled = $("bForge").disabled = false; }, 400);
+    box.focus();
+  }
+}
+
+// ---------------------------------------------------------------- wiring
+$("bNew").onclick = newSession;
+$("bSend").onclick = () => send("send");
+$("bForge").onclick = () => send("forge");
+$("bTrace").onclick = () => document.querySelector("aside.trace").classList.toggle("hidden");
+$("bTools").onclick = () => { loadTools(); $("tools").scrollIntoView(); };
+
+const input = $("input");
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send("send"); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 190) + "px";
+});
+
+(async function boot() {
+  try {
+    await loadState();
+    await loadSessions();
+    await loadTools();
+  } catch (e) {
+    ingesting = null;
+    console.error(e);
+  }
+  setInterval(loadSessions, 5000);
+  input.focus();
+})();
+</script>
+</body>
+</html>

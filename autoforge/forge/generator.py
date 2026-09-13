@@ -6,7 +6,11 @@ Two generators, one interface:
   function plus its schema and trigger probes. The model is told to emit a
   *strict JSON envelope*, and we parse defensively: models wrap JSON in
   prose, fences, or trailing commentary often enough that a strict
-  `json.loads` is a bug, not a test.
+  `json.loads` is a bug, not a test. The envelope itself also arrives
+  near-miss — unescaped quotes inside the `code` field, trailing commas, and
+  (the defect that broke the first live runs on *both* aiping and a local
+  qwen2.5:7b) a stray `}` that closes the object after `code` while the model
+  then keeps writing `entry`/`parameters`/`probes`. See `_repair_variants`.
 
 * `TemplateGenerator` — deterministic, offline, no API key. Used by the demo
   and by tests to prove the pipeline end-to-end without network.
@@ -29,6 +33,17 @@ from ..tools.spec import ToolSpec, ToolState, TriggerProbe, normalise_parameters
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _BRACE_RE = re.compile(r"\{.*\}", re.DOTALL)
 _BRACKET_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+class UnrecoverableGeneration(RuntimeError):
+    """The model cannot answer under this configuration, so a retry is futile.
+
+    Deliberately *not* a ValueError. A malformed or truncated envelope is worth
+    another round with sharper feedback -- that is what the round budget is for.
+    A reasoning model that spends the whole `max_tokens` budget thinking and
+    never begins its answer will do the identical thing next round, so the
+    distinction has to be visible to whoever decides whether to loop.
+    """
 
 
 @dataclass
@@ -55,20 +70,77 @@ _VALID_ESCAPE_RE = re.compile(r"\\(?![\\/\"bfnrtu])")
 _TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
 
 
+def _next_significant(text: str, j: int) -> tuple[str, int]:
+    """The next non-whitespace character at or after ``j``, and its index."""
+    n = len(text)
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    return (text[j] if j < n else ""), j
+
+
+def _key_follows(text: str, j: int) -> bool:
+    """At ``j`` (a ``"``), does a ``"key":`` pair start here?"""
+    n = len(text)
+    k = j + 1
+    while k < n:
+        if text[k] == "\\":
+            k += 2
+            continue
+        if text[k] == '"':
+            nxt, _ = _next_significant(text, k + 1)
+            return nxt == ":"
+        if text[k] == "\n":
+            return False
+        k += 1
+    return False
+
+
+def _ends_string_here(text: str, i: int, is_key: bool, stack: list[str]) -> bool:
+    """Can the ``"`` at ``i`` close the string, given what follows it?
+
+    The decision is structural, not textual. ``:`` may only close a *key*, so a
+    ``"`` before a colon can never end a value -- which is exactly the case that
+    broke: ``code`` holding ``{"isbn13": parts}``. A ``,`` may close a value,
+    but only if what follows can still be JSON: another ``"key":`` in an object,
+    or anything in an array.
+    """
+    nxt, j = _next_significant(text, i + 1)
+    if nxt == "":
+        return True                          # end of input closes the string
+    if is_key:
+        return nxt == ":"                    # only a key is followed by a colon
+    if nxt == ",":
+        if stack and stack[-1] == "[":
+            return True                      # next array element
+        after, k = _next_significant(text, j + 1)
+        return after == '"' and _key_follows(text, k)
+    if nxt == "}":
+        return bool(stack) and stack[-1] == "{"
+    if nxt == "]":
+        return bool(stack) and stack[-1] == "["
+    return False
+
+
 def _fix_unescaped_quotes(text: str) -> str:
     """Escape double quotes that appear *inside* a JSON string value.
 
     Observed defect: the model embeds Python source in the ``code`` field and
-    writes ``raise ValueError("Invalid check digit")`` with the inner quotes
-    unescaped. The JSON string then terminates early and the parser dies with
-    "Expecting ',' delimiter".
+    writes ``raise ValueError("Invalid check digit")`` -- or a dict literal like
+    ``{"isbn13": parts}`` -- with the inner quotes unescaped. The JSON string
+    then terminates early and the parser dies with "Expecting ',' delimiter".
 
-    Heuristic: while inside a string, a ``"`` that is *not* followed (after
-    optional whitespace) by ``, : } ]`` or end-of-input is content, not a
-    terminator -- so escape it.
+    A purely textual rule cannot separate those inner quotes from the structural
+    ones, because the same characters introduce them: in ``{"a": 1}`` the quote
+    after the key is followed by ``:``, which looks exactly like a real key
+    ending. What distinguishes them is *position* -- a value string can never be
+    closed by ``:`` -- so the scanner tracks whether it is inside a key or a
+    value, and which container it is in (see `_ends_string_here`).
     """
     out: list[str] = []
+    stack: list[str] = []                    # '{' / '[' for each open container
+    expect_key = False                       # a key may start here
     in_string = False
+    is_key = False                           # the current string is a key
     i = 0
     n = len(text)
     while i < n:
@@ -77,6 +149,18 @@ def _fix_unescaped_quotes(text: str) -> str:
         if not in_string:
             if ch == '"':
                 in_string = True
+                is_key = expect_key
+            elif ch in "{[":
+                stack.append(ch)
+                expect_key = ch == "{"
+            elif ch in "}]":
+                if stack:
+                    stack.pop()
+                expect_key = bool(stack) and stack[-1] == "{"
+            elif ch == ",":
+                expect_key = bool(stack) and stack[-1] == "{"
+            elif ch == ":":
+                expect_key = False
             out.append(ch)
             i += 1
             continue
@@ -90,13 +174,10 @@ def _fix_unescaped_quotes(text: str) -> str:
             continue
 
         if ch == '"':
-            j = i + 1
-            while j < n and text[j] in " \t\r\n":
-                j += 1
-            nxt = text[j] if j < n else ""
-            if nxt in (":", ",", "}", "]", ""):
+            if _ends_string_here(text, i, is_key, stack):
                 out.append('"')              # genuine terminator
                 in_string = False
+                expect_key = bool(stack) and stack[-1] == "{"
             else:
                 out.append('\\"')            # stray quote inside content
             i += 1
@@ -107,9 +188,73 @@ def _fix_unescaped_quotes(text: str) -> str:
     return "".join(out)
 
 
+def _drop_stray_closers(text: str) -> str:
+    """Remove ``}``/``]`` the model wrote before the envelope was finished.
+
+    The captured failure (Qwen3.5-Flash via aiping; qwen2.5:7b locally emits the
+    same shape) closes the object right after ``code`` and then keeps going::
+
+        { "name": ..., "description": ..., "code": "..." },   <- stray `}`
+          "entry": ..., "parameters": {...}, "probes": [...] }
+
+    ``json.loads`` reports ``Extra data: line 5 column 4``; ``raw_decode`` stops
+    at the stray brace and hands back only three keys, silently losing
+    ``entry``/``parameters``/``probes`` -- a worse outcome than an error, since
+    the pipeline would accept a tool with no probes. Deleting the stray brace
+    leaves ``"...code..."\\n,\\n"entry"``; whitespace before a comma is legal
+    JSON, so the entire envelope survives intact.
+
+    The rule is positional rather than textual. The envelope spans the first
+    delimiter to the last, so everything between them must stay nested at depth
+    >= 1; a closer that would drop below that is stray. Note a single stray
+    brace shifts the depth of *every* closer after it, which is why "count
+    matched pairs" and "keep the last depth-zero closer" both misread this text
+    -- the untouched interior is what makes the detection unambiguous.
+    """
+    start, end = 0, len(text)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if end - start < 2 or text[start] not in "{[" or text[end - 1] not in "}]":
+        return text
+
+    kept: list[str] = []
+    depth = 1                      # inside the outermost container
+    in_string = False
+    escaped = False
+    for ch in text[start + 1:end - 1]:
+        if escaped:
+            escaped = False
+        elif in_string:
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            if depth == 1:
+                continue           # would close the envelope early -- drop it
+            depth -= 1
+        kept.append(ch)
+
+    if depth != 1:                 # unclosed delimiters: a different defect
+        return text
+    return text[start] + "".join(kept) + text[end - 1]
+
+
 def _repair_variants(text: str) -> list[str]:
     """Progressively repaired variants of near-miss JSON, cheapest first."""
     variants = [text]
+
+    # 0. A stray closer that ended the envelope early. Cheap, structural, and
+    #    the one that actually bit us, so it goes first.
+    unwrapped = _drop_stray_closers(text)
+    if unwrapped != text:
+        variants.append(unwrapped)
 
     # 1. Escape stray double quotes inside string values (the ``code`` field
     #    blowing up on Python string literals).
@@ -280,14 +425,29 @@ class LLMToolGenerator:
         )
         data = extract_json(resp.content)
         if data is None:
-            choices = resp.raw.get("choices") or [{}]
-            finish = choices[0].get("finish_reason")
+            # A reasoning model that spent the entire budget thinking has not
+            # written anything for "be more terse" to shorten. Another round
+            # spends the same tokens to observe the same wall, so this is raised
+            # as its own type and the pipeline stops rather than retrying.
+            if resp.ran_out_of_budget_thinking:
+                raise UnrecoverableGeneration(
+                    f"generator produced no answer: {resp.describe_shortfall()} "
+                    f"[model={self.llm.name}]"
+                )
+            finish = resp.finish_reason
             # This message is echoed back to the model as retry feedback, so the
-            # advice is addressed to the model, not to the operator.
+            # advice is addressed to the model, not to the operator. A 'stop'
+            # finish with unparseable content is a *different* defect from a
+            # truncated one, and it used to get no advice at all: the retry then
+            # repeated the same escaping mistake, so all three rounds failed the
+            # same way. Name the actual defect instead of staying silent.
             hint = (
                 " -- the answer was cut off mid-JSON; emit a shorter, denser"
                 " function with every helper defined inline"
-                if finish == "length" else ""
+                if finish == "length" else
+                " -- the answer was complete but not valid JSON; escape every"
+                " inner double quote in `code` as \\\" and every newline as \\n,"
+                " and emit exactly one object with nothing after it"
             )
             raise ValueError(
                 f"generator returned no parseable JSON "

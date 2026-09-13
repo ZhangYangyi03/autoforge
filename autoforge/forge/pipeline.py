@@ -24,10 +24,11 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
+from ..autonomy.policy import AutonomyPolicy
 from ..core.llm import LLMClient
 from ..tools.registry import ToolRegistry
 from ..tools.spec import ToolSpec, ToolState
-from .generator import GeneratedTool, TemplateGenerator
+from .generator import GeneratedTool, TemplateGenerator, UnrecoverableGeneration
 from .sandbox import Sandbox
 from .verifier import ToolVerifier, VerificationReport
 
@@ -98,6 +99,7 @@ class ForgePipeline:
         *,
         config: ForgeConfig | None = None,
         sandbox: Sandbox | None = None,
+        policy: AutonomyPolicy | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.generator = generator
@@ -105,8 +107,24 @@ class ForgePipeline:
         self.registry = registry
         self.config = config or ForgeConfig()
         self.sandbox = sandbox or verifier.sandbox
+        # None means "no policy attached": every gate below fails open, which
+        # is what the forge pipeline did before the policy existed. Attaching
+        # a policy is how a caller makes the verdicts binding.
+        self.policy = policy
         self.on_event = on_event
         self.log: list[dict[str, Any]] = []
+
+    def _may_promote(self) -> bool:
+        """Whether a clean verification may seal a tool as ACTIVE.
+
+        Turning may_promote_tools off does NOT stop the tool being forged or
+        called — creation stays free and PROBATION tools are already in the
+        model's context. It only withholds ACTIVE, the state that means
+        "trusted without further evidence".
+        """
+        if not self.config.promote_on_pass:
+            return False
+        return self.policy is None or self.policy.may_promote_tools
 
     # -- the loop --------------------------------------------------------
     def forge(self, need: str, context: str = "") -> ForgeResult:
@@ -117,6 +135,10 @@ class ForgePipeline:
         for round_no in range(1, self.config.max_rounds + 1):
             started = time.perf_counter()
             attempt = ForgeAttempt(need, round_no)
+            # Set when retrying cannot possibly change the outcome, so the loop
+            # stops after recording the attempt instead of spending another
+            # round's budget to observe the same wall.
+            futile = False
             try:
                 prompt_need = need if not feedback else self._repair_prompt(need, feedback)
                 generated = self.generator.generate(prompt_need, context or existing)
@@ -128,15 +150,38 @@ class ForgePipeline:
                 spec.verification = report.to_dict()
 
                 if report.passed:
-                    spec.state = (
-                        ToolState.ACTIVE if self.config.promote_on_pass else ToolState.PROBATION
-                    )
+                    if self._may_promote():
+                        spec.state = ToolState.ACTIVE
+                    else:
+                        # PROBATION tools are already visible to the model, so
+                        # nothing is lost but the seal. Record why, so a tool
+                        # sitting on probation is never a mystery.
+                        spec.state = ToolState.PROBATION
+                        self._emit("promote_withheld", {
+                            "tool": spec.name,
+                            "reason": (
+                                "may_promote_tools is off"
+                                if self.policy is not None and not self.policy.may_promote_tools
+                                else "promote_on_pass is off"
+                            ),
+                        })
                     self.registry.register(spec)
                     attempt.accepted = True
                     result.spec = spec
                 else:
                     spec.state = ToolState.DRAFT
                     feedback = self._feedback(report)
+            except UnrecoverableGeneration as exc:
+                # Nothing about this failure is round-specific: the model, not
+                # the attempt, cannot produce an answer. Record it and stop.
+                futile = True
+                attempt.error = f"{type(exc).__name__}: {exc}"
+                self._emit("forge_error", {
+                    "round": round_no,
+                    "error": attempt.error,
+                    "futile": True,
+                    "traceback": traceback.format_exc(),
+                })
             except Exception as exc:  # noqa: BLE001
                 attempt.error = f"{type(exc).__name__}: {exc}"
                 # A framework whose whole point is judging generated code cannot
@@ -155,7 +200,7 @@ class ForgePipeline:
                 "error": attempt.error,
                 "report": attempt.report.to_dict() if attempt.report else None,
             })
-            if attempt.accepted:
+            if attempt.accepted or futile:
                 break
 
         self._emit("forge_done", {"need": need, "ok": result.ok, "rounds": result.rounds})

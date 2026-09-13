@@ -38,12 +38,54 @@ def test_config_flags_beat_env(monkeypatch):
     assert cfg["model"] == "from-flag"
 
 
+def test_missing_key_hint_names_a_variable_that_works(monkeypatch):
+    """The advice must not send the reader down a closed path.
+
+    Naming AIPING_API_KEY on a non-aiping endpoint is worse than saying nothing:
+    the reader sets it, gets 401, and has no reason to suspect the variable.
+    """
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://api.deepseek.com/v1")
+    with pytest.raises(SystemExit) as e:
+        cli._config(_args())
+    assert "AUTOFORGE_API_KEY" in str(e.value) and "AIPING_API_KEY" not in str(e.value)
+
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://aiping.cn/api/v1")
+    with pytest.raises(SystemExit) as e:
+        cli._config(_args())
+    assert "AIPING_API_KEY" in str(e.value)
+
+
 def test_remote_without_key_exits_with_advice(monkeypatch):
     monkeypatch.delenv("AIPING_API_KEY", raising=False)
     monkeypatch.delenv("AUTOFORGE_API_KEY", raising=False)
     monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
     with pytest.raises(SystemExit, match="no API key"):
         cli._config(_args())
+
+
+def test_aiping_key_only_stands_in_for_aiping(monkeypatch):
+    """`AIPING_API_KEY` is provider-specific, not a generic fallback.
+
+    A DeepSeek run inheriting it read "Authorization Required" out of a 401 and
+    nothing in the output named the credential as the cause — the base_url had
+    moved but the key had not. Scope the fallback to the endpoint it belongs to.
+    """
+    monkeypatch.setenv("AIPING_API_KEY", "QC-aiping-only")
+
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://api.deepseek.com/v1")
+    with pytest.raises(SystemExit, match="no API key"):
+        cli._config(_args())
+
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://aiping.cn/api/v1")
+    assert cli._config(_args())["key"] == "QC-aiping-only"
+
+
+def test_autoforge_key_is_provider_agnostic(monkeypatch):
+    """`AUTOFORGE_API_KEY` is ours, so it stands in for any endpoint."""
+    monkeypatch.delenv("AIPING_API_KEY", raising=False)
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "sk-any-provider")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://api.deepseek.com/v1")
+    assert cli._config(_args())["key"] == "sk-any-provider"
 
 
 def test_fast_flag_or_env_enables_fast(monkeypatch):
@@ -70,9 +112,10 @@ def test_bare_auto_with_tty_enters_chat(monkeypatch, capsys):
     assert called == ["chat"]
 
 
-def test_parser_exposes_chat_forge_list():
+def test_parser_exposes_every_subcommand():
     names = cli.build_parser()._subparsers._group_actions[0].choices
-    assert set(names) == {"chat", "forge", "list", "setup", "config"}
+    assert set(names) == {"chat", "forge", "list", "setup", "config",
+                          "web", "run", "modes"}
 
 
 # -- trace rendering ---------------------------------------------------

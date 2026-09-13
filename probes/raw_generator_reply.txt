@@ -1,0 +1,23 @@
+{
+  "name": "normalize_isbn",
+  "description": "Validate and normalize ISBN-10 or ISBN-13 identifiers, stripping hyphens and labels, returning normalized ISBN or INVALID error",
+  "code": "def normalize_isbn(isbn_input):\n    if isbn_input is None:\n        return \"INVALID: input is None\"\n    s = str(isbn_input).strip()\n    if not s:\n        return \"INVALID: empty input\"\n    for p in [\"ISBN\", \"ISBN-\", \"ISBN-10\", \"ISBN-13\"]:\n        if s.upper().startswith(p):\n            s = s[len(p):].strip()\n    s = s.replace(\"-\", \"\").replace(\" \", \"\")\n    if len(s) == 10:\n        if not all(c.isdigit() or c.upper() == 'X' for c in s):\n            return \"INVALID: invalid characters for ISBN-10\"\n        check = 10 if s[-1].upper() == 'X' else int(s[-1])\n        total = sum((i+1)*(int(c) if c.isdigit() else 10) for i,c in enumerate(s[:-1]))\n        if total % 11 != (11 - check) % 11:\n            return \"INVALID: ISBN-10 check digit mismatch\"\n        return s\n    elif len(s) == 13:\n        if not all(c.isdigit() for c in s):\n            return \"INVALID: invalid characters for ISBN-13\"\n        total = sum((1 if i%2==0 else 3)*int(c) for i,c in enumerate(s[:-1]))\n        check = int(s[-1])\n        if total % 10 != (10 - total % 10) % 10:\n            return \"INVALID: ISBN-13 check digit mismatch\"\n        return s\n    else:\n        return \"INVALID: wrong length\""
+  },
+  "entry": "normalize_isbn",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "isbn_input": {"type": "string", "description": "ISBN string possibly with hyphens or labels"}
+    },
+    "required": ["isbn_input"]
+  },
+  "probes": [
+    {"query": "ISBN-10: 0-306-40615-2", "expect": "call", "negative_query": "What is the weather today?"},
+    {"query": "  978-0-13-468599-1  ", "expect": "call", "negative_query": "Please summarize this article"},
+    {"query": "ISBN-13: 9780306406157", "expect": "call", "negative_query": "Convert this to binary"},
+    {"query": "abc-def-ghi", "expect": "call", "negative_query": "Calculate 2+2"}
+  ],
+  "effect_signature": "pure | reads:<input> | writes:<none>",
+  "tags": ["validation", "normalization", "isbn"],
+  "rationale": "ISBNs are commonly used in book systems; normalization prevents duplicate entries and validates data integrity without external dependencies"
+}

@@ -267,6 +267,75 @@ class TestSandbox:
         r = sb.run("import os\ndef f():\n    os._exit(3)\n", "f", {})
         assert not r.ok  # died, but the parent survived
 
+    def test_non_ascii_args_survive_the_round_trip(self):
+        # Regression: `-I` makes PYTHONIOENCODING inert, so the child used the
+        # locale codec (cp936 here) to decode a UTF-8 payload. Any non-ASCII
+        # argument mangled into a bogus escape -> "bad payload: Invalid \escape".
+        # A path under 项目_开发 is the everyday case that triggers it.
+        sb = Sandbox(timeout=8)
+        r = sb.run("def f(s):\n    return s\n", "f", {"s": "项目_开发/路径"})
+        assert r.ok and r.output == "项目_开发/路径"
+
+    def test_non_ascii_result_survives(self):
+        sb = Sandbox(timeout=8)
+        r = sb.run("def f():\n    return '中文结果'\n", "f", {})
+        assert r.ok and r.output == "中文结果"
+
+    def test_forged_code_reaches_the_host_filesystem(self, tmp_path):
+        # The load-bearing claim in AUTONOMOUS_SYSTEM and my_capabilities: the
+        # sandbox bounds blast radius, it does not take away file access. A
+        # forged tool is shell access with a timeout. If this ever fails, both
+        # of those texts are lying.
+        f = tmp_path / "outside.txt"
+        f.write_text("reached", encoding="utf-8")
+        sb = Sandbox(timeout=8)
+        r = sb.run(
+            "def f(path):\n    with open(path, encoding='utf-8') as fh:\n"
+            "        return fh.read()\n",
+            "f", {"path": str(f)},
+        )
+        assert r.ok and r.output == "reached"
+
+    def test_restrict_builtins_removes_file_access(self, tmp_path):
+        # Negative control for the claim above: the flag must actually narrow,
+        # or "restrict_builtins=True" is decoration.
+        f = tmp_path / "outside.txt"
+        f.write_text("reached", encoding="utf-8")
+        sb = Sandbox(timeout=8, restrict_builtins=True)
+        r = sb.run(
+            "def f(path):\n    with open(path, encoding='utf-8') as fh:\n"
+            "        return fh.read()\n",
+            "f", {"path": str(f)},
+        )
+        assert not r.ok and "open" in (r.error or "")
+
+
+# ======================================================================
+# self-knowledge: the agent must not deny reach it actually has
+# ======================================================================
+class TestSystemPromptReach:
+    """A capability the agent has and denies is worse than one it lacks.
+
+    An agent that reads "forge_tool -- create a new tool" and concludes "I
+    have no file tools" leaves the whole machinery unused. The prompt has to
+    say what forged code can reach, and point at the runtime check.
+    """
+
+    def test_prompt_states_the_filesystem_and_socket_reach(self):
+        from autoforge.agent import AUTONOMOUS_SYSTEM
+        low = AUTONOMOUS_SYSTEM.lower()
+        assert "filesystem" in low
+        assert "socket" in low or "network" in low
+
+    def test_prompt_names_the_false_denial_it_forbids(self):
+        from autoforge.agent import AUTONOMOUS_SYSTEM
+        assert "have no file tools" in AUTONOMOUS_SYSTEM.lower()
+
+    def test_prompt_advertises_my_capabilities_as_the_check(self):
+        from autoforge.agent import AUTONOMOUS_SYSTEM
+        assert "my_capabilities" in AUTONOMOUS_SYSTEM
+        assert "check my_capabilities" in AUTONOMOUS_SYSTEM.lower()
+
 
 # ======================================================================
 # forge pipeline: the three-stage loop

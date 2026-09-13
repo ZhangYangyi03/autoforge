@@ -270,3 +270,149 @@ def test_config_command_shows_sources(capsys):
 def test_config_command_survives_having_no_key(capsys):
     assert cli.main(["config"]) == 0
     assert "auto setup" in capsys.readouterr().out
+
+
+def test_config_command_keeps_the_origin_column_separated(capsys):
+    """A value wider than the column must not run into its origin.
+
+    ``https://api.deepseek.com/v1`` is 28 chars; at a fixed 26-wide column the
+    line read ``.../v1config``, which looks like a corrupted URL rather than a
+    layout bug -- the one place a user reads the URL they are about to trust.
+    """
+    configfile.save({"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat",
+                     "api_key": "sk-abc"})
+    assert cli.main(["config"]) == 0
+    out = capsys.readouterr().out
+    for line in out.splitlines():
+        if "base_url" in line and "://" in line:
+            assert re.search(r"https://api\.deepseek\.com/v1\s+config\s*$", line), repr(line)
+            break
+    else:
+        pytest.fail(f"no base_url row in output:\n{out}")
+
+
+# -- the probe itself ---------------------------------------------------
+# Every wizard test above stubs `_probe`. That is exactly how the raw-dict bug
+# survived a green suite: the seam between the wizard and the client was never
+# executed. These drive the real function against a fake transport.
+
+import requests  # noqa: E402
+
+
+def _reply(content, reasoning="", finish="stop"):
+    message = {"content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return {"choices": [{"message": message, "finish_reason": finish}]}
+
+
+class _FakeResponse:
+    """Minimal stand-in for a requests.Response.
+
+    ``raise_for_status`` must attach ``response=self``: real requests does, and
+    code that reads the status off the exception depends on it. Leaving it off
+    makes the fake agree with a bug instead of with the library.
+    """
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Capture the outgoing body and answer with a canned payload."""
+    import autoforge.core.llm as llm
+
+    monkeypatch.setattr(llm, "_sleep", lambda _s: None)        # no real backoff
+    sent: dict = {}
+
+    def install(payload=None, *, exc=None, status=200):
+        def fake_post(url, headers=None, json=None, timeout=None, proxies=None):
+            sent["url"], sent["body"] = url, json
+            sent["headers"], sent["proxies"] = headers, proxies
+            if exc is not None:
+                raise exc
+            return _FakeResponse(
+                payload if payload is not None else _reply("Ready"), status_code=status)
+        monkeypatch.setattr(llm.requests, "post", fake_post)
+        return sent
+
+    return install
+
+
+def test_probe_sends_a_message_the_client_can_serialise(wire):
+    """The regression: the probe passed a bare dict, the client calls
+    ``m.to_api()``, and AttributeError made every endpoint -- good ones
+    included -- look unreachable to the person running setup for the first
+    time."""
+    sent = wire()
+    ok, detail = setup_wizard._probe("http://127.0.0.1:11434/v1", "m", "k", False, 3000)
+    assert ok, detail
+    assert sent["body"]["messages"] == [
+        {"role": "user", "content": "Reply with the single word: ready"}]
+    assert sent["url"] == "http://127.0.0.1:11434/v1/chat/completions"
+
+
+def test_probe_omits_the_proxy_when_asked_to(wire):
+    """A local endpoint must go out direct; routing it through the socks5 proxy
+    is what the wizard's proxy question exists to avoid."""
+    sent = wire()
+    setup_wizard._probe("http://127.0.0.1:11434/v1", "m", "k", False, 3000)
+    assert sent["proxies"] is None
+
+    sent = wire()
+    setup_wizard._probe("https://aiping.cn/api/v1", "m", "k", True, 3000)
+    assert sent["proxies"] == {"http": "socks5://127.0.0.1:9674",
+                               "https": "socks5://127.0.0.1:9674"}
+
+
+def test_probe_refuses_a_reply_with_no_content(wire):
+    """A reasoning model can spend the entire budget on reasoning_content and
+    return nothing. Reporting that as a working endpoint is the one thing the
+    probe must never do -- it is precisely the failure being diagnosed."""
+    wire(_reply("", reasoning="x" * 400, finish="length"))
+    ok, detail = setup_wizard._probe("https://aiping.cn/api/v1",
+                                     "DeepSeek-V4.1-Flash", "k", False, 64)
+    assert not ok
+    assert "no content" in detail and "reasoning" in detail
+
+
+def test_probe_reports_a_transport_failure(wire):
+    wire(exc=requests.ConnectionError("connection refused"))
+    ok, detail = setup_wizard._probe("http://127.0.0.1:11434/v1", "m", "k", False, 3000)
+    assert not ok and "ConnectionError" in detail
+
+
+def test_probe_reports_an_http_error(wire):
+    """A rejected key must surface as advice, not a bare status code.
+
+    Reusing the stored key after switching provider is the commonest way to get
+    here, so the message has to name that cause or the user cannot act on it.
+    """
+    wire({"error": "bad key"}, status=401)
+    ok, detail = setup_wizard._probe("https://aiping.cn/api/v1", "m", "bad", False, 3000)
+    assert not ok and "401" in detail
+    assert "provider" in detail
+
+    wire({"error": "forbidden"}, status=403)
+    ok, detail = setup_wizard._probe("https://aiping.cn/api/v1", "m", "bad", False, 3000)
+    assert not ok and "403" in detail
+
+    wire({"error": "boom"}, status=500)
+    ok, detail = setup_wizard._probe("https://aiping.cn/api/v1", "m", "bad", False, 3000)
+    assert not ok and "500" in detail
+
+
+def test_probe_trims_a_multiline_reply(wire):
+    wire(_reply("line one\nline two"))
+    ok, detail = setup_wizard._probe("http://127.0.0.1:11434/v1", "m", "k", False, 3000)
+    assert ok and "\n" not in detail

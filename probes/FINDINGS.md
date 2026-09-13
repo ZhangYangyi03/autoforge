@@ -136,3 +136,126 @@ So the envelope is the first wall, the invariance check the second.
   the transport. The failure is visible, reproducible and attributable, which is
   the most one can reasonably ask of it. It is not silently wrong.
 
+
+---
+
+## The gateway's default model reasons until the output budget is gone
+
+**This supersedes the "local 7B is too weak" reading of the section above.** The
+7B failure and this one look identical from the outside — "no parseable JSON" —
+and have nothing to do with each other.
+
+**Reproduce:** `python probes/probe_gateway_empty.py`
+(nine requests, ~2 minutes).
+
+```
+short prompt,   no cap      HTTP 200  finish='stop'    content=5c    usage=3/36      reasoning=0
+short prompt,   cap 3000    HTTP 200  finish='stop'    content=5c    usage=18/36     reasoning=62
+forge prompt,   cap 3000    HTTP 200  finish='length'  content=0c    usage=3000/246  reasoning=10767
+forge prompt,   cap 8000    HTTP 200  finish='length'  content=0c    usage=8000/246  reasoning=27092
+```
+
+`DeepSeek-V4.1-Flash` is a reasoning model: it returns a `reasoning_content`
+trace alongside `content`. On a short prompt the trace is 62 characters and the
+answer arrives. On a forge-shaped prompt — long system message, a need that
+deserves real design thought — **the trace consumes the entire `max_tokens`
+budget and `content` comes back empty with `finish_reason='length'`.**
+
+### Why raising the cap is not the fix
+
+The trace is not truncated by the cap, it *scales to fill it*: 10767 characters
+at a cap of 3000, 27092 at 8000. Whatever number you choose, the model spends it
+thinking and the answer still never starts. This is the shape of the earlier
+`200/leng` readings in `probe_maxtokens` — those were not near-misses of a
+complete answer, they were reasoning-only replies, and reading them as
+"truncation just past the end" sent this investigation the wrong way for a while.
+
+### Why the suppression flags are not the fix either
+
+`python probes/probe_gateway_thinking.py` sends the same payload with each of the
+six common switches:
+
+```
+flag                    finish      reason  content
+baseline                length       10049        0
+enable_thinking=False   HTTP 503         0        0
+thinking=disabled       HTTP 503         0        0
+chat_template_kwargs    length        9342        0
+reasoning_effort=none   HTTP 503         0        0
+reasoning_effort=min    length       10115        0
+```
+
+The three that returned 200 show traces of 9342–10115 characters and no answer.
+`reasoning_effort=minimal` barely moves the number: effort is not the lever. The
+503s are the gateway reporting no available provider — a separate, frequent
+condition worth labelling rather than reading as a property of the flag.
+
+### Consequence
+
+- **This is a model-selection problem, not a framework problem.** The client was
+  passing `max_tokens` and parsing what came back, exactly as documented
+  (`probes/probe_maxtokens.py`). Nothing in the transport was wrong; the
+  chosen model does not answer this kind of prompt at any cap.
+- `/models` lists **147** models including code-tuned ones
+  (`Doubao-Seed-2.0-Code`, `Step-3.5-Flash`, `GLM-5.3-Flash`, ...). Picking one
+  that answers directly is the fix, and `probes/probe_gateway_models.py` grades
+  candidates mechanically instead of guessing.
+- Three framework changes follow from it, all in-tree:
+  - `LLMResponse.reasoning` keeps the trace, so a reply is never reported as
+    "0 chars" when 10k characters came with it;
+  - `LLMResponse.ran_out_of_budget_thinking` names the wall, and
+    `describe_shortfall()` says "spent the budget on reasoning" rather than
+    "cut off mid-JSON" for an answer that never existed;
+  - `UnrecoverableGeneration` stops the round loop. Round two would relive round
+    one exactly, at full budget — a wall is not a failure to retry harder.
+
+## Correction: the wall was real, but it was not what blocked the run
+
+Everything above is still true of the configs it tested — at a large cap this
+model does spend the budget on reasoning. It is **not**, however, the reason the
+first live `forge` runs failed. Reading the failure as "the model does not
+answer" was wrong, and the fix that followed from it (swap models) would not have
+worked, because a second model failed identically.
+
+Two independent backends, two different models, one failure:
+
+| backend | model | outcome |
+| --- | --- | --- |
+| aiping | Qwen3.5-Flash, cap 4000 | `finish_reason=stop`, 思考 4695c + 正文 2326c, parse FAIL |
+| local ollama | qwen2.5:7b | `finish_reason=stop`, 2275c, parse FAIL |
+
+Both answered completely. Both were rejected by our parser. The reported error
+was `Extra data: line 5 column 4 (char 1422)` — not malformed JSON, but **a valid
+object followed by more text**.
+
+The captured reply (`probes/raw_generator_reply.txt`) shows what the model did:
+it wrote `name`/`description`/`code`, emitted `}` — *exactly where the comma
+belonged* — then kept going with `entry`/`parameters`/`probes`/`tags`/
+`rationale`, and closed the object properly at the end:
+
+```
+{ "name": ..., "description": ..., "code": "..."
+  },                                  <- stray; the comma should be here
+  "entry": ..., "parameters": {...}, "probes": [...] }
+```
+
+**Why the obvious fix is the wrong fix.** `raw_decode` recovers the first object
+and drops the tail — three keys instead of nine. That *looks* like success and is
+worse than an error: `entry` defaults to the tool name, `parameters` and `probes`
+default empty, so the pipeline would accept a tool with **no probes** and skip
+checking it. A parse failure is loud; a silently probe-less tool is not.
+
+**The actual fix** is `_drop_stray_closers` in `forge/generator.py`. The envelope
+spans the first delimiter to the last, so everything between them must stay
+nested at depth ≥ 1; deleting the brace restores the text to `"...code..."\n,\n"entry"...`,
+and whitespace before a comma is legal JSON, so all nine keys survive.
+
+One trap worth recording, because it cost a debugging round: **a single stray
+brace shifts the depth of every closer after it.** Counting braces, or asking
+which closer "returns to depth zero", misreads this text badly — the captured
+reply showed four apparent depth-zero closers and EOF depth `-1` when there was
+exactly *one* defect. Only the first-delimiter-to-last-delimiter interior is
+unambiguous.
+
+Verified: all 9 keys recovered, `code` compiles, 4 probes intact, 17/17 parser
+tests and 275/275 suite tests pass.

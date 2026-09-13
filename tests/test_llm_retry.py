@@ -59,8 +59,9 @@ class _Sender:
 
 
 def _client(**kw) -> OpenAICompatClient:
-    return OpenAICompatClient("m", "https://gw.invalid/v1", "sk-test",
-                              max_attempts=3, retry_backoff=0.0, **kw)
+    kw.setdefault("max_attempts", 3)
+    kw.setdefault("retry_backoff", 0.0)
+    return OpenAICompatClient("m", "https://gw.invalid/v1", "sk-test", **kw)
 
 
 def _wire(monkeypatch, *steps) -> _Sender:
@@ -138,6 +139,42 @@ def test_backoff_grows_between_attempts(monkeypatch):
                                 max_attempts=3, retry_backoff=2.0)
     assert _ask(client) == "ok"
     assert waited == [2.0, 4.0]            # 2**1, then 2**2
+
+
+def test_backoff_is_capped_so_a_long_outage_still_gets_retried_soon(monkeypatch):
+    """Uncapped doubling would park the next attempt minutes away."""
+    waited: list[float] = []
+    monkeypatch.setattr(llm.requests, "post",
+                        _Sender(*[_Resp(503)] * 5, _Resp(200, "ok")))
+    monkeypatch.setattr(llm, "_sleep", waited.append)
+    client = OpenAICompatClient("m", "https://gw.invalid/v1", "sk",
+                                max_attempts=6, retry_backoff=10.0,
+                                retry_max_delay=25.0)
+    assert _ask(client) == "ok"
+    assert waited == [10.0, 25.0, 25.0, 25.0, 25.0]   # 100s and 1000s clipped
+
+
+def test_a_long_503_burst_is_ridden_out(monkeypatch):
+    """The live failure: round two died on a burst that outlasted 3 attempts.
+
+    Reproduced against aiping.cn — a forge round raised `503 Service
+    Unavailable` after the old 3-attempt/1.5x ladder (~7s total), while the same
+    calls returned 200 a minute later. Riding out ~30s is what turns that into a
+    success instead of a lost round.
+    """
+    sender = _wire(monkeypatch, *[_Resp(503)] * 4, _Resp(200, "survived"))
+    monkeypatch.setattr(llm, "_sleep", lambda _s: None)
+    assert _ask(_client(max_attempts=6)) == "survived"
+    assert sender.attempts == 5
+
+
+def test_the_default_ladder_outlasts_a_burst(monkeypatch):
+    """Defaults are part of the contract: nobody passes retry flags in the CLI."""
+    sender = _wire(monkeypatch, *[_Resp(503)] * 3, _Resp(200, "ok"))
+    monkeypatch.setattr(llm, "_sleep", lambda _s: None)
+    client = OpenAICompatClient("m", "https://gw.invalid/v1", "sk")
+    assert _ask(client) == "ok"
+    assert sender.attempts == 4            # the default budget covers 4 tries
 
 
 def test_max_attempts_of_one_disables_retrying(monkeypatch):

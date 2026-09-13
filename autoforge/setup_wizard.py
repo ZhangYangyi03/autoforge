@@ -15,8 +15,11 @@ import getpass
 import sys
 from pathlib import Path
 
+import requests
+
 from . import configfile
 from .core.llm import OpenAICompatClient
+from .core.message import Message
 
 # label, base_url, model, needs_key
 PRESETS: list[tuple[str, str, str, bool]] = [
@@ -83,17 +86,41 @@ def _ask_yes(prompt: str, current: bool) -> bool:
 
 
 def _probe(base: str, model: str, key: str, use_proxy: bool, max_tokens: int) -> tuple[bool, str]:
-    """One tiny round-trip. Returns (ok, human-readable detail)."""
+    """One tiny round-trip. Returns (ok, human-readable detail).
+
+    The message must be a ``Message``: the client serialises with ``m.to_api()``,
+    so a raw dict reaches ``AttributeError`` and every endpoint -- including a
+    perfectly good one -- gets reported as unreachable. That is the worst
+    possible failure here, because the wizard is the first thing anyone runs and
+    its verdict is what tells them whether the rest will work.
+    """
     client = OpenAICompatClient(
         model=model, base_url=base, api_key=key or "none", timeout=60.0,
         proxies=PROXIES if use_proxy else None, default_max_tokens=max_tokens,
     )
     try:
-        out = client.chat([{"role": "user", "content": "Reply with the single word: ready"}])
+        out = client.chat([Message.user("Reply with the single word: ready")])
+    except requests.HTTPError as exc:
+        # A key is provider-specific. Switching provider in the wizard offers the
+        # stored key on a bare Enter, so the commonest failure here is a key that
+        # belongs to the endpoint you just moved away from -- and a bare "401"
+        # gives the user nothing to act on.
+        status = getattr(exc.response, "status_code", None)
+        if status in (401, 403):
+            return False, (f"{status}: the endpoint rejected the key. Keys are "
+                           f"provider-specific -- an existing key is reused when "
+                           f"you switch provider, so enter this provider's key.")
+        return False, f"HTTPError: {exc}"
     except Exception as exc:                                          # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
-    text = (out.content or "").strip().replace("\n", " ")
-    return True, f"model replied {text[:60]!r}"
+    # A 200 carrying no content is not a working endpoint. A reasoning model can
+    # spend the entire budget on reasoning_content and return an empty answer;
+    # calling that "ok" would send the user away with settings that never
+    # produce text, which is exactly what the probe exists to catch.
+    text = (out.content or "").strip()
+    if not text:
+        return False, "the endpoint answered but sent no content — " + out.describe_shortfall()
+    return True, f"model replied {text.replace(chr(10), ' ')[:60]!r}"
 
 
 def run(args) -> int:
@@ -117,7 +144,7 @@ def run(args) -> int:
         proxy_default = True
 
     if not _tty():
-        return _save_quietly(base, model, key, max_tokens, proxy_default, args)
+        return _save_quietly(base, model, key, max_tokens, proxy_default)
 
     print(_c(_C, "\nautoforge setup"))
     print(_c(_D, "answers are written to " + str(configfile.config_path())
@@ -172,13 +199,23 @@ def run(args) -> int:
     return 0
 
 
-def _save_quietly(base, model, key, max_tokens, use_proxy, args) -> int:
-    """No terminal: take what we have, write it, say so on one line."""
+def _save_quietly(base, model, key, max_tokens, use_proxy) -> int:
+    """No terminal: take what we have, write it, and say exactly what was taken.
+
+    There is no prompt to read here, so the flags are the only way to set a value
+    explicitly. Print the effective set — a silent write of values the caller
+    never chose is how a config file ends up lying about what it holds.
+    """
     if any(h in base for h in ("127.0.0.1", "localhost")):
         use_proxy = False
     path = configfile.save({"base_url": base, "model": model, "api_key": key,
                             "max_tokens": max_tokens, "proxy": use_proxy})
-    print(f"wrote {path}  (non-interactive: {base} / {model})")
+    print(f"wrote {path}")
+    print(_c(_D, "  no terminal: prompts skipped; values kept as they were. "
+                 "Set them with flags:"))
+    print(_c(_D, "  --base-url / --model / --api-key / --max-tokens / --no-proxy"))
+    print(f"  base_url {base}   model {model}   max_tokens {max_tokens}   "
+          f"proxy {use_proxy}   api_key {configfile.mask(key)}")
     return 0
 
 

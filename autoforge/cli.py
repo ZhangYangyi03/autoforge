@@ -1,6 +1,9 @@
 """Command-line entry point: `autoforge`, installed as `auto`.
 
     auto                    talk to the agent (bare invocation, on a terminal)
+    auto web                serve the harness UI — one command, no build step
+    auto run "<task>"       run one task through a chosen mode, headless
+    auto modes              list the runtime modes (standard / minimal)
     auto setup              one-time wizard: provider, key, model -> config file
     auto config             show the effective settings and where each came from
     auto forge "<need>"     forge one tool, one shot, and stop
@@ -29,16 +32,21 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from . import configfile, setup_wizard
 from .agent import ForgeAgent
+from .autonomy.policy import FULL_FREEDOM, SUPERVISED, AutonomyPolicy
 from .core.llm import OpenAICompatClient
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
 from .forge.sandbox import Sandbox
 from .forge.verifier import ToolVerifier
+from .store import ToolStore
 from .tools.registry import ToolRegistry
+
+MODES = ("standard", "minimal")
 
 PROXIES = {"http": "socks5://127.0.0.1:9674", "https": "socks5://127.0.0.1:9674"}
 
@@ -84,7 +92,10 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
                 return value
         value = saved.get(field)
         if value not in (None, ""):
-            src[field] = f"config {configfile.config_path()}"
+            # Just "config": the path is printed once in the header, and repeating
+            # it on every row buries the one thing this column is for — telling
+            # env apart from file apart from default at a glance.
+            src[field] = "config"
             return value
         src[field] = "default"
         return default
@@ -94,13 +105,24 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
     model = str(pick("model", args.model, "AUTOFORGE_MODEL",
                      default="DeepSeek-V4.1-Flash"))
     local = any(h in base for h in ("127.0.0.1", "localhost"))
-    key = str(pick("api_key", args.api_key, "AUTOFORGE_API_KEY", "AIPING_API_KEY",
-                   default=""))
+    # `AIPING_API_KEY` is provider-specific: it may only stand in as the key when
+    # the endpoint actually is aiping. Treating it as a generic fallback is how
+    # a DeepSeek run got handed the aiping key and came back 401 — the base_url
+    # had changed but the credential had not, and nothing in the output said so.
+    key_env = ["AUTOFORGE_API_KEY"]
+    if "aiping" in base:
+        key_env.append("AIPING_API_KEY")
+    key = str(pick("api_key", args.api_key, *key_env, default=""))
     if not key:
         if not local:
             if strict:
+                # Name the variable that actually works here: suggesting
+                # AIPING_API_KEY on a non-aiping endpoint sends the reader down
+                # a path the resolver has deliberately closed.
+                env_hint = ("AIPING_API_KEY or AUTOFORGE_API_KEY" if "aiping" in base
+                            else "AUTOFORGE_API_KEY")
                 raise SystemExit(
-                    "no API key: run `auto setup` once, or set AIPING_API_KEY, or\n"
+                    f"no API key: run `auto setup` once, or set {env_hint}, or\n"
                     "pass --api-key, or point --base-url at a local server\n"
                     "(e.g. http://127.0.0.1:11434/v1)"
                 )
@@ -117,7 +139,7 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
         src["proxy"] = "flag"
     elif saved.get("proxy") is not None and not local:
         use_proxy = bool(saved["proxy"])
-        src["proxy"] = f"config {configfile.config_path()}"
+        src["proxy"] = "config"
     else:
         use_proxy = not local
         src["proxy"] = "default (off for local endpoints)"
@@ -131,8 +153,53 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
         max_tokens, src["max_tokens"] = args.max_tokens, "flag"
     else:
         max_tokens = int(pick("max_tokens", None, "AUTOFORGE_MAX_TOKENS", default=3000))
+
+    policy_name, policy_src = _resolve_policy(args, saved, src)
     return ({"base": base, "model": model, "key": key, "proxy": use_proxy,
-             "fast": fast, "max_tokens": max_tokens}, src)
+             "fast": fast, "max_tokens": max_tokens, "policy": policy_name}, src)
+
+
+POLICIES = {"full": FULL_FREEDOM, "supervised": SUPERVISED}
+
+
+def _policy_for(name: str) -> AutonomyPolicy:
+    """A *copy* of the named preset.
+
+    selfmod.amend applies changes with setattr on the live object, so handing
+    out the module-level singleton would let one session's set_autonomy leak
+    into every agent built afterwards — including children. Each agent gets its
+    own instance.
+    """
+    preset = POLICIES.get(name)
+    if preset is None:
+        raise SystemExit(f"unknown policy {name!r} (have: {', '.join(POLICIES)})")
+    return replace(preset)
+
+
+def _resolve_policy(args: argparse.Namespace, saved: dict, src: dict) -> tuple[str, str]:
+    """Which autonomy policy to build the agent with.
+
+    A preset nobody can select is the same as no preset at all, so the name is
+    resolved here and threaded into everything downstream.
+    """
+    flag = getattr(args, "policy", None)
+    if flag:
+        src["policy"] = "flag"
+        return flag, "flag"
+    env = os.environ.get("AUTOFORGE_POLICY", "").strip().lower()
+    if env:
+        if env not in POLICIES:
+            raise SystemExit(f"unknown AUTOFORGE_POLICY={env!r} (have: {', '.join(POLICIES)})")
+        src["policy"] = "env AUTOFORGE_POLICY"
+        return env, "env"
+    cfg = str(saved.get("policy") or "").strip().lower()
+    if cfg:
+        if cfg not in POLICIES:
+            raise SystemExit(f"unknown policy={cfg!r} in config (have: {', '.join(POLICIES)})")
+        src["policy"] = "config"
+        return cfg, "config"
+    src["policy"] = "default"
+    return "full", "default"
 
 
 def _config(args: argparse.Namespace) -> dict:
@@ -157,6 +224,7 @@ def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
         sandbox=sandbox,
         generator=LLMToolGenerator(llm, max_tokens=cfg["max_tokens"]),
         forge_config=ForgeConfig(promote_on_pass=True, max_rounds=2),
+        policy=POLICIES.get(cfg.get("policy", "full"), FULL_FREEDOM),
         enable_meta_cognition=meta_cognition,
     )
     # __post_init__ built its own verifier; make both points honour --fast so
@@ -166,10 +234,46 @@ def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
     return agent
 
 
+def _build_mode(cfg: dict, mode: str = "standard"):
+    """Build the agent that a runtime mode names.
+
+    This is the single seam the web harness and `auto run` share: a mode is an
+    assembly of the same parts, not a separate program.
+
+      standard — the full forging agent, with a store so sealed tools persist
+      minimal  — two tools (bash + str_replace_editor), no forging
+    """
+    if mode not in MODES:
+        raise SystemExit(f"unknown mode {mode!r} (have: {', '.join(MODES)})")
+
+    if mode == "minimal":
+        from .modes import MinimalAgent
+
+        llm = OpenAICompatClient(
+            model=cfg["model"], base_url=cfg["base"], api_key=cfg["key"],
+            timeout=600, proxies=PROXIES if cfg["proxy"] else None,
+        )
+        # The control group carries a policy too, so an A/B against standard
+        # compares like with like. Under the default preset nothing changes:
+        # bash stays ungated, which is what the comparison depends on.
+        return MinimalAgent(llm=llm, cwd=os.getcwd(),
+                            policy=_policy_for(cfg.get("policy", "full")))
+
+    agent = _build(cfg)
+    # The CLI's `forge` writes JSON artifacts by hand; the harness wants the
+    # sealed tool to survive the session, so it gets a store.
+    try:
+        agent.store = ToolStore(os.environ.get("AUTOFORGE_DB") or None)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"{_c(_Y, 'note:')} tool store unavailable ({exc}); sealed tools "
+              f"live for this session only")
+    return agent
+
+
 def _describe(cfg: dict, agent: ForgeAgent) -> None:
     print(_c(_D, f"model {cfg['model']}  |  {cfg['base']}  |  "
                  f"{'FAST' if cfg['fast'] else 'full'} checks  |  "
-                 f"proxy={cfg['proxy']}"))
+                 f"proxy={cfg['proxy']}  |  policy={cfg.get('policy', 'full')}"))
 
 
 # ----------------------------------------------------------------------
@@ -365,9 +469,23 @@ def cmd_config(args: argparse.Namespace) -> int:
             ("api_key", configfile.mask(cfg["key"]), src.get("api_key", "")),
             ("max_tokens", cfg["max_tokens"], src.get("max_tokens", "")),
             ("proxy", cfg["proxy"], src.get("proxy", "")),
-            ("fast", cfg["fast"], src.get("fast", ""))]
+            ("fast", cfg["fast"], src.get("fast", "")),
+            ("policy", cfg["policy"], src.get("policy", ""))]
+    width = max(len(str(v)) for _n, v, _o in rows) + 2
     for name, value, origin in rows:
-        print(f"  {name:<11}{str(value):<26}{_c(_D, origin)}")
+        print(f"  {name:<11}{str(value):<{width}}{_c(_D, origin)}")
+
+    # Mirrors the agent's own my_capabilities: a policy that reads like a cage
+    # while some of its fields are never consulted is worse than no policy.
+    preset = _policy_for(cfg["policy"])
+    print(f"\n  {_c(_D, 'policy')}  {preset.describe()}")
+    inert = preset.unenforced
+    if inert:
+        print(_c(_Y, f"  not enforced by any code path: {', '.join(inert)}"))
+        print(_c(_D, "  (the sandbox does not consult the policy — DESIGN.md §2.5)"))
+    else:
+        print(_c(_D, "  every denial in this preset is enforced"))
+
     origin = src.get("api_key", "")
     if not cfg["key"]:
         print(_c(_Y, "\n  no key configured — run `auto setup` to store one\n"))
@@ -378,6 +496,51 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(_c(_D, f"\n  {origin} {note}\n"))
     else:
         print()
+    return 0
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    cfg = _config(args)
+    from .web import serve
+
+    token = args.token or os.environ.get("AUTOFORGE_WEB_TOKEN") or None
+    try:
+        serve(
+            cfg,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+            mode=args.mode,
+            token=token,
+        )
+    except OSError as exc:
+        print(f"{_c(_Y, 'error:')} cannot bind {args.host}:{args.port} — {exc}")
+        print(f"{_c(_D, 'try:')} auto web --port {args.port + 1}")
+        return 1
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """One-shot task through a chosen mode — the headless twin of the UI."""
+    cfg = _config(args)
+    agent = _build_mode(cfg, args.mode)
+    print(_c(_D, f"mode {args.mode}  |  model {cfg['model']}  |  {cfg['base']}  |  "
+                 f"policy={cfg.get('policy', 'full')}"))
+    task = " ".join(args.task)
+    result = agent.run(task)
+    _show_trace(agent, 0)
+    if result.content:
+        print(f"\n{result.content}")
+    if result.self_terminated:
+        print(_c(_D, f"(self-terminated: {result.termination_reason})"))
+    return 0
+
+
+def cmd_modes(args: argparse.Namespace) -> int:
+    print("standard  — full forging agent: meta-tools, 5-check verification, "
+          "evolution, spawning, persistence")
+    print("minimal   — two tools (bash + str_replace_editor), no forging; "
+          "the control group")
     return 0
 
 
@@ -394,6 +557,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tokens", type=int, help="generator output cap (AUTOFORGE_MAX_TOKENS)")
     p.add_argument("--no-proxy", action="store_true", help="do not use the socks proxy")
     p.add_argument("--proxy", choices=["0", "1"], help="force proxy on/off")
+    p.add_argument("--policy", choices=list(POLICIES),
+                   help="autonomy preset: full (default) or supervised "
+                        "(AUTOFORGE_POLICY)")
     p.add_argument("--version", action="version", version="autoforge 0.4.0")
 
     sub = p.add_subparsers(dest="command")
@@ -420,6 +586,25 @@ def build_parser() -> argparse.ArgumentParser:
     su.add_argument("--no-proxy", action="store_true", help="do not use the socks proxy")
 
     cf = sub.add_parser("config", help="show effective settings and where each came from")
+
+    w = sub.add_parser("web", help="serve the harness UI (one command, no build step)")
+    w.add_argument("--host", default=os.environ.get("AUTOFORGE_WEB_HOST", "127.0.0.1"),
+                   help="bind address (default 127.0.0.1; use 0.0.0.0 to share)")
+    w.add_argument("--port", type=int,
+                   default=int(os.environ.get("AUTOFORGE_WEB_PORT") or "8765"),
+                   help="port (default 8765; 0 picks a free one)")
+    w.add_argument("--mode", choices=list(MODES),
+                   default=os.environ.get("AUTOFORGE_MODE", "standard"),
+                   help="runtime mode for new sessions")
+    w.add_argument("--token", help="shared token needed to drive the agent "
+                                   "(AUTOFORGE_WEB_TOKEN)")
+    w.add_argument("--no-browser", action="store_true", help="do not open a browser")
+
+    r = sub.add_parser("run", help="run one task through a chosen mode, headless")
+    r.add_argument("task", nargs="+", help="the task, in plain language")
+    r.add_argument("--mode", choices=list(MODES), default="standard")
+
+    sub.add_parser("modes", help="list the runtime modes")
     return p
 
 
@@ -438,7 +623,8 @@ def main(argv: list[str] | None = None) -> int:
         args.call = None
         args.path = None
     return {"chat": cmd_chat, "forge": cmd_forge, "list": cmd_list,
-            "setup": cmd_setup, "config": cmd_config}[args.command](args)
+            "setup": cmd_setup, "config": cmd_config,
+            "web": cmd_web, "run": cmd_run, "modes": cmd_modes}[args.command](args)
 
 
 if __name__ == "__main__":

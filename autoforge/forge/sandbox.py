@@ -30,11 +30,25 @@ from typing import Any, Callable
 _RUNNER = textwrap.dedent('''
     import io, json, sys, contextlib
 
+    def _emit(obj):
+        # Write UTF-8 bytes, not text. See the payload comment below: `-I`
+        # makes PYTHONIOENCODING inert, so sys.stdout would encode with the
+        # locale codec and blow up (or mojibake) on any non-ASCII result.
+        sys.stdout.buffer.write(
+            json.dumps(obj, default=str, ensure_ascii=False).encode("utf-8"))
+        sys.stdout.buffer.flush()
+
     def _main():
         try:
-            payload = json.loads(sys.stdin.read() or "{}")
+            # Read raw bytes and decode UTF-8 ourselves. `-I` (isolated mode)
+            # makes PYTHONIOENCODING inert, so `sys.stdin.read()` would use the
+            # locale codec -- cp936 on a Chinese Windows host -- to decode a
+            # payload the parent wrote as UTF-8. Any non-ASCII argument (a path
+            # under 项目_开发, a CJK string) then mangles into a bogus escape
+            # and the call dies with "bad payload: Invalid \\escape".
+            payload = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
         except Exception as e:
-            sys.stdout.write(json.dumps({"ok": False, "error": f"bad payload: {e}"}))
+            _emit({"ok": False, "error": f"bad payload: {e}"})
             return
         code = payload["code"]
         entry = payload["entry"]
@@ -54,20 +68,17 @@ _RUNNER = textwrap.dedent('''
             exec(compile(code, "<forged>", "exec"), ns)
             fn = ns.get(entry)
             if fn is None or not callable(fn):
-                sys.stdout.write(json.dumps({
+                _emit({
                     "ok": False,
                     "error": f"entry {entry!r} not found or not callable",
-                }))
+                })
                 return
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 out = fn(**args)
-            sys.stdout.write(json.dumps(
-                {"ok": True, "output": out, "stdout": buf.getvalue()},
-                default=str,
-            ))
+            _emit({"ok": True, "output": out, "stdout": buf.getvalue()})
         except BaseException as e:  # noqa: BLE001
-            sys.stdout.write(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+            _emit({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
     _main()
 ''').strip()
@@ -160,12 +171,29 @@ class Sandbox:
                     returncode=proc.returncode,
                     stderr=stderr,
                 )
-            try:
-                data = json.loads(stdout.strip().splitlines()[-1])
-            except (json.JSONDecodeError, IndexError) as exc:
+            # The runner writes exactly one envelope as its last line, but the
+            # child is untrusted: a stray module-level statement, a thread, or a
+            # print that escaped the redirect can land after it. A bare JSON
+            # scalar on the final line used to reach ``data.get("ok")`` and die
+            # with ``AttributeError: 'str' object has no attribute 'get'`` --
+            # a message naming neither the tool nor the output. Take the last
+            # line that is an *object*; otherwise say what actually arrived.
+            data: dict[str, Any] | None = None
+            for line in reversed(stdout.strip().splitlines()):
+                try:
+                    cand = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(cand, dict) and "ok" in cand:
+                    data = cand
+                    break
+            if data is None:
                 return SandboxResult(
                     ok=False,
-                    error=f"unparseable output: {exc}; raw={stdout.strip()[:300]}",
+                    error=(
+                        f"no result envelope in output (exit {proc.returncode}); "
+                        f"raw={stdout.strip()[:300]}"
+                    ),
                     duration_ms=duration,
                     returncode=proc.returncode,
                     stderr=stderr,

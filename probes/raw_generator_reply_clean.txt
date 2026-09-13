@@ -1,0 +1,16 @@
+{
+  "name": "isbn_normalizer",
+  "description": "Normalize and validate ISBN-10 and ISBN-13 identifiers by stripping hyphens, checking the check digit, and converting ISBN-10 to ISBN-13.",
+  "code": "def isbn_normalizer(isbn: str) -> str:\n    import re\n    from math import floor\n    from functools import reduce\n    \n    def convert_isbn10_to_isbn13(isbn10: str) -> str:\n        non_check_digits = isbn10.replace('-', '')\n        check_digit = str((11 - (sum((10 - i) * int(non_check_digit) for i, non_check_digit in enumerate(non_check_digits)) % 11)) % 11)\n        return f'978{non_check_digits}{check_digit}'\n    \n    def validate_isbn(isbn: str) -> bool:\n        if len(isbn) == 10:\n            return validate_isbn10(isbn)\n        elif len(isbn) == 13:\n            return validate_isbn13(isbn)\n        else:\n            return False\n    \n    def validate_isbn10(isbn10: str) -> bool:\n        non_check_digits = isbn10.replace('-', '')\n        check_digit = int(non_check_digits[-1])\n        calculated_check_digit = 10 - (sum((10 - i) * int(non_check_digit) for i, non_check_digit in enumerate(non_check_digits[:-1])) % 11)\n        return calculated_check_digit % 11 == check_digit\n    \n    def validate_isbn13(isbn13: str) -> bool:\n        non_check_digits = isbn13.replace('-', '')\n        check_digit = int(non_check_digits[-1])\n        calculated_check_digit = sum((10 - i) * int(non_check_digit) for i, non_check_digit in enumerate(non_check_digits[:-1])) % 11\n        return calculated_check_digit % 11 == check_digit\n    \n    isbn = isbn.replace('-', '')\n    if validate_isbn(isbn):\n        if len(isbn) == 10:\n            return convert_isbn10_to_isbn13(isbn)\n        elif len(isbn) == 13:\n            return isbn\n    raise ValueError('Invalid ISBN format')",
+  "entry": "isbn_normalizer",
+  "parameters": {"type": "object", "properties": {"isbn": {"type": "string"}}, "required": ["isbn"]},
+  "probes": [
+    {"query": "isbn_normalizer('978-0-306-40615-7')", "expect": "call", "negative_query": "isbn_normalizer('12345678901234')"},
+    {"query": "isbn_normalizer('0-306-40615-7')", "expect": "call", "negative_query": "isbn_normalizer('1234567890123')"},
+    {"query": "isbn_normalizer('9780306406157')", "expect": "call", "negative_query": "isbn_normalizer('0306406157')"},
+    {"query": "isbn_normalizer('0306-40615-7')", "expect": "call", "negative_query": "isbn_normalizer('0306406157')"}
+  ],
+  "effect_signature": "pure | reads:isbn | writes:normalized_isbn",
+  "tags": ["isbn", "normalization", "validation"],
+  "rationale": "This tool normalizes and validates ISBN-10 and ISBN-13 identifiers, ensuring they are in the correct format and check digit is valid. It also converts ISBN-10 to ISBN-13, which is a common task when dealing with book identifiers."
+}

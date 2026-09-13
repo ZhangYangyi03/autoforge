@@ -71,6 +71,7 @@ class Spawner:
     spawn_count: int = 0
     history: list[SpawnRecord] = field(default_factory=list)
     max_depth: int = 8              # a limit the agent can raise, not a cage
+    policy: Any = None              # AutonomyPolicy | None — gates merge_back
     _depth: int = 0
 
     def spawn(
@@ -116,6 +117,7 @@ class Spawner:
             agent_factory=self.agent_factory,
             parent_id=f"{self.parent_id}.{self.spawn_count}",
             max_depth=self.max_depth,
+            policy=self.policy,
             _depth=self._depth + 1,
         )
 
@@ -127,16 +129,44 @@ class Spawner:
         require_state: ToolState = ToolState.ACTIVE,
         approve: Callable[[ToolSpec], bool] | None = None,
     ) -> list[str]:
-        """Pull an isolated child's trusted tools into the parent library."""
+        """Pull an isolated child's trusted tools into the parent library.
+
+        `approve=None` (the default) is not "no gate": it means the policy
+        decides. When may_promote_tools is off the child's tools may not be
+        sealed ACTIVE in the first place, so require_state already filters them
+        and merge_back ends up pulling nothing. Pass an explicit `approve`
+        callback to merge anyway, one spec at a time.
+        """
         merged: list[str] = []
+        collect = self._collect_approved
         for name, spec in child_registry._tools.items():
             if spec.state != require_state:
                 continue
-            if approve is not None and not approve(spec):
+            if not collect(spec, approve):
                 continue
             self.registry.register(spec, replace=True)
             merged.append(name)
         return merged
+
+    @staticmethod
+    def _collect_approved(
+        spec: ToolSpec,
+        approve: Callable[[ToolSpec], bool] | None,
+    ) -> bool:
+        """Explicit callback always wins. With none, accept: require_state
+        already filtered, and the caller who owns the policy decides whether
+        merge_back is reachable at all (see `denied_reason`)."""
+        return approve(spec) if approve is not None else True
+
+    def denied_reason(self) -> str | None:
+        """Why merge_back would refuse to pull anything, or None if it won't."""
+        if self.policy is not None and not self.policy.may_promote_tools:
+            return (
+                "may_promote_tools is off: children may not seal tools ACTIVE, "
+                "so there is nothing at ACTIVE to merge. Pass approve=... to "
+                "accept on a case-by-case basis."
+            )
+        return None
 
     def summary(self) -> dict[str, Any]:
         return {

@@ -25,15 +25,71 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+class LLMResponseError(RuntimeError):
+    """The endpoint answered 2xx with a body that is not a completion.
+
+    Raised instead of letting the malformation surface later as
+    ``AttributeError: 'str' object has no attribute 'get'`` -- a message that
+    names neither the endpoint nor the body, and lands three frames away from
+    the reply that caused it. Retrying cannot help: the payload and the
+    credentials were accepted, and what came back is not the promised shape.
+    """
+
+
 @dataclass
 class LLMResponse:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     raw: dict[str, Any] | None = None
 
+    #: The model's private scratchpad, when the provider exposes one
+    #: (`reasoning_content` on reasoning models). Not part of the answer, but it
+    #: is not noise either: it is where the `max_tokens` budget goes when a
+    #: reply comes back empty, so diagnostics that count it can say *why*.
+    reasoning: str = ""
+
     @property
     def wants_tools(self) -> bool:
         return bool(self.tool_calls)
+
+    @property
+    def finish_reason(self) -> str | None:
+        """The provider's stop reason: 'stop', 'length', 'tool_calls', ...
+
+        Worth a name rather than three copies of the same dict walk, because it
+        is the only thing that separates "the model finished" from "the model was
+        cut off" — a distinction the error paths live or die by.
+        """
+        raw = self.raw if isinstance(self.raw, dict) else {}
+        choices = raw.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+        first = choices[0]
+        # A gateway that fails out-of-band sometimes answers HTTP 200 with
+        # ``choices: ["<something went wrong>"]``. Reading the shape rather than
+        # assuming it keeps that failure at the body, where it can be reported,
+        # instead of at this property, where all it can be is an AttributeError.
+        return first.get("finish_reason") if isinstance(first, dict) else None
+
+    @property
+    def ran_out_of_budget_thinking(self) -> bool:
+        """True when the cap was spent reasoning and no answer ever started.
+
+        Distinguishes a deterministic wall from a transient hiccup: retrying
+        this is guaranteed to burn the same budget again for the same nothing.
+        """
+        if self.content or self.tool_calls:
+            return False
+        return bool(self.reasoning) and self.finish_reason == "length"
+
+    def describe_shortfall(self) -> str:
+        """One line explaining an unusable reply, for the caller's error path."""
+        if self.ran_out_of_budget_thinking:
+            return (f"the model spent the whole max_tokens budget on "
+                    f"reasoning ({len(self.reasoning)} chars of "
+                    f"reasoning_content) and never began the answer; raise "
+                    f"max_tokens or pick a model that answers directly")
+        return f"finish_reason={self.finish_reason!r}, {len(self.content)} chars of content"
 
 
 class LLMClient:
@@ -84,8 +140,9 @@ class OpenAICompatClient(LLMClient):
         default_temperature: float = 0.0,
         default_max_tokens: int | None = DEFAULT_MAX_TOKENS,
         extra_headers: dict[str, str] | None = None,
-        max_attempts: int = 3,
-        retry_backoff: float = 1.5,
+        max_attempts: int = 5,
+        retry_backoff: float = 2.0,
+        retry_max_delay: float = 30.0,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -95,13 +152,19 @@ class OpenAICompatClient(LLMClient):
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.extra_headers = extra_headers or {}
+        # Five attempts at a base of two seconds is roughly 30 seconds of riding
+        # out a 503 burst. The gateway's outages are bursty and outlast a short
+        # ladder: a real forge died on `503 Service Unavailable` in round two
+        # even with the three-attempt, 1.5x default, and a probe reproduced the
+        # same 503 twice in a row while every cap returned 200 seconds later.
         self.max_attempts = max(1, max_attempts)
         self.retry_backoff = retry_backoff
+        self.retry_max_delay = retry_max_delay
         self.name = f"openai-compat:{model}"
 
     def _wait_before_retry(self, attempt: int, resp: Any) -> None:
         """Exponential backoff, but never earlier than the server asked for."""
-        delay = self.retry_backoff ** attempt
+        delay = min(self.retry_backoff ** attempt, self.retry_max_delay)
         if resp is not None:
             asked = (getattr(resp, "headers", None) or {}).get("Retry-After")
             if asked:
@@ -111,13 +174,32 @@ class OpenAICompatClient(LLMClient):
                     pass
         _sleep(delay)
 
-    def _to_response(self, data: dict[str, Any]) -> LLMResponse:
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
+    def _to_response(self, data: Any) -> LLMResponse:
+        if not isinstance(data, dict):
+            raise LLMResponseError(
+                f"{self.name} answered with a JSON {type(data).__name__}, "
+                f"not an object: {str(data)[:200]!r}"
+            )
+        choices = data.get("choices")
+        if not isinstance(choices, list):
+            choices = []
+        if choices and not isinstance(choices[0], dict):
+            # 200 with choices[0] as a bare string is how an OpenAI-compatible
+            # gateway reports a downstream failure. Name it; do not crash on it.
+            raise LLMResponseError(
+                f"{self.name} returned choices[0] of type "
+                f"{type(choices[0]).__name__}, not an object: "
+                f"{str(choices[0])[:200]!r}"
+            )
+        choice = choices[0] if choices else {}
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            msg = {}
         return LLMResponse(
             content=msg.get("content") or "",
             tool_calls=[ToolCall.from_api(tc) for tc in (msg.get("tool_calls") or [])],
             raw=data,
+            reasoning=msg.get("reasoning_content") or "",
         )
 
     def chat(
@@ -166,13 +248,25 @@ class OpenAICompatClient(LLMClient):
                 continue
 
             resp.raise_for_status()
-            parsed = self._to_response(resp.json())
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                # A proxy or gateway in front of the endpoint can answer 200
+                # with an HTML error page. Decoding that is not the caller's
+                # problem to guess at, and the decode failure names nothing.
+                raise LLMResponseError(
+                    f"{self.name} returned a non-JSON body "
+                    f"(HTTP {resp.status_code}): {(resp.text or '')[:200]!r}"
+                ) from exc
+            parsed = self._to_response(body)
 
-            # An empty completion is a provider hiccup, not an answer — retry it
-            # like a 503. On the last attempt hand it back anyway: the caller's
-            # diagnostics quote `finish_reason`, which explains an empty reply
-            # far better than an exception raised on its behalf would.
+            # An empty completion is usually a provider hiccup, and hiccups are
+            # worth a second send. One exception: if the whole budget went to a
+            # reasoning trace, the wall is deterministic and resending just
+            # spends the same tokens for the same empty reply.
             if parsed.content or parsed.tool_calls or final:
+                return parsed
+            if parsed.ran_out_of_budget_thinking:
                 return parsed
             self._wait_before_retry(attempt, resp)
 
@@ -222,6 +316,7 @@ def tool_call(name: str, arguments: dict[str, Any] | None = None, call_id: str |
 __all__ = [
     "LLMClient",
     "LLMResponse",
+    "LLMResponseError",
     "OpenAICompatClient",
     "MockLLMClient",
     "tool_call",
