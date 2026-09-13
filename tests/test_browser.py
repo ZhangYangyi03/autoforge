@@ -41,6 +41,7 @@ from autoforge.browser import (
     _Reader,
     accept_key,
     browser_candidates,
+    closed_connection,
     encode_frame,
     find_browser,
     launch_browser,
@@ -207,7 +208,8 @@ class FakeCDP:
     def __init__(self, replies: dict | None = None, *, status: int = 101,
                  accept_override: str | None = None, event_first: bool = False,
                  stray_reply: bool = False, upgrade_garbage: bytes = b"",
-                 silent: bool = False, on_message=None) -> None:
+                 silent: bool = False, on_message=None,
+                 kill_after: int = 0, kill_mode: str = "reset") -> None:
         self.replies = replies or {}
         self.status = status
         self.accept_override = accept_override
@@ -218,6 +220,14 @@ class FakeCDP:
         #: browser looks like from here.
         self.silent = silent
         self.on_message = on_message
+        #: Die after answering this many requests, without a close frame --
+        #: which is what a browser quitting under the client looks like. Zero
+        #: means stay up. `kill_mode` picks which death: a reset (`RST`, so the
+        #: client's read raises) or a hang-up (`FIN`, so it returns an empty
+        #: chunk). Those two are the same event arriving in two shapes, and the
+        #: whole point of `closed_connection` is that they read alike.
+        self.kill_after = kill_after
+        self.kill_mode = kill_mode
         self.received: list[dict] = []
         self.sent: list[dict] = []
         self.request_headers: dict[str, str] = {}
@@ -320,6 +330,28 @@ class FakeCDP:
             message = json.loads(frame.payload.decode("utf-8"))
             self.received.append(message)
             self._answer(conn, message)
+            if self.kill_after and len(self.received) >= self.kill_after:
+                self._die(conn)
+                return
+
+    def _die(self, conn: socket.socket) -> None:
+        """Drop the connection the way a browser process quitting does.
+
+        `SO_LINGER` with a zero timeout makes `close` send `RST` instead of
+        `FIN`, so the client's next read *raises* rather than coming back
+        empty. That is the Windows behaviour (WinError 10053/10054) reproduced
+        on every platform, which is the branch the empty-chunk path misses.
+        """
+        if self.kill_mode == "reset":
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     def _answer(self, conn: socket.socket, message: dict) -> None:
         if self.silent:
@@ -407,6 +439,90 @@ class TestHandshake:
                 assert b"Inspector.detached" in frame.payload
             finally:
                 ws.close()
+
+
+class TestTheBrowserQuitting:
+    """A browser that dies mid-stream, in both of the shapes it arrives in.
+
+    This is the failure that made the graceful-close path dead code on Windows.
+    The same event -- the peer is gone -- reaches `recv` as an empty chunk on
+    POSIX and as a *raised* `OSError` (WinError 10053/10054) on Windows, so the
+    empty-chunk branch never ran there and a raw, localized OS string escaped
+    the whole websocket layer. Both shapes are exercised here and both must end
+    as this module's error, carrying the same message.
+    """
+
+    def _drive_into_a_dead_socket(self, server: "FakeCDP") -> WebSocketError:
+        ws = WebSocket.connect(server.url, timeout=5)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
+            with pytest.raises(WebSocketError) as caught:
+                ws.recv(timeout=5)
+            return caught.value
+        finally:
+            ws.close()
+
+    def test_a_reset_reads_as_this_modules_error_not_an_oserror(self):
+        """The raising shape: what Windows does, forced on every platform."""
+        # `silent` because the death has to land on an *outstanding* request --
+        # a server that answers first and dies after has left the client with
+        # its reply, which is a completed call, not a dead peer.
+        with FakeCDP(silent=True, kill_after=1, kill_mode="reset") as server:
+            error = self._drive_into_a_dead_socket(server)
+        # A timeout would mean the death was read as silence, which is a
+        # different claim about the peer and the wrong one.
+        assert not isinstance(error, TimeoutError)
+        assert "closed the connection" in str(error)
+
+    def test_a_hangup_reads_the_same_as_a_reset(self):
+        """The empty-chunk shape: what POSIX does. Identical text, by design."""
+        with FakeCDP(silent=True, kill_after=1, kill_mode="close") as server:
+            error = self._drive_into_a_dead_socket(server)
+        assert "closed the connection" in str(error)
+
+    def test_a_hung_browser_is_a_timeout_not_a_death(self):
+        """The distinction the socket layer must not blur.
+
+        A browser that is alive and simply not answering is not the same fact
+        as one that has quit, and the CDP loop needs to tell them apart to name
+        the method that hung. Collapsing both into one error loses that.
+        """
+        with FakeCDP(silent=True) as server:
+            ws = WebSocket.connect(server.url, timeout=5)
+            try:
+                ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
+                with pytest.raises(WebSocketError, match="sent nothing"):
+                    ws.recv(timeout=1)
+            finally:
+                ws.close()
+
+
+class TestClosedConnectionVocabulary:
+    """`closed_connection` itself, without a socket in the way."""
+
+    def test_a_windows_error_becomes_this_modules_error_carrying_the_number(self):
+        exc = ConnectionResetError(10054, "forcibly closed by the remote host")
+        exc.winerror = 10054
+        error = closed_connection(exc, "the browser closed the connection")
+        assert isinstance(error, WebSocketError)
+        assert error.errno == 10054
+        assert error.__cause__ is exc
+
+    def test_a_posix_errno_survives_the_same_way(self):
+        exc = ConnectionResetError(104, "Connection reset by peer")
+        error = closed_connection(exc, "the browser closed the connection")
+        assert error.errno == 104
+
+    def test_the_number_is_not_stuffed_into_the_message(self):
+        """The text must stay stable for callers that match on it.
+
+        The errno is the language-independent half of an OS message, so it
+        rides along as an attribute; embedding it would make the message
+        change shape per platform for no gain.
+        """
+        exc = ConnectionResetError(104, "Connection reset by peer")
+        error = closed_connection(exc, "the browser closed the connection")
+        assert str(error) == "the browser closed the connection"
 
 
 class TestWebSocketControl:

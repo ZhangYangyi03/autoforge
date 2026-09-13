@@ -93,6 +93,29 @@ class WebSocketTimeout(WebSocketError):
     """
 
 
+def closed_connection(exc: OSError, message: str) -> WebSocketError:
+    """Name a dropped socket in this module's vocabulary, on every platform.
+
+    The same event -- the browser died mid-stream -- reaches `recv` in two
+    shapes. On POSIX the read returns `b""` and the caller raises on the empty
+    chunk. On Windows it *raises* instead: WinError 10053
+    (`ConnectionAbortedError`) when the local end tears down, 10054
+    (`ConnectionResetError`) when the peer vanishes. Both are `OSError`
+    subclasses, so the empty-chunk branch never runs and the raw exception --
+    carrying a localized OS string -- escaped the whole websocket layer. The
+    graceful-close path was dead code on Windows.
+
+    Normalizing it here means a dead browser reads the same everywhere. The
+    errno rides along as an attribute rather than in the text: it is the
+    language-independent half of the OS message, and the text stays stable for
+    callers that match on it.
+    """
+    error = WebSocketError(message)
+    error.errno = getattr(exc, "winerror", None) or exc.errno  # type: ignore[attr-defined]
+    error.__cause__ = exc
+    return error
+
+
 class CDPError(RuntimeError):
     """The browser answered, and the answer was an error."""
 
@@ -432,6 +455,13 @@ class WebSocket:
             except socket.timeout:
                 raise WebSocketTimeout(
                     f"the browser sent nothing for {_secs(limit)}") from None
+            except OSError as exc:
+                # Windows reports a dead peer by raising (10053/10054) where
+                # POSIX returns b"" -- same event, so the same error. Must come
+                # after the timeout clause: on 3.10+ socket.timeout is
+                # TimeoutError, an OSError subclass.
+                raise closed_connection(
+                    exc, "the browser closed the connection")
             if not chunk:
                 self.close()
                 raise WebSocketError("the browser closed the connection")
@@ -472,6 +502,12 @@ def _read_handshake(raw: Any) -> tuple[int, dict[str, str], bytes]:
             chunk = raw.recv(4096)
         except socket.timeout:
             raise WebSocketError("timed out waiting for the upgrade reply") from None
+        except OSError as exc:
+            # Same Windows/POSIX split as `_next_message`: a browser that dies
+            # during the upgrade raises here too, and that must read as this
+            # module's error rather than surfacing a raw WinError.
+            raise closed_connection(
+                exc, "the connection closed during the upgrade")
         if not chunk:
             raise WebSocketError("the connection closed during the upgrade")
         buf += chunk
