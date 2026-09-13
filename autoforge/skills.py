@@ -30,13 +30,34 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .store import _default_home
 
 SKILL_SUFFIX = ".md"
 ARCHIVE_DIR = ".archive"
 ENV_DIRS = "AUTOFORGE_SKILLS_DIRS"
+
+#: A skill package's entry point. The library is a tree of categories, each
+#: holding skill directories, each holding one of these — the layout every
+#: skill on this machine actually uses.
+SKILL_INDEX_NAME = "SKILL.md"
+
+#: Directories a skill scan must never descend into. Ported from Hermes'
+#: `skill_utils.EXCLUDED_SKILL_DIRS`, which is the implementation that already
+#: reads this exact directory tree correctly: VCS and editor metadata, virtualenvs
+#: and dependency trees, and every cache directory a Python project grows.
+EXCLUDED_SKILL_DIRS = frozenset({
+    ".git", ".github", ".hub", ".archive", ".venv", "venv",
+    "node_modules", "site-packages", "__pycache__",
+    ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+})
+
+#: Progressive-disclosure areas *inside a skill package*: loaded explicitly by
+#: name, never discovered as skills of their own. Pruned only when the directory
+#: holding them is itself a skill (see `iter_skill_index_files`) — otherwise a
+#: legitimate category called `scripts/` or `templates/` would vanish.
+SKILL_SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
 
 MENU_LINE_CHARS = 160      # per-entry cap in the prompt menu
 MENU_BUDGET_CHARS = 1400   # whole-menu cap, for the same reason memory has one
@@ -190,6 +211,65 @@ def default_skill_dirs(cwd: str | None = None, home: str | None = None
     return dirs
 
 
+def iter_skill_index_files(directory: str | Path) -> Iterator[Path]:
+    """Walk `directory` yielding sorted `SKILL.md` paths, pruning as it goes.
+
+    Ported from Hermes' `skill_utils.iter_skill_index_files` because that is the
+    scanner that already reads this machine's skill tree correctly, and this
+    module's first version did not: it globbed `*.md` one level deep, which sees
+    zero of the 243 skills on disk. Every skill here is a *package*
+    (`<category>/<name>/SKILL.md`), and a flat glob cannot see a tree.
+
+    Pruning happens on the directory list rather than on the results, so
+    excluded subtrees are never even listed — the difference between reading a
+    tree and filtering a mess.
+
+    The support-dir rule carries the subtlety worth keeping: `references/`,
+    `templates/`, `assets/` and `scripts/` are cut *only* when the directory
+    holding them is itself a skill (`SKILL.md` present). A category that happens
+    to be named `scripts` stays discoverable, and a skill's own support files —
+    which may well contain an archived `SKILL.md` package — are not promoted to
+    skills.
+    """
+    root = str(directory)
+    matches: list[str] = []
+    for here, dirs, files in os.walk(root, followlinks=True):
+        is_a_skill = SKILL_INDEX_NAME in files
+        dirs[:] = [
+            d for d in dirs
+            if d not in EXCLUDED_SKILL_DIRS
+            and not (is_a_skill and d in SKILL_SUPPORT_DIRS)
+        ]
+        if SKILL_INDEX_NAME in files:
+            matches.append(os.path.join(here, SKILL_INDEX_NAME))
+    for path in sorted(matches):
+        yield Path(path)
+
+
+def iter_skill_files(directory: str | Path) -> Iterator[Path]:
+    """Every skill file under `directory`, in both layouts this library supports.
+
+    1. Flat `<name>.md` at the top level — what `SkillLibrary.write` produces,
+       and therefore what the agent's own skills look like.
+    2. `<category>/<name>/SKILL.md` anywhere below — the package layout, which is
+       how skills are distributed and how the whole library on this machine is
+       arranged.
+
+    Flat first, so a skill the agent wrote itself outranks a packaged one of the
+    same name — the agent's own edit is the more specific statement of intent.
+    `SkillLibrary.scan` reports the collision either way, so this order decides
+    which file wins, not whether the loser is noticed.
+    """
+    root = Path(directory)
+    for path in sorted(root.glob("*" + SKILL_SUFFIX)):
+        # A half-written file from an interrupted `write` (see the temp-then-move
+        # dance there) must never be indexed.
+        if path.name.endswith(SKILL_SUFFIX + ".tmp"):
+            continue
+        yield path
+    yield from iter_skill_index_files(root)
+
+
 # ---------------------------------------------------------------------------
 class SkillLibrary:
     """Skills on disk, plus the usage history that makes them rankable."""
@@ -219,7 +299,10 @@ class SkillLibrary:
         for source, directory in self.dirs:
             if not os.path.isdir(directory):
                 continue
-            for path in sorted(Path(directory).glob("*" + SKILL_SUFFIX)):
+            # Both layouts, and a tree walk rather than a flat glob: every skill
+            # is a package under a category, and the previous `glob("*.md")` saw
+            # none of them. See `iter_skill_files`.
+            for path in iter_skill_files(directory):
                 try:
                     skill = self._read(path, source)
                 except SkillError as exc:

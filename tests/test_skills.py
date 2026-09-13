@@ -598,3 +598,145 @@ class TestDefaults:
         lib = SkillLibrary(dirs=[("user", str(tmp_path / "nope"))])
         assert lib.scan() == []
         assert lib.errors == []
+
+
+# ======================================================================
+# the scanner sees trees, not just the top level
+# ======================================================================
+PKG = """---
+name: {name}
+description: {desc}
+when_to_use: {when}
+tags: t
+---
+body of {name}
+"""
+
+
+def _pkg(directory, category, name):
+    """Write a packaged skill: <category>/<name>/SKILL.md."""
+    d = directory / category / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        PKG.format(name=name, desc=f"does {name}", when=f"when {name}"),
+        encoding="utf-8",
+    )
+    return d
+
+
+class TestScannerFindsPackages:
+    """The library is a tree of categories, and the first scanner could not see it.
+
+    The original scan globbed `*.md` one level deep, so it found every skill the
+    agent had *written itself* (flat, at the top) and none of the skills that
+    were *installed* (a package under a category). On this machine that was 0 of
+    239 discovered, with no error — a silent wrong answer, which is why the
+    counting assertion below is the point of the class, not a decoration.
+    """
+
+    def test_a_skill_inside_a_category_is_discovered(self, home):
+        _pkg(home / "skills", "research", "arxiv")
+        lib = _lib(home)
+        names = [s.name for s in lib.scan()]
+        assert names == ["arxiv"], "a packaged skill must be visible to the scan"
+
+    def test_several_categories_and_depths_all_come_back(self, home):
+        root = home / "skills"
+        _pkg(root, "research", "arxiv")
+        _pkg(root, "software-development", "tdd")
+        _pkg(root, "mlops", "ollama")
+        # already at the top level, so this one is a package with no category
+        _pkg(root, "", "flat-package")
+        names = sorted(s.name for s in _lib(home).scan())
+        assert names == ["arxiv", "flat-package", "ollama", "tdd"]
+
+    def test_the_agents_own_flat_skills_still_work(self, home):
+        # `write` produces <name>.md at the top; that layout must not regress
+        # while fixing the packaged one.
+        lib = _lib(home)
+        lib.write("mine", "does mine", "when mine", "b")
+        assert "mine" in [s.name for s in lib.scan()]
+
+    def test_flat_and_packaged_are_both_seen(self, home):
+        root = home / "skills"
+        _write_raw(root, "hand-written", PKG.format(name="hand-written", desc="d", when="w"))
+        _pkg(root, "research", "installed")
+        names = sorted(s.name for s in _lib(home).scan())
+        assert names == ["hand-written", "installed"]
+
+    def test_an_archived_skill_is_not_resurrected(self, home):
+        # `.archive/` holds retired skills. They stay on disk for the record and
+        # must not be indexed — otherwise deleting a skill does nothing.
+        root = home / "skills"
+        _pkg(root, ".archive", "retired")
+        _pkg(root, "live", "current")
+        names = [s.name for s in _lib(home).scan()]
+        assert names == ["current"], "an archived package must stay archived"
+
+    def test_a_quarantined_skill_is_not_indexed(self, home):
+        # `.hub/quarantine/` is the same contract for a bad import.
+        root = home / "skills"
+        _pkg(root, ".hub/quarantine", "suspect")
+        _pkg(root, "live", "current")
+        assert [s.name for s in _lib(home).scan()] == ["current"]
+
+    def test_a_support_dir_inside_a_skill_is_not_a_skill(self, home):
+        # A skill package may keep a complete old copy under references/. That
+        # is documentation data, reachable by file_path, not a skill.
+        root = home / "skills"
+        skill = _pkg(root, "live", "real")
+        old = skill / "references" / "old-skill"
+        old.mkdir(parents=True)
+        (old / "SKILL.md").write_text(
+            PKG.format(name="old-skill", desc="d", when="w"), encoding="utf-8")
+        assert [s.name for s in _lib(home).scan()] == ["real"]
+
+    def test_a_category_named_like_a_support_dir_survives(self, home):
+        # `scripts/foo/SKILL.md` is a legitimate skill; `scripts` is only a
+        # support area *inside* a package. The pruning must know the difference.
+        root = home / "skills"
+        _pkg(root, "scripts", "deploy")
+        _pkg(root, "templates", "scaffold")
+        names = sorted(s.name for s in _lib(home).scan())
+        assert names == ["deploy", "scaffold"]
+
+    def test_a_dependency_tree_is_not_walked(self, home):
+        root = home / "skills"
+        _pkg(root, "node_modules", "junk")
+        _pkg(root, "__pycache__", "junk2")
+        _pkg(root, ".venv/lib", "junk3")
+        _pkg(root, "live", "real")
+        assert [s.name for s in _lib(home).scan()] == ["real"]
+
+    def test_a_partial_write_is_not_indexed(self, home):
+        # An interrupted `write` can leave `<name>.md.tmp`; indexing it would
+        # offer a skill whose body is half a file.
+        root = home / "skills"
+        (root / "half.md.tmp").write_text("---\nname: half\n", encoding="utf-8")
+        _pkg(root, "live", "real")
+        assert [s.name for s in _lib(home).scan()] == ["real"]
+
+    def test_the_flat_file_wins_a_name_collision(self, home):
+        # The agent's own edit outranks an installed skill of the same name, and
+        # the shadowing is reported rather than silent.
+        root = home / "skills"
+        _write_raw(root, "dup",
+                   PKG.format(name="dup", desc="agent version", when="w"))
+        _pkg(root, "research", "dup")
+        lib = _lib(home)
+        found = {s.name: s for s in lib.scan()}
+        assert found["dup"].description == "agent version"
+        assert any("dup" in str(x) for x in lib.shadowed)
+
+    def test_a_broken_package_is_loud_and_does_not_kill_the_scan(self, home):
+        # One malformed file must surface in errors and leave its neighbours
+        # discoverable — a scan that dies on the first bad file hides the rest.
+        root = home / "skills"
+        bad = root / "research" / "broken"
+        bad.mkdir(parents=True)
+        (bad / "SKILL.md").write_text("# no frontmatter\n", encoding="utf-8")
+        _pkg(root, "research", "fine")
+        lib = _lib(home)
+        names = [s.name for s in lib.scan()]
+        assert names == ["fine"]
+        assert lib.errors, "a malformed skill must be reported, not swallowed"
