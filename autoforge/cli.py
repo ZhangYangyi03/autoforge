@@ -54,7 +54,9 @@ from .tools.registry import ToolRegistry
 
 MODES = ("standard", "minimal")
 
-PROXIES = {"http": "socks5://127.0.0.1:9674", "https": "socks5://127.0.0.1:9674"}
+# The relay itself lives in `configfile` so the vision client honours the same
+# switch; this name is kept so the callers below read unchanged.
+PROXIES = configfile.PROXIES
 
 _C = "\033[36m"
 _D = "\033[2m"

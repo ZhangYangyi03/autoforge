@@ -51,7 +51,15 @@ from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .mcp import MCPClient, MCPHub, servers_from_config
+from .browser import (
+    Browser,
+    BrowserError,
+    CDPError,
+    WebSocketError,
+    launch_browser,
+)
 from .notify import Notifier, NotifyError, channels_from_config
+from .vision import VisionError, vision_from_config
 from .route.router import BehaviourRouter, RoutingWeights
 from .schedule import Schedule, ScheduleError, as_clock
 from .schedule import install_system_task as _install_system_task
@@ -351,6 +359,21 @@ BUILTIN_SCOPES: dict[str, str] = {
     # arbitrary code execution to send a status line.
     "notify_send": "network",
     "notify_channels": "read_only",
+    # Looking. Rendering a page starts a browser, which runs a process; driving
+    # it reaches the network, and evaluating script in it can do anything the
+    # page could do. The two that read state back declare the narrower scope
+    # they actually hold, rather than all of them claiming the widest.
+    "browser_open": "system",
+    "browser_close": "system",
+    "browser_state": "read_only",
+    "browser_goto": "network",
+    "browser_eval": "network",
+    "browser_click": "network",
+    "browser_type": "network",
+    "browser_press": "network",
+    "browser_screenshot": "local_write",
+    "see": "network",
+    "vision_status": "read_only",
     # The task table is a file the agent owns. Writing it is a local write;
     # reading back the agenda is not.
     "schedule_add": "local_write",
@@ -436,6 +459,18 @@ class ForgeAgent:
         self.schedule = Schedule()
         self.mcp = MCPHub(self.mcp_servers)
 
+        # Seeing. Two halves that are useless apart: a browser to render what
+        # only exists after scripts run, and a vision endpoint to read the
+        # picture back. Neither is started or contacted at construction -- the
+        # browser process is launched on first use and the vision config is
+        # only read into a client. An agent that is never asked to look never
+        # costs anything for being able to.
+        self.vision, self._vision_problem = vision_from_config(load())
+        self._browser: Browser | None = None
+        self._browser_proc: Any = None
+        self._browser_endpoint = os.environ.get(
+            "AUTOFORGE_CDP_ENDPOINT", "http://127.0.0.1:9222")
+
         # Skills: procedures on disk, ranked by how often they were loaded.
         # Scanned at construction because the prompt menu is built per run, and
         # a menu assembled from a stale scan would offer procedures that are no
@@ -503,6 +538,8 @@ class ForgeAgent:
         self._tool_gpu()
         self._tool_notify()
         self._tool_schedule()
+        self._tool_browser()
+        self._tool_vision()
 
     def _add(self, spec: ToolSpec) -> None:
         # Say what this tool touches, so a switched-off freedom has something to
@@ -1830,6 +1867,338 @@ class ForgeAgent:
                 "name": {"type": "string", "description": "the OS task name"},
             }},
             fn=install_system_task, source="builtin", tags=["meta", "time"],
+        ))
+
+    # ------------------------------------------------------------------
+    # looking at things
+    # ------------------------------------------------------------------
+    def _ensure_browser(self, *, launch: bool = True,
+                        headless: bool = True) -> "Browser":
+        """The live browser session, attaching to one if it is already there.
+
+        Connecting first and launching second is deliberate: an operator who
+        started Chrome themselves with a profile they are logged into gets that
+        session, and the agent does not start a second browser behind them.
+        """
+        if self._browser is not None and not self._browser._closed:
+            return self._browser
+
+        try:
+            self._browser = Browser.connect(self._browser_endpoint)
+            return self._browser
+        except (BrowserError, WebSocketError) as first:
+            if not launch:
+                raise BrowserError(
+                    f"no browser is listening at {self._browser_endpoint} "
+                    f"({first})") from first
+
+        # Nothing there. Start one and attach to it. A launch failure is
+        # reported with its own cause, because "no browser" and "the browser
+        # refuses to open the debug port" need different fixes.
+        try:
+            self._browser_proc, endpoint = launch_browser(headless=headless)
+        except BrowserError as exc:
+            raise BrowserError(
+                f"no browser to drive: {exc}") from exc
+        self._browser_endpoint = endpoint
+        self._browser = Browser.connect(endpoint)
+        return self._browser
+
+    def _tool_browser(self) -> None:
+        """A real browser, so the agent can read pages that must be rendered.
+
+        A page whose content arrives from JavaScript is invisible to anything
+        that only fetches HTML, and "the build output page shows an error" is
+        not something a file read can confirm. This drives Chrome over CDP for
+        that, and hands the screenshot to `see` so the agent can look at what
+        it rendered rather than inferring it from the DOM.
+        """
+
+        def browser_open(headless: bool = True, endpoint: str = "") -> str:
+            if endpoint:
+                self._browser_endpoint = endpoint
+            browser = self._ensure_browser(headless=headless)
+            browser.enable()
+            self._record("browser_open", {"endpoint": self._browser_endpoint})
+            return (f"Driving {self._browser_endpoint} "
+                    f"(target {browser.target.get('id', 'attached')!r}).\n"
+                    f"{self._browser_report(browser)}")
+
+        def browser_state() -> str:
+            if self._browser is None or self._browser._closed:
+                return "No browser is attached. Call browser_open first."
+            return self._browser_report(self._browser)
+
+        def browser_goto(url: str, wait: bool = True,
+                         timeout: float = 30.0) -> str:
+            browser = self._ensure_browser()
+            title = browser.goto(url, wait=wait, timeout=timeout)
+            self._record("browser_goto", {"url": url})
+            return (f"{browser.current_url() or url}\n"
+                    f"title: {title or '(none)'}")
+
+        def browser_eval(expression: str) -> str:
+            browser = self._ensure_browser()
+            value = browser.evaluate(expression)
+            self._record("browser_eval", {"chars": len(expression)})
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+            if len(rendered) > 4000:
+                return rendered[:4000] + f"\n[...{len(rendered) - 4000} more chars]"
+            return rendered
+
+        def browser_click(x: float, y: float, clicks: int = 1) -> str:
+            browser = self._ensure_browser()
+            browser.click(x, y, clicks=clicks)
+            self._record("browser_click", {"x": x, "y": y})
+            return f"Clicked ({x}, {y}) x{clicks}. Now on: {browser.current_url()}"
+
+        def browser_type(text: str, selector: str = "",
+                         submit: bool = False) -> str:
+            browser = self._ensure_browser()
+            if selector:
+                # Focus through the DOM and dispatch a real click, so the page's
+                # own focus handling runs; setting .value directly would leave
+                # framework state untouched and the form would submit empty.
+                browser.evaluate(
+                    "(() => { const el = document.querySelector("
+                    + json.dumps(selector) + "); if (!el) return false;"
+                    " el.focus(); return true; })()")
+            browser.type_text(text)
+            key = ""
+            if submit:
+                browser.press("Enter")
+                key = " then Enter"
+            self._record("browser_type", {"chars": len(text), "selector": selector})
+            return (f"Typed {len(text)} characters"
+                    + (f" into {selector}" if selector else "")
+                    + key)
+
+        def browser_press(key: str) -> str:
+            browser = self._ensure_browser()
+            browser.press(key)
+            self._record("browser_press", {"key": key})
+            return f"Pressed {key}."
+
+        def browser_screenshot(path: str = "", full_page: bool = False) -> str:
+            browser = self._ensure_browser()
+            data = browser.screenshot(full_page=full_page)
+            if not path:
+                # Beside the other durable state rather than in whatever the
+                # process happened to be started from: a screenshot written to
+                # a working directory nobody chose is a file nobody finds.
+                home = os.environ.get("AUTOFORGE_HOME")
+                base = home or os.path.join(os.path.expanduser("~"), ".autoforge")
+                path = os.path.join(base, "screenshots",
+                                    f"shot-{int(time.time())}.png")
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+            self._record("browser_screenshot", {"path": path, "bytes": len(data)})
+            hint = ("\nPass it to `see` with your question to actually look at it."
+                    if self.vision else
+                    "\n(No vision endpoint is configured, so nothing can read it back.)")
+            return (f"Saved {len(data)} bytes to {os.path.abspath(target)}\n"
+                    f"Page: {browser.current_url()}" + hint)
+
+        def browser_close() -> str:
+            had = self._browser is not None
+            if self._browser is not None:
+                self._browser.close()
+                self._browser = None
+            # The process is left running on purpose when it was already there
+            # before we attached: it is not ours to kill.
+            note = (" Detached. Any browser that was already running is left "
+                    "as it was." if had else "")
+            return f"No browser is attached now.{note}"
+
+        self._add(ToolSpec(
+            name="browser_open",
+            description=(
+                "Attach to a browser over the DevTools protocol, starting one "
+                "if nothing is listening. Required before the other browser_* "
+                "tools. Attaching to an already-running browser is preferred, "
+                "so start Chrome with --remote-debugging-port=9222 yourself if "
+                "you want to share a logged-in session."
+            ),
+            parameters={"type": "object", "properties": {
+                "headless": {"type": "boolean",
+                             "description": "start headless if one must be started (default true)"},
+                "endpoint": {"type": "string",
+                             "description": "CDP endpoint; default http://127.0.0.1:9222"},
+            }},
+            fn=browser_open, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_state",
+            description=(
+                "What the browser is currently showing: the URL, the title, and "
+                "how many tabs exist. Call it to confirm a click or a navigation "
+                "did what you expected instead of assuming it did."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=browser_state, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_goto",
+            description=(
+                "Navigate the current tab and wait for the document to finish "
+                "loading, including its scripts. Returns the final URL and "
+                "title -- a redirect means they differ from what you asked for."
+            ),
+            parameters={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "wait": {"type": "boolean", "description": "wait for load (default true)"},
+                "timeout": {"type": "number", "description": "seconds (default 30)"},
+            }, "required": ["url"]},
+            fn=browser_goto, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_eval",
+            description=(
+                "Run JavaScript in the page and get the value back. This is how "
+                "you read content that only exists after the scripts ran. "
+                "Expressions are reduced to JSON; return a plain value rather "
+                "than a DOM node, which does not survive the trip."
+            ),
+            parameters={"type": "object", "properties": {
+                "expression": {"type": "string",
+                               "description": "a JavaScript expression"},
+            }, "required": ["expression"]},
+            fn=browser_eval, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_click",
+            description=(
+                "Click at a point in the viewport, in CSS pixels from the "
+                "top-left. Get the coordinates from browser_eval with "
+                "getBoundingClientRect. Coordinates rather than selectors "
+                "because that is what the browser actually dispatches, so "
+                "overlays and hit-testing behave as they do for a person."
+            ),
+            parameters={"type": "object", "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "clicks": {"type": "integer", "description": "1 (default) or 2"},
+            }, "required": ["x", "y"]},
+            fn=browser_click, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_type",
+            description=(
+                "Type text into the page, optionally focusing a CSS selector "
+                "first, optionally pressing Enter. Pass submit=true to press "
+                "Enter, which is how forms are usually sent."
+            ),
+            parameters={"type": "object", "properties": {
+                "text": {"type": "string"},
+                "selector": {"type": "string", "description": "CSS selector to focus first"},
+                "submit": {"type": "boolean", "description": "press Enter after typing"},
+            }, "required": ["text"]},
+            fn=browser_type, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_press",
+            description=(
+                "Press one key: Enter, Escape, ArrowDown, Tab, PageDown. Use "
+                "Escape to dismiss a dialog and Tab to move focus."
+            ),
+            parameters={"type": "object", "properties": {
+                "key": {"type": "string", "description": "a CDP key name"},
+            }, "required": ["key"]},
+            fn=browser_press, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_screenshot",
+            description=(
+                "Save a PNG of the page and return its path. Screenshots are "
+                "the only way to see anything that is visual -- a layout that "
+                "broke, a blank render, a chart -- so pair it with `see` rather "
+                "than stopping at the file."
+            ),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string", "description": "where to write the PNG"},
+                "full_page": {"type": "boolean",
+                              "description": "capture the whole scrollable page"},
+            }},
+            fn=browser_screenshot, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_close",
+            description=(
+                "Detach from the browser. A browser this agent started keeps "
+                "running; one that was already there is left exactly as it was."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=browser_close, source="builtin", tags=["browser", "web"],
+        ))
+
+    def _browser_report(self, browser: "Browser") -> str:
+        parts = [f"url:   {browser.current_url() or '(none)'}",
+                 f"title: {browser.title() or '(none)'}",
+                 f"events seen: {len(browser.events)}"]
+        try:
+            targets = browser.call("Target.getTargets").get("targetInfos", [])
+            pages = [t for t in targets if t.get("type") == "page"]
+            parts.append(f"tabs:  {len(pages)}")
+            for page in pages[:5]:
+                parts.append(f"  - {page.get('title') or '(untitled)'} "
+                             f"<{page.get('url')}>")
+        except (CDPError, BrowserError, WebSocketError):
+            # A browser-level target has no Target domain. Not worth failing a
+            # status report over.
+            pass
+        return "\n".join(parts)
+
+    def _tool_vision(self) -> None:
+        """Reading a picture. The half of "look at this" that needs a model."""
+
+        def see(image: str, question: str = "") -> str:
+            if not self.vision:
+                reason = self._vision_problem or (
+                    "no vision endpoint is configured")
+                return (f"Cannot look at {image}: {reason}. Set vision.model and "
+                        f"vision.base_url in the config (or "
+                        f"AUTOFORGE_VISION_MODEL / AUTOFORGE_VISION_BASE_URL).")
+            try:
+                answer = self.vision.describe(image, question)
+            except VisionError as exc:
+                return f"Could not read {image}: {exc}"
+            self._record("see", {"image": image})
+            return answer
+
+        def vision_status() -> str:
+            lines = [self.vision.report() if self.vision
+                     else "vision: not configured"]
+            if self._vision_problem:
+                lines.append(f"  config problem: {self._vision_problem}")
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="see",
+            description=(
+                "Look at an image and answer a question about it. Takes a file "
+                "path or an http(s) URL. Use it on a screenshot to check what "
+                "actually rendered, and on any chart or diagram whose meaning "
+                "is not in the text. Ask a specific question -- a targeted "
+                "question gets a usable answer where 'what is this' does not."
+            ),
+            parameters={"type": "object", "properties": {
+                "image": {"type": "string",
+                          "description": "path to an image file, or an http(s) URL"},
+                "question": {"type": "string",
+                             "description": "what to find out about it"},
+            }, "required": ["image"]},
+            fn=see, source="builtin", tags=["vision", "media"],
+        ))
+        self._add(ToolSpec(
+            name="vision_status",
+            description=(
+                "Whether the agent can look at images at all, and which model "
+                "and endpoint it would use. Call it before promising to check a "
+                "screenshot."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=vision_status, source="builtin", tags=["vision", "media"],
         ))
 
     def _tool_gpu(self) -> None:

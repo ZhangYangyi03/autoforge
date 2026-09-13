@@ -24,6 +24,13 @@ KNOWN = ("base_url", "model", "api_key", "max_tokens", "proxy", "fast")
 
 DEFAULT_PATH = Path.home() / ".autoforge" / "config.json"
 
+#: The local relay used when `proxy` is on. Defined once here because three
+#: callers need the same answer -- the text client, the setup wizard and the
+#: vision client -- and a second copy is how one of them ends up silently
+#: unproxied while the others work.
+PROXIES = {"http": "socks5://127.0.0.1:9674",
+           "https": "socks5://127.0.0.1:9674"}
+
 
 def config_path() -> Path:
     """`$AUTOFORGE_CONFIG` wins; otherwise ~/.autoforge/config.json."""

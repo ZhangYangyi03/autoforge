@@ -30,7 +30,7 @@ PRESETS: list[tuple[str, str, str, bool]] = [
     ("Something else (any OpenAI-compatible endpoint)", "", "", False),
 ]
 
-PROXIES = {"http": "socks5://127.0.0.1:9674", "https": "socks5://127.0.0.1:9674"}
+PROXIES = configfile.PROXIES
 
 _G, _D, _Y, _C, _R = "\033[32m", "\033[2m", "\033[33m", "\033[36m", "\033[0m"
 
