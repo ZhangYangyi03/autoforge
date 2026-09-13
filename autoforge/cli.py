@@ -48,6 +48,7 @@ from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
 from .forge.sandbox import Sandbox
 from .forge.verifier import ToolVerifier
+from .schedule import Schedule
 from .store import ToolStore
 from .tools.registry import ToolRegistry
 
@@ -881,6 +882,71 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tick(args: argparse.Namespace) -> int:
+    """Attend to whatever the schedule says is due, then exit.
+
+    This is the command the operating system is given (`install_system_task`
+    registers exactly it). Every other entry point needs a person to start it;
+    this is the one that makes "runs unattended" a fact about the machine
+    rather than a description of the agent's intentions.
+
+    Nothing due means no model call and no output: a scheduler that reports
+    "nothing happened" every thirty minutes trains whoever reads it to stop
+    reading. `--quiet` is what the OS task uses, and it is also the default
+    posture of a tick, because the only thing worth waking a human for is a
+    task that actually ran.
+
+    A task that raises is recorded as a failure and does not stop the ones
+    behind it -- one broken task must not cost every later task its turn.
+    """
+    table = Schedule(getattr(args, "file", None))
+    now = time.time()
+    due = table.due(now)
+
+    if not due:
+        if not args.quiet:
+            upcoming = table.next_due(now)
+            print("Nothing is due." if upcoming is None
+                  else f"Nothing is due. Next: {upcoming.line(now)}")
+        return 0
+
+    if not args.quiet:
+        print(f"{len(due)} task(s) due:")
+        for task in due:
+            print(f"  {task.line(now)}")
+
+    # Config and the model are built only once there is work to do. A tick that
+    # finds nothing due must have no failure modes at all: an unconfigured
+    # installation with an empty schedule should be silent and successful, not
+    # an error every thirty minutes that the operator learns to ignore.
+    cfg = _config(args)
+    agent = _build_mode(cfg, args.mode)
+    failures = 0
+    for task in due:
+        if not args.quiet:
+            print(f"\n=== {task.id} ({task.created_by}): {task.text} ===")
+        live = _LiveRun().start()
+        try:
+            result = agent.run(task.text, progress=live)
+        except Exception as exc:                      # noqa: BLE001 - recorded, not swallowed
+            ok, note = False, f"{type(exc).__name__}: {exc}"
+        else:
+            ok, note = True, (result.content or "").strip()[:500]
+        finally:
+            live.stop()
+        # The note is the point of `complete`: the next run is the only reader
+        # that can tell a repeated failure from a long silence.
+        table.complete(task.id, ok=ok, note=note)
+        if not ok:
+            failures += 1
+        if not args.quiet:
+            print(f"  {'done' if ok else 'FAILED'}: {note[:200]}")
+
+    if failures and not args.quiet:
+        print(_c(_D, f"{failures} of {len(due)} task(s) failed."))
+    return 1 if failures else 0
+
+
 def cmd_modes(args: argparse.Namespace) -> int:
     print("standard  — full forging agent: meta-tools, 5-check verification, "
           "evolution, spawning, persistence")
@@ -950,7 +1016,37 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--mode", choices=list(MODES), default="standard")
 
     sub.add_parser("modes", help="list the runtime modes")
+
+    tk = sub.add_parser(
+        "tick", help="attend to what the schedule says is due, then exit "
+                     "(this is what the OS scheduler runs)")
+    tk.add_argument("--quiet", action="store_true",
+                    help="say nothing unless a task actually ran")
+    tk.add_argument("--file", help="schedule file (defaults to "
+                                   "$AUTOFORGE_HOME/schedule.jsonl)")
+    tk.add_argument("--mode", choices=list(MODES), default="standard",
+                    help="which agent runs the due tasks")
     return p
+
+
+# A parser that offers a command with no handler is a command that crashes on
+# use, and the two lists living apart is how they drift. Kept as one table so
+# a test can hold them equal -- this is the seam that `tick` fell through.
+#
+# Built on each call rather than at import: the lookup must see a handler that
+# was replaced after this module loaded, which is how the CLI is tested.
+def command_table() -> dict[str, Any]:
+    return {
+        "chat": cmd_chat,
+        "forge": cmd_forge,
+        "list": cmd_list,
+        "setup": cmd_setup,
+        "config": cmd_config,
+        "web": cmd_web,
+        "run": cmd_run,
+        "modes": cmd_modes,
+        "tick": cmd_tick,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -967,9 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
         args.out = None
         args.call = None
         args.path = None
-    return {"chat": cmd_chat, "forge": cmd_forge, "list": cmd_list,
-            "setup": cmd_setup, "config": cmd_config,
-            "web": cmd_web, "run": cmd_run, "modes": cmd_modes}[args.command](args)
+    return command_table()[args.command](args)
 
 
 if __name__ == "__main__":

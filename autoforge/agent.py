@@ -51,7 +51,10 @@ from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .mcp import MCPClient, MCPHub, servers_from_config
+from .notify import Notifier, NotifyError, channels_from_config
 from .route.router import BehaviourRouter, RoutingWeights
+from .schedule import Schedule, ScheduleError, as_clock
+from .schedule import install_system_task as _install_system_task
 from .skills import SkillError, SkillLibrary
 from .store import ToolStore
 from .tools.registry import ToolRegistry
@@ -341,6 +344,24 @@ BUILTIN_SCOPES: dict[str, str] = {
     # their code is not here to read.
     "mcp_connect": "system",
     "mcp_call": "system",
+    # Reaching a human is network egress and nothing else, so it is gated on
+    # exactly the freedom an operator would expect: switch off may_access_
+    # network and the agent stops being able to message anyone. Declaring it
+    # `system` would have been true but useless -- the gate would ask about
+    # arbitrary code execution to send a status line.
+    "notify_send": "network",
+    "notify_channels": "read_only",
+    # The task table is a file the agent owns. Writing it is a local write;
+    # reading back the agenda is not.
+    "schedule_add": "local_write",
+    "schedule_done": "local_write",
+    "schedule_cancel": "local_write",
+    "schedule_list": "read_only",
+    "schedule_tick": "read_only",
+    # This one changes the machine's configuration, so it declares the widest
+    # scope: it really does run a subprocess that rewrites Task Scheduler or
+    # prints a crontab line.
+    "install_system_task": "system",
 }
 
 
@@ -399,6 +420,20 @@ class ForgeAgent:
         # spawned until the agent asks for one -- a config entry says how to
         # reach a server, not that it should be running.
         self.mcp_servers, self._mcp_problems = servers_from_config(load())
+
+        # Reaching a human. Built from the config at construction for the same
+        # reason MCP servers are: a config entry says how to reach someone, not
+        # that a message is owed. Nothing is sent until the agent calls
+        # notify_send, and the failures are carried rather than raised so an
+        # unreadable channel is reported in the menu instead of at the moment
+        # the agent needs to speak.
+        self.notify_channels, self._notify_problems = channels_from_config(load())
+        self.notifier = Notifier(self.notify_channels)
+
+        # The agent's own agenda. Opened here, fired by `schedule_tick` (the
+        # agent deciding to look) or by `python -m autoforge tick` (the OS
+        # deciding to wake it). The table stores; it never fires by itself.
+        self.schedule = Schedule()
         self.mcp = MCPHub(self.mcp_servers)
 
         # Skills: procedures on disk, ranked by how often they were loaded.
@@ -466,6 +501,8 @@ class ForgeAgent:
         self._tool_skills()
         self._tool_mcp()
         self._tool_gpu()
+        self._tool_notify()
+        self._tool_schedule()
 
     def _add(self, spec: ToolSpec) -> None:
         # Say what this tool touches, so a switched-off freedom has something to
@@ -1583,6 +1620,217 @@ class ForgeAgent:
             "       I can still probe devices, estimate occupancy, audit timing",
             "       units and time torch baselines — reading is not running.",
         ]
+
+    # ------------------------------------------------------------------
+    # reaching a human; keeping an agenda
+    # ------------------------------------------------------------------
+    def _tool_notify(self) -> None:
+        """Speaking to a person, over the channels the config named.
+
+        Without this the agent can only talk to whoever is sitting in front of
+        its stdin. A run that finishes at 03:00 has nobody to tell, and a run
+        that needs a decision has nobody to ask -- which makes every
+        long-horizon task dependent on a human staying awake. That is the gap
+        these two tools close; the delivery report is why they are trustworthy
+        once closed.
+        """
+
+        def notify_send(text: str, subject: str = "", only: str = "") -> str:
+            names = [n.strip() for n in (only or "").split(",") if n.strip()] or None
+            try:
+                deliveries = self.notifier.send(text, subject=subject, only=names)
+            except NotifyError as exc:
+                # Nothing was attempted: no channels, no match, or empty text.
+                return f"Nothing was sent. {exc}"
+            self._record("notify", {
+                "channels": [d.channel for d in deliveries],
+                "delivered": sum(1 for d in deliveries if d.ok),
+            })
+            # The summary is the tool result, deliberately. A tool that reports
+            # "sent" and returns nothing teaches the model to assume delivery,
+            # and the failure mode of that assumption is a silent night.
+            return self.notifier.summary(deliveries)
+
+        def notify_channels() -> str:
+            lines = [self.notifier.describe()]
+            lines += [f"  config problem: {p}" for p in self._notify_problems]
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="notify_send",
+            description=(
+                "Send a message to the operator over every configured channel "
+                "(webhook, email, or both). Use it for anything that must reach "
+                "a person without them asking: a finished long task, a failure "
+                "worth interrupting for, a question blocking further progress. "
+                "It returns a per-channel account of what actually happened -- "
+                "a message that was NOT delivered is reported as such, and "
+                "never assumed delivered."
+            ),
+            parameters={"type": "object", "properties": {
+                "text": {"type": "string", "description": "the message body"},
+                "subject": {"type": "string",
+                            "description": "subject line; used by email channels"},
+                "only": {"type": "string",
+                         "description": "comma-separated channel names to use; "
+                                        "omit for all of them"},
+            }, "required": ["text"]},
+            fn=notify_send, source="builtin", tags=["meta", "comms"],
+        ))
+        self._add(ToolSpec(
+            name="notify_channels",
+            description=(
+                "List the notification channels this agent can actually reach, "
+                "and any config entry that was rejected. Call this before "
+                "promising anyone a message."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=notify_channels, source="builtin", tags=["meta", "comms"],
+        ))
+
+    def _tool_schedule(self) -> None:
+        """A durable agenda: the agent deciding what it owes, and when.
+
+        The table stores and never fires. Firing is `schedule_tick` (the agent
+        looking at its own list) or `python -m autoforge tick` (the OS waking
+        the process). Keeping those separate is what lets the same schedule be
+        honoured by an agent that happens to be running and by one that is
+        asleep and gets started for the purpose.
+        """
+
+        def schedule_add(text: str, when: str, repeat: str = "") -> str:
+            try:
+                task = self.schedule.add(text, when, repeat=repeat or 0)
+            except ScheduleError as exc:
+                return f"Could not schedule that. {exc}"
+            self._record("schedule_add", {"id": task.id, "when": task.due_at})
+            return (f"Scheduled {task.id}: {task.text}\n  {task.line()}\n"
+                    f"A task fires only while I am running. Until "
+                    f"install_system_task has been called, nobody starts me, "
+                    f"so a task due at 03:00 waits for the next run.")
+
+        def schedule_list() -> str:
+            return self.schedule.report()
+
+        def schedule_tick() -> str:
+            now = time.time()
+            due = self.schedule.due(now)
+            if not due:
+                upcoming = self.schedule.next_due(now)
+                return ("Nothing is due." if upcoming is None
+                        else f"Nothing is due. Next: {upcoming.line(now)}")
+            self._record("schedule_tick", {"due": [t.id for t in due]})
+            lines = [f"{len(due)} task(s) are due. Attend to them, then close "
+                     f"each one with schedule_done so the next run knows what "
+                     f"happened:"]
+            lines += [f"  {t.line(now)}" for t in due]
+            return "\n".join(lines)
+
+        def schedule_done(task_id: str, note: str = "", ok: bool = True) -> str:
+            try:
+                task = self.schedule.complete(task_id, ok=ok, note=note)
+            except ScheduleError as exc:
+                return str(exc)
+            self._record("schedule_done", {"id": task_id, "ok": ok})
+            if task.repeat > 0:
+                return (f"Recorded. {task_id} repeats, so it stays open: next "
+                        f"due {as_clock(task.due_at)} "
+                        f"({task.runs} run(s), {task.failures} failed).")
+            return f"Recorded. {task_id} is closed."
+
+        def schedule_cancel(task_id: str) -> str:
+            try:
+                task = self.schedule.cancel(task_id)
+            except ScheduleError as exc:
+                return str(exc)
+            self._record("schedule_cancel", {"id": task_id})
+            return f"Cancelled {task.id}: {task.text}"
+
+        def install_system_task(interval_minutes: int = 30,
+                                name: str = "autoforge-tick") -> str:
+            try:
+                return _install_system_task(interval_minutes, name)
+            except ScheduleError as exc:
+                return f"Could not register the task. {exc}"
+
+        self._add(ToolSpec(
+            name="schedule_add",
+            description=(
+                "Put something on your own agenda: a thing to do later, or to "
+                "do repeatedly. `when` takes a duration (90m, 2h, 1d) or an ISO "
+                "time (2026-09-14T09:00:00, local). Use it for anything you "
+                "have decided to come back to, instead of assuming you will "
+                "remember it next session."
+            ),
+            parameters={"type": "object", "properties": {
+                "text": {"type": "string", "description": "what to attend to"},
+                "when": {"type": "string",
+                         "description": "when it is due: 90m, 2h, 1d, or ISO 8601"},
+                "repeat": {"type": "string",
+                           "description": "repeat interval (1d, 6h); omit for a one-off"},
+            }, "required": ["text", "when"]},
+            fn=schedule_add, source="builtin", tags=["meta", "time"],
+        ))
+        self._add(ToolSpec(
+            name="schedule_list",
+            description=(
+                "Show your agenda: what is overdue, what is coming, and whether "
+                "anything can wake you at all. Call it when asked what you have "
+                "planned, rather than describing intentions from memory."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=schedule_list, source="builtin", tags=["meta", "time"],
+        ))
+        self._add(ToolSpec(
+            name="schedule_tick",
+            description=(
+                "Read your agenda for anything now due. This is what a wake-up "
+                "looks like from your side: when the OS starts you with "
+                "`tick`, this is the list you get. Run it before starting new "
+                "work, so a scheduled task is not quietly skipped."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=schedule_tick, source="builtin", tags=["meta", "time"],
+        ))
+        self._add(ToolSpec(
+            name="schedule_done",
+            description=(
+                "Close a due task, with a note about what happened. The note is "
+                "the point: it is the only thing that lets a later run tell a "
+                "repeated failure apart from a long silence. Pass ok=false when "
+                "it failed."
+            ),
+            parameters={"type": "object", "properties": {
+                "task_id": {"type": "string", "description": "the task id from schedule_tick"},
+                "note": {"type": "string", "description": "what happened"},
+                "ok": {"type": "boolean", "description": "did it succeed (default true)"},
+            }, "required": ["task_id"]},
+            fn=schedule_done, source="builtin", tags=["meta", "time"],
+        ))
+        self._add(ToolSpec(
+            name="schedule_cancel",
+            description="Remove a scheduled task from your agenda without running it.",
+            parameters={"type": "object", "properties": {
+                "task_id": {"type": "string"},
+            }, "required": ["task_id"]},
+            fn=schedule_cancel, source="builtin", tags=["meta", "time"],
+        ))
+        self._add(ToolSpec(
+            name="install_system_task",
+            description=(
+                "Register a recurring wake-up with the operating system, so you "
+                "run even when nobody starts you. This is the only action that "
+                "makes 'unattended' true. It changes the machine's "
+                "configuration, so it says exactly what it registered and how "
+                "to undo it, and is not called on suspicion."
+            ),
+            parameters={"type": "object", "properties": {
+                "interval_minutes": {"type": "integer",
+                                     "description": "how often to wake (default 30)"},
+                "name": {"type": "string", "description": "the OS task name"},
+            }},
+            fn=install_system_task, source="builtin", tags=["meta", "time"],
+        ))
 
     def _tool_gpu(self) -> None:
         """CUDA kernel-layer tools.

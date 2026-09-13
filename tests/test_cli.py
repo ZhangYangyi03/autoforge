@@ -117,7 +117,23 @@ def test_bare_auto_with_tty_enters_chat(monkeypatch, capsys):
 def test_parser_exposes_every_subcommand():
     names = cli.build_parser()._subparsers._group_actions[0].choices
     assert set(names) == {"chat", "forge", "list", "setup", "config",
-                          "web", "run", "modes"}
+                          "web", "run", "modes", "tick"}
+
+
+def test_every_offered_subcommand_has_a_handler():
+    """Regression: `tick` was offered by the parser and absent from dispatch.
+
+    `schedule.wake_command` hands the OS `python -m autoforge tick --quiet`, so
+    the mismatch would have been a registered task failing every interval,
+    forever, with a KeyError nobody was awake to read.
+    """
+    names = set(cli.build_parser()._subparsers._group_actions[0].choices)
+    table = cli.command_table()
+    assert names == set(table), \
+        f"offered but unrouted: {names - set(table)}; " \
+        f"routed but unoffered: {set(table) - names}"
+    for name, handler in table.items():
+        assert callable(handler), f"{name} is wired to {handler!r}"
 
 
 # -- trace rendering ---------------------------------------------------
@@ -257,3 +273,140 @@ def test_the_prompt_names_the_switch_the_tool_and_the_arguments(monkeypatch, cap
     assert "forge_tool" in out
     assert "may_access_network" in out
     assert "a csv parser" in out
+
+
+# -- the unattended entry point -----------------------------------------
+# `python -m autoforge tick` is what gets registered with the OS scheduler, so
+# these tests exercise it as the scheduler would: as a process that must
+# terminate, and whose silence means "nothing to do".
+def test_tick_on_an_empty_schedule_says_nothing_when_quiet(monkeypatch, capsys):
+    """Quiet means quiet: a task firing every 30 minutes must not log 48
+    lines a day to say it had nothing to do."""
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    assert cli.main(["tick", "--quiet", "--file", "/tmp/af-empty-sched.jsonl"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_tick_reports_the_next_due_time_when_not_quiet(monkeypatch, capsys, tmp_path):
+    from autoforge.schedule import Schedule
+    path = tmp_path / "s.jsonl"
+    Schedule(path).add("water the plants", "1d")
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    assert cli.main(["tick", "--file", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "Nothing is due" in out
+    assert "water the plants" in out
+
+
+def test_tick_does_not_build_an_agent_when_nothing_is_due(monkeypatch, tmp_path):
+    """The common case must not pay for a model client.
+
+    A tick that constructs an agent to discover it has nothing to do would make
+    the unattended path depend on config and credentials it does not need --
+    which is exactly how a scheduled task fails on a machine where the API key
+    has expired.
+    """
+    built: list[str] = []
+    monkeypatch.setattr(cli, "_build_mode", lambda *a, **k: built.append("agent"))
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    assert cli.main(["tick", "--quiet", "--file", str(tmp_path / "none.jsonl")]) == 0
+    assert built == [], "a no-op tick built an agent"
+
+
+def test_tick_runs_the_due_task_through_the_agent(monkeypatch, tmp_path, capsys):
+    from autoforge.schedule import Schedule
+    path = tmp_path / "s.jsonl"
+    Schedule(path).add("say hello", "0s")
+
+    seen: dict = {}
+
+    class _FakeAgent:
+        def __init__(self, cfg=None):
+            seen["built"] = True
+
+        def run(self, prompt, **kw):
+            seen["prompt"] = prompt
+            return argparse.Namespace(content="done: hello said")
+
+    monkeypatch.setattr(cli, "_build_mode", lambda cfg, mode: _FakeAgent(cfg))
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    rc = cli.main(["tick", "--file", str(path)])
+    assert rc == 0
+    assert seen.get("built"), "a due task did not build an agent"
+    assert "say hello" in seen["prompt"], \
+        "the due task's text never reached the model"
+    assert "hello said" in capsys.readouterr().out
+
+
+def test_tick_closes_the_task_it_ran(monkeypatch, tmp_path):
+    """A due task attended to must not still be due on the next tick."""
+    from autoforge.schedule import Schedule
+    path = tmp_path / "s.jsonl"
+    task = Schedule(path).add("one shot", "0s")
+
+    class _FakeAgent:
+        def __init__(self, cfg=None):
+            pass
+
+        def run(self, prompt, **kw):
+            return argparse.Namespace(content="ok")
+
+    monkeypatch.setattr(cli, "_build_mode", lambda cfg, mode: _FakeAgent(cfg))
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    assert cli.main(["tick", "--quiet", "--file", str(path)]) == 0
+    assert Schedule(path).due() == []
+    assert Schedule(path).get(task.id).runs == 1
+
+
+def test_tick_closes_the_task_even_when_the_agent_raises(monkeypatch, tmp_path):
+    """A run that crashed is a run that happened.
+
+    Leaving it open means every subsequent tick re-runs a task that is already
+    failing, and the agenda fills with the same broken entry forever.
+    """
+    from autoforge.schedule import Schedule
+    path = tmp_path / "s.jsonl"
+    Schedule(path).add("doomed", "0s")
+
+    class _ExplodingAgent:
+        def __init__(self, cfg=None):
+            pass
+
+        def run(self, prompt, **kw):
+            raise RuntimeError("model unreachable")
+
+    monkeypatch.setattr(cli, "_build_mode", lambda cfg, mode: _ExplodingAgent(cfg))
+    # A configured provider: `_config` exits before reaching the seam
+    # otherwise, and what is under test here is the tick, not the setup.
+    monkeypatch.setenv("AUTOFORGE_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOFORGE_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("AUTOFORGE_HOME", "/tmp")
+    cli.main(["tick", "--file", str(path)])
+    closed = Schedule(path).get(Schedule(path).all()[0].id)
+    assert closed.runs == 1 and closed.failures == 1
+    assert "model unreachable" in closed.notes[-1]
+
+
+def test_tick_with_a_missing_schedule_file_is_a_clean_no_op(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path / "nothing-here"))
+    assert cli.main(["tick", "--quiet"]) == 0
