@@ -41,6 +41,12 @@ from .autonomy.spawn import ShareMode, Spawner
 from .autonomy.topology import Topology, TopologyDesigner
 from .configfile import load
 from .core.agent import Agent, AgentResult
+from .core.compaction import (
+    Compactor,
+    DeterministicSummarizer,
+    LLMSummarizer,
+    default_log_path,
+)
 from .core.llm import LLMClient
 from .core.message import Message
 from .forge.evolution import EvolutionEngine
@@ -410,6 +416,10 @@ class ForgeAgent:
     # means nobody is watching, which is the honest state for a piped or
     # unattended run — not a degraded one.
     steer: Any = None
+    # How a run stays coherent past the context window (core/compaction.py).
+    # None means "build the default": a model summary with a deterministic
+    # fallback. A run that never approaches the window never pays for it.
+    compactor: Any = None
 
     def __post_init__(self) -> None:
         if self.generator is None:
@@ -482,6 +492,19 @@ class ForgeAgent:
             # An unreadable skills directory is not a reason to refuse to run.
             # The library records the failure and reports it in the menu.
             pass
+
+        # Coherence past the window. The summarizer is the model itself -- it is
+        # the only thing present that can tell a decision from a command -- with
+        # the deterministic summarizer behind it, so a model that fails or
+        # returns junk degrades the note rather than the run. Which messages may
+        # be dropped, and the operator's own words being kept out of the
+        # summarizer's reach entirely, are the Compactor's business.
+        if self.compactor is None:
+            self.compactor = Compactor(
+                summarizer=LLMSummarizer(self.llm),
+                fallback=DeterministicSummarizer(),
+                log_path=default_log_path(),
+            )
 
         # unlimited_turns is the agent's own claim on unbounded loops. When it
         # is off, an unbounded request gets a real ceiling instead of the
@@ -2435,6 +2458,19 @@ class ForgeAgent:
         if self.store and kind in ("forge_done", "auto_quarantine"):
             self.store.log_event(kind, payload)
 
+    def _on_compact(self, event: Any) -> None:
+        """A compaction is an event the operator should be able to see.
+
+        It is the one thing in a long run that changes the context without the
+        model asking for it, so a run that quietly stopped remembering and a run
+        that never had to would otherwise look identical from the trace.
+        """
+        payload = (event.as_dict() if hasattr(event, "as_dict")
+                   else {"event": repr(event)})
+        self._record("compact", payload)
+        if self.store:
+            self.store.log_event("compact", payload)
+
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
         # Forward to the live observer, if one is attached, so forging shows up
@@ -2494,6 +2530,8 @@ class ForgeAgent:
             on_turn=lambda turn, msg: _emit("turn", turn=turn),
             on_steer=lambda text: self._record("steer", {"text": text[:300]}),
             steer=self.steer,
+            compactor=self.compactor,
+            on_compact=self._on_compact,
         )
         result = agent.run(task, history)
         self._record("finish", {

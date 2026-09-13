@@ -31,6 +31,12 @@ from typing import Any, Callable
 
 from .autonomy.policy import AutonomyPolicy
 from .core.agent import Agent, AgentResult
+from .core.compaction import (
+    Compactor,
+    DeterministicSummarizer,
+    LLMSummarizer,
+    default_log_path,
+)
 from .core.llm import LLMClient
 from .tools.registry import ToolRegistry
 from .tools.spec import ToolSpec, ToolState
@@ -224,6 +230,7 @@ class MinimalAgent:
     policy: AutonomyPolicy | None = None   # None = no gate, the old behaviour
     confirmer: Any = None                # asked before a gated tool runs
     steer: Any = None                    # the operator's channel into a live run
+    compactor: Any = None                # None = build the default (compaction.py)
     trace: list[dict[str, Any]] = field(default_factory=list)
     pipeline: Any = None                 # cannot forge — the harness checks this
     store: Any = None
@@ -249,6 +256,16 @@ class MinimalAgent:
                     spec.fn = partial(_bash, cwd=self.cwd)
             self.registry.register(spec)
 
+        # The minimal mode is the control group for "does scaffolding help?", so
+        # it gets the same context compaction as the full agent. Leaving it out
+        # would make the comparison a comparison of scaffolding *and* memory.
+        if self.compactor is None:
+            self.compactor = Compactor(
+                summarizer=LLMSummarizer(self.llm),
+                fallback=DeterministicSummarizer(),
+                log_path=default_log_path(),
+            )
+
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
 
@@ -263,6 +280,10 @@ class MinimalAgent:
                 "result", {"tool": n, "ok": getattr(r, "ok", None)}),
             on_steer=lambda text: self._record("steer", {"text": text[:300]}),
             steer=self.steer,
+            compactor=self.compactor,
+            on_compact=lambda e: self._record(
+                "compact", e.as_dict() if hasattr(e, "as_dict")
+                else {"event": repr(e)}),
         )
         result = agent.run(task, history)
         self._record("finish", {"turns": result.turns, "tools": result.tool_calls,

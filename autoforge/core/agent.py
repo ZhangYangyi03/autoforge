@@ -2,7 +2,7 @@
 
 Deliberately thin in mechanism, deliberately free in policy.
 
-The two things that make this loop different from every other agent loop:
+The three things that make this loop different from every other agent loop:
 
 1. **No hidden turn cap.** `max_turns=None` (the default) means the agent runs
    until it produces a text answer or calls `terminate`. A cap exists only if
@@ -17,6 +17,13 @@ The two things that make this loop different from every other agent loop:
 
 Everything else — tool dispatch, message threading — is ordinary, because that
 part isn't what's broken in other frameworks.
+
+3. **The context is compacted, never silently truncated.** An unbounded loop
+   meets a bounded context window eventually, and the failure there is a
+   provider error at the far end of the task. `compaction.py` replaces the
+   middle of the history with a summary at a provably safe cut point. The loop
+   itself only calls it; the policy — when, how much to keep, and what to do if
+   summarising fails — lives there.
 """
 from __future__ import annotations
 
@@ -109,6 +116,8 @@ class Agent:
         on_request: Callable[[int], None] | None = None,
         on_steer: Callable[[str], None] | None = None,
         steer: Any = None,
+        compactor: Any = None,
+        on_compact: Callable[[Any], None] | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -124,6 +133,12 @@ class Agent:
         # person uses to talk to this run while it is happening. Optional, so a
         # run with nobody watching is exactly what it was before.
         self.steer = steer
+        # Anything with `maybe_compact(msgs, turn) -> event | None`. None means
+        # the context is never compacted, which is correct for a short run and
+        # is why the framework itself turns this off by default rather than
+        # deciding a window size for the caller.
+        self.compactor = compactor
+        self.on_compact = on_compact
         self._terminated: _TerminateSignal | None = None
         if allow_self_terminate:
             self._register_terminate_tool()
@@ -208,6 +223,22 @@ class Agent:
             # task just changed.
             if self._absorb(msgs):
                 return self._stopped(msgs, turn - 1, used)
+
+            # After `_absorb`, so anything the operator just typed is part of
+            # the list when the cut point is chosen — and therefore protected by
+            # the rule that their last line is never summarized. Compacting
+            # first would let a brand-new instruction land in the dropped range.
+            #
+            # It also has to be here rather than mid-tool: this is the only
+            # point in the loop where the list is guaranteed to hold whole
+            # groups (an assistant message and all the results answering it),
+            # which is what a cut needs to be safe.
+            if self.compactor is not None:
+                event = self.compactor.maybe_compact(msgs, turn)
+                # Only when something happened. A no-op is most turns, and a
+                # reporter that fires with `None` trains its reader to ignore it.
+                if event is not None:
+                    _notify(self.on_compact, event)
 
             _notify(self.on_request, turn)
             resp = self.llm.chat(msgs, tools=self.registry.schemas())
