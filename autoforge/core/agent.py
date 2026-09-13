@@ -42,6 +42,10 @@ class AgentResult:
     tool_calls: list[str] = field(default_factory=list)
     self_terminated: bool = False
     termination_reason: str = ""
+    # Kept apart from self_terminated on purpose: "the agent judged itself
+    # done" and "a person stopped it" are different facts, and a report that
+    # blurs them credits the agent with a decision it did not make.
+    stopped_by_operator: bool = False
 
     @property
     def used_tools(self) -> bool:
@@ -103,6 +107,8 @@ class Agent:
         on_tool_result: Callable[[str, Any], None] | None = None,
         on_turn: Callable[[int, Message], None] | None = None,
         on_request: Callable[[int], None] | None = None,
+        on_steer: Callable[[str], None] | None = None,
+        steer: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -113,6 +119,11 @@ class Agent:
         self.on_tool_result = on_tool_result
         self.on_turn = on_turn
         self.on_request = on_request
+        self.on_steer = on_steer
+        # Anything with `take_supplements()` / `stop_requested()`: the channel a
+        # person uses to talk to this run while it is happening. Optional, so a
+        # run with nobody watching is exactly what it was before.
+        self.steer = steer
         self._terminated: _TerminateSignal | None = None
         if allow_self_terminate:
             self._register_terminate_tool()
@@ -148,6 +159,34 @@ class Agent:
             )
         )
 
+    def _absorb(self, msgs: list[Message]) -> bool:
+        """Take whatever the operator said since the last check.
+
+        Supplements land as user messages at the next safe point — before a
+        model call, or right after a tool result — which is the latest moment
+        they can still change the run they belong to. Returns True if the
+        operator also asked to stop: the current step finishes, then the run
+        ends. A stop is never applied mid-tool, because the alternative is
+        killing a subprocess or a write halfway through.
+
+        No `try/except` on purpose. The whole point is that a line the operator
+        typed is never dropped, so a bug in this channel must be loud rather
+        than swallowed into a run that quietly ignored them.
+        """
+        if self.steer is None:
+            return False
+        for text in self.steer.take_supplements():
+            msgs.append(Message.user(text))
+            _notify(self.on_steer, text)
+        return bool(self.steer.stop_requested())
+
+    @staticmethod
+    def _stopped(msgs: list[Message], turns: int, used: list[str]) -> AgentResult:
+        return AgentResult(
+            "(stopped by the operator)", msgs, turns, used,
+            stopped_by_operator=True, termination_reason="stopped by the operator",
+        )
+
     def run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
         msgs = list(history or [])
         if not msgs or msgs[0].role != "system":
@@ -165,6 +204,10 @@ class Agent:
                     f"(turn cap of {self.max_turns} reached before completion)",
                     msgs, turn - 1, used,
                 )
+            # Before the model is asked: the cheapest place to find out the
+            # task just changed.
+            if self._absorb(msgs):
+                return self._stopped(msgs, turn - 1, used)
 
             _notify(self.on_request, turn)
             resp = self.llm.chat(msgs, tools=self.registry.schemas())
@@ -187,6 +230,11 @@ class Agent:
                     )
                 _notify(self.on_tool_result, tc.name, result)
                 msgs.append(Message.tool(result.output, tc.id, tc.name))
+                # A note typed while that tool ran lands here, before the model
+                # is asked again — a forge can take minutes, and waiting until
+                # the task ended would make the correction useless.
+                if self._absorb(msgs):
+                    return self._stopped(msgs, turn, used)
 
 
 __all__ = ["Agent", "AgentResult", "DEFAULT_SYSTEM", "_TerminateSignal"]

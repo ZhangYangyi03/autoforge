@@ -329,6 +329,10 @@ class ForgeAgent:
     # Asked before running a tool that needs a switched-off freedom. Left None
     # the gate fails closed — see autonomy/confirm.py and ToolRegistry._gate.
     confirmer: Any = None
+    # The operator's channel into a run in progress (core/steering.py). None
+    # means nobody is watching, which is the honest state for a piped or
+    # unattended run — not a degraded one.
+    steer: Any = None
 
     def __post_init__(self) -> None:
         if self.generator is None:
@@ -1452,16 +1456,20 @@ class ForgeAgent:
             on_tool_result=lambda n, r: self._record(
                 "result", {"tool": n, "ok": getattr(r, "ok", None)}),
             on_turn=lambda turn, msg: _emit("turn", turn=turn),
+            on_steer=lambda text: self._record("steer", {"text": text[:300]}),
+            steer=self.steer,
         )
         result = agent.run(task, history)
         self._record("finish", {
             "turns": result.turns, "tools": result.tool_calls,
             "self_terminated": result.self_terminated,
+            "stopped_by_operator": result.stopped_by_operator,
         })
         if self.store:
             self.store.log_event("run", {
                 "task": task[:300], "turns": result.turns,
                 "self_terminated": result.self_terminated,
+                "stopped_by_operator": result.stopped_by_operator,
             })
         return result
 

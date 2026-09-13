@@ -43,6 +43,7 @@ from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
 from .core.llm import OpenAICompatClient
+from .core.steering import Steering
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
 from .forge.sandbox import Sandbox
@@ -400,6 +401,12 @@ class _LiveRun:
         self._waiting_since: float | None = None
         self._ticks = 0
         self._thread: threading.Thread | None = None
+        # Where the run is, for `/status`: published as the loop moves, read by
+        # whoever asks. Kept here rather than in the steering channel because
+        # this object already sees every event.
+        self._turn = 0
+        self._last_tool: str | None = None
+        self._forging: str | None = None
         # The round whose failure was already narrated as a forge_error, so the
         # attempt line that follows it doesn't say the same thing twice.
         self._err_round: int | None = None
@@ -452,6 +459,7 @@ class _LiveRun:
     def __call__(self, kind: str, payload: dict) -> None:
         if kind == "request":
             self._clear()
+            self._turn = payload.get("turn") or self._turn
             self._waiting_since = time.time()
             self._ticks = 0
             self._write(f"  [{self._stamp()}] turn {payload.get('turn')} "
@@ -459,6 +467,7 @@ class _LiveRun:
         elif kind == "call":
             self._clear()
             self._waiting_since = None
+            self._last_tool = str(payload.get("tool"))
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
                         f"-> {payload.get('tool')}\n")
         elif kind == "result":
@@ -468,6 +477,7 @@ class _LiveRun:
             # Forging costs a model turn per round — the longest silence in the
             # whole run, so it starts the heartbeat before the first request.
             self._clear()
+            self._forging = str(payload.get("need", ""))[:48]
             self._waiting_since = time.time()
             self._ticks = 0
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
@@ -492,12 +502,14 @@ class _LiveRun:
             self._clear()
             self._waiting_since = None
             self._err_round = payload.get("round")
+            self._forging = None
             futile = " (no point retrying)" if payload.get("futile") else ""
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
                         f"forge error: {str(payload.get('error', ''))[:60]}{futile}\n")
         elif kind == "forge_done":
             self._clear()
             self._waiting_since = None
+            self._forging = None
             ok = payload.get("ok")
             name = payload.get("name") or payload.get("need") or "?"
             rounds = payload.get("rounds")
@@ -562,6 +574,29 @@ class _LiveRun:
                 "design_team", "retire", "promote_withheld",
                 "gpu_compile", "gpu_bench", "evaluate")
 
+    # -- the operator's channel -----------------------------------------
+    def say(self, text: str) -> None:
+        """Print one line of the *operator's* conversation with the run.
+
+        A steering reply shares the progress lock, so it can never land in the
+        middle of a heartbeat tick. It clears the tick first: the status line is
+        being rewritten every second, and a reply that the next tick overwrote
+        would be worse than no reply.
+        """
+        self._clear()
+        self._write(f"  {text}\n")
+
+    def snapshot(self) -> str:
+        """Where the run is right now, in one line, for `/status`."""
+        bits = [f"{self._elapsed()} elapsed", f"turn {self._turn or '-'}"]
+        if self._waiting_since is not None:
+            bits.append(f"waiting on the model {int(time.time() - self._waiting_since)}s")
+        if self._forging:
+            bits.append(f"forging {self._forging}")
+        if self._last_tool:
+            bits.append(f"last tool: {self._last_tool}")
+        return "  ·  ".join(bits)
+
     def done(self, result) -> None:
         self._clear()
         n_calls = len(result.tool_calls) if isinstance(result.tool_calls, list) else result.tool_calls
@@ -576,10 +611,15 @@ HELP_BODY = """commands:
   /help      this list            /tools   the tool library + health
   /report    policy and amendments /trace   the agent's decision log
   /reset     forget the conversation (keeps forged tools)
-  /quit      exit"""
+  /quit      exit
+
+while it is working: type a sentence to add it to the task mid-run,
+  /status to ask where it is, /stop to end the run at the next step."""
 
 BANNER = (f"{_c(_C, 'autoforge')} — an agent that writes, verifies and keeps its own tools.\n"
           f"Type a need in plain language. {_c(_D, '/help for commands, /quit to leave.')}")
+LIVE_HINT = (f"{_c(_D, 'it does not lock the keyboard: while it runs, type to add to the task, ')}"
+             f"{_c(_D, '/status to ask where it is, /stop to end the turn.')}")
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -587,64 +627,81 @@ def cmd_chat(args: argparse.Namespace) -> int:
     agent = _build(cfg)
     _describe(cfg, agent)
     print(BANNER)
+    print(LIVE_HINT)
+
+    # One reader owns stdin for the whole session. During a run its lines are
+    # steering; between runs they are the next prompt. That is what makes
+    # mid-run typing possible at all — the loop cannot block on a keyboard.
+    steering = Steering().start()
+    agent.steer = steering
     history: list = []
 
-    while True:
-        try:
-            line = input(f"\n{_c(_C, 'you>')} ").strip()
-        except (EOFError, KeyboardInterrupt):
+    try:
+        while True:
+            try:
+                line = steering.take_line(f"\n{_c(_C, 'you>')} ")
+            except KeyboardInterrupt:
+                print()
+                break
+            if line == "":                 # end of input, not a blank line
+                print()
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            cmd = line.split()[0].lower()
+            if cmd in ("/quit", "/exit", "/q"):
+                break
+            if cmd == "/help":
+                print(HELP_BODY)
+                continue
+            if cmd == "/tools":
+                rep = agent.registry.report()
+                if not rep["tools"]:
+                    print(_c(_D, "(no tools yet — ask for something you need)"))
+                for t in rep["tools"]:
+                    print(f"  {t.get('name'):<24} {_c(_D, str(t.get('state')))}")
+                continue
+            if cmd == "/report":
+                print(json.dumps(agent.report(), indent=2, default=str))
+                continue
+            if cmd == "/trace":
+                for ev in agent.trace:
+                    print(f"  {str(ev.get('kind')):<14} {str(ev)[:110]}")
+                continue
+            if cmd == "/reset":
+                history = []
+                print(_c(_D, "conversation cleared; forged tools kept"))
+                continue
+
+            mark = len(agent.trace)
+            live = _LiveRun().start()
+            steering.watch(live)          # replies and /status point at this run
+            try:
+                result = agent.run(line, history=history, progress=live)
+            except KeyboardInterrupt:
+                live.stop()
+                print(f"\n{_c(_D, 'interrupted')}")
+                continue
+            except Exception as exc:                                   # noqa: BLE001
+                live.stop()
+                print(f"{_c(_Y, 'error:')} {type(exc).__name__}: {exc}")
+                continue
+            live.stop()
+            live.done(result)
+
             print()
-            break
-        if not line:
-            continue
-
-        cmd = line.split()[0].lower()
-        if cmd in ("/quit", "/exit", "/q"):
-            break
-        if cmd == "/help":
-            print(HELP_BODY)
-            continue
-        if cmd == "/tools":
-            rep = agent.registry.report()
-            if not rep["tools"]:
-                print(_c(_D, "(no tools yet — ask for something you need)"))
-            for t in rep["tools"]:
-                print(f"  {t.get('name'):<24} {_c(_D, str(t.get('state')))}")
-            continue
-        if cmd == "/report":
-            print(json.dumps(agent.report(), indent=2, default=str))
-            continue
-        if cmd == "/trace":
-            for ev in agent.trace:
-                print(f"  {str(ev.get('kind')):<14} {str(ev)[:110]}")
-            continue
-        if cmd == "/reset":
-            history = []
-            print(_c(_D, "conversation cleared; forged tools kept"))
-            continue
-
-        mark = len(agent.trace)
-        live = _LiveRun().start()
-        try:
-            result = agent.run(line, history=history, progress=live)
-        except KeyboardInterrupt:
-            live.stop()
-            print(f"\n{_c(_D, 'interrupted')}")
-            continue
-        except Exception as exc:                                   # noqa: BLE001
-            live.stop()
-            print(f"{_c(_Y, 'error:')} {type(exc).__name__}: {exc}")
-            continue
-        live.stop()
-        live.done(result)
-
-        print()
-        _show_trace(agent, mark, skip_streamed=True)
-        if result.content:
-            print(f"\n{_c(_C, 'agent>')} {result.content}")
-        if result.self_terminated:
-            print(_c(_D, "(the agent decided the task was done)"))
-        history = result.messages
+            _show_trace(agent, mark, skip_streamed=True)
+            if result.content:
+                print(f"\n{_c(_C, 'agent>')} {result.content}")
+            if result.self_terminated:
+                print(_c(_D, "(the agent decided the task was done)"))
+            if getattr(result, "stopped_by_operator", False):
+                print(_c(_Y, "(you stopped this run — the work above stands)"))
+            history = result.messages
+    finally:
+        steering.close()
 
     print(_c(_D, f"bye — {len(agent.registry.names())} tool(s) this session"))
     return 0

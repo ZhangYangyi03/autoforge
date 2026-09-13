@@ -223,6 +223,7 @@ class MinimalAgent:
     cwd: str | None = None
     policy: AutonomyPolicy | None = None   # None = no gate, the old behaviour
     confirmer: Any = None                # asked before a gated tool runs
+    steer: Any = None                    # the operator's channel into a live run
     trace: list[dict[str, Any]] = field(default_factory=list)
     pipeline: Any = None                 # cannot forge — the harness checks this
     store: Any = None
@@ -260,10 +261,13 @@ class MinimalAgent:
             on_tool_call=lambda n, a: self._record("call", {"tool": n, "args": a}),
             on_tool_result=lambda n, r: self._record(
                 "result", {"tool": n, "ok": getattr(r, "ok", None)}),
+            on_steer=lambda text: self._record("steer", {"text": text[:300]}),
+            steer=self.steer,
         )
         result = agent.run(task, history)
         self._record("finish", {"turns": result.turns, "tools": result.tool_calls,
-                                "self_terminated": result.self_terminated})
+                                "self_terminated": result.self_terminated,
+                                "stopped_by_operator": result.stopped_by_operator})
         return result
 
     def report(self) -> dict[str, Any]:
