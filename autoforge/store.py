@@ -450,6 +450,36 @@ class ToolStore:
             self._conn.commit()
         return out
 
+    def memory_for_injection(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Read kept facts for the per-turn block — without counting a recall.
+
+        Kept apart from `recall` on purpose. `recall` is the agent *choosing* to
+        look something up; this is the prompt carrying what it already decided
+        to keep. Folding the two together would bump the recall counter on every
+        turn, turning `recalls` into "how many turns has this entry existed" and
+        erasing the only signal for which facts the agent actually reaches for.
+
+        Order: most-recalled first, then most-recent. `recalls` starts at zero
+        for everything, so a fresh store degrades cleanly to "what did I know
+        last time" — and once the agent starts reaching for a fact on purpose,
+        that fact climbs.
+        """
+        rows = self._conn.execute(
+            "SELECT key, value, tags, updated_at, recalls FROM memory"
+            " ORDER BY recalls DESC, updated_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            {
+                "key": r["key"],
+                "value": r["value"],
+                "tags": _unjson(r["tags"]) or [],
+                "updated_at": r["updated_at"],
+                "recalls": r["recalls"],
+            }
+            for r in rows
+        ]
+
     # -- self-report ------------------------------------------------------
     def report(self) -> dict[str, Any]:
         """What this store actually persists — facts, for the agent's self-model.

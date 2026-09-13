@@ -71,6 +71,8 @@ You can:
 - my_capabilities — your real reach: what is enforced, what is declared-only,
   and what forged code may actually do
 - my_history     — your ledger: past forges, runs, self-changes
+- remember       — keep a fact across sessions; kept facts are put in front of
+  you on every turn, so do not recall what is already listed above
 - forge_tool     — create a tool for a need you cannot serve
 - evolve_tool    — breed a better version of a weak tool
 - spawn_agent    — a child agent for a subtask
@@ -146,6 +148,14 @@ FORGE_ROUND_CEILING = 3      # unbounded_forge_rounds == False
 SUPERVISED_TURN_CAP = 25     # unlimited_turns == False
 
 _WEIGHT_FIELDS = ("text", "success", "trust", "cost", "over_trigger")
+
+# How much of every request the agent's own kept facts may occupy, and how long
+# any single entry may be before it is elided. Bounded because this block is
+# re-sent on every turn: an unbounded one would price a chatty memory at the
+# cost of the task, and the agent would have no way to see that happen.
+MEMORY_BUDGET_CHARS = 1200
+MEMORY_ENTRY_CHARS = 240
+MEMORY_SLOTS = 20
 
 
 def _coerce_weights(value: Any, current: Any) -> tuple[Any | None, str | None]:
@@ -1108,6 +1118,50 @@ class ForgeAgent:
             fn=forget, source="builtin", tags=["meta"], effect_signature="local_write",
         ))
 
+    def _memory_lines(self) -> list[str]:
+        """The facts the agent chose to keep, carried into every request.
+
+        `recall` already existed, and that was the whole gap: a memory the agent
+        has to remember to ask for is one it will forget to ask for. From the
+        model's side, a kept fact that is not in front of it is identical to a
+        fact that was never kept.
+
+        Read through `memory_for_injection`, which does not touch the recall
+        counter — this runs on every turn, and counting it as a recall would
+        make `recalls` mean "age in turns" rather than "times the agent reached
+        for this on purpose".
+
+        Three states, three sentences. Off (no store), empty, and populated are
+        different facts, and an agent that cannot tell them apart will describe
+        its memory wrongly in either direction.
+        """
+        if self.store is None:
+            return ["- Kept facts: no store this session, so nothing persists."]
+        rows = self.store.memory_for_injection(MEMORY_SLOTS)
+        if not rows:
+            return ["- Kept facts: none kept yet (remember() keeps one)."]
+
+        head = "- Kept facts (deliberate memory — kept by me, survives restart):"
+        body: list[str] = []
+        used = 0
+        dropped = 0
+        for r in rows:
+            value = " ".join((r["value"] or "").split())
+            if len(value) > MEMORY_ENTRY_CHARS:
+                value = value[:MEMORY_ENTRY_CHARS] + " …"
+            line = f"    {r['key']}: {value}"
+            # `body and` guards the first line: a single oversized entry is
+            # still shown, truncated, rather than producing an empty section
+            # that reads as "I kept nothing".
+            if body and used + len(line) > MEMORY_BUDGET_CHARS:
+                dropped += 1
+                continue
+            body.append(line)
+            used += len(line)
+        if dropped:
+            body.append(f"    (+{dropped} more kept — recall() reads the rest)")
+        return [head, *body]
+
     def _self_report(self) -> str:
         """The facts about myself, read from the objects that hold them.
 
@@ -1421,7 +1475,9 @@ class ForgeAgent:
         this process will actually fork, not the machine the agent imagines.
         """
         facts = "\n".join(host_facts(self.sandbox))
-        return f"{self.system_prompt}\n\n{self._self_report()}\n\n{facts}"
+        kept = "\n".join(self._memory_lines())
+        return (f"{self.system_prompt}\n\n{self._self_report()}\n\n"
+                f"{kept}\n\n{facts}")
 
     # ------------------------------------------------------------------
     def run(self, task: str, history: list[Message] | None = None,
