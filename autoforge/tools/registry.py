@@ -295,26 +295,37 @@ class ToolRegistry:
         self._events.append({"t": time.time(), "kind": kind, "tool": name, **extra})
 
     # -- scoping -----------------------------------------------------------
-    def scoped(self, allowed, *, role: str = "") -> "ToolRegistry":
-        """A view of this registry that can only see and call `allowed`.
+    def scoped(self, allowed, *, role: str = "",
+               deny: Callable[[ToolSpec], str] | None = None) -> "ToolRegistry":
+        """A view of this registry that can only see and call what it permits.
 
-        `allowed` empty means no restriction, and the registry itself is
-        returned — so a node that names no whitelist behaves exactly as before
-        and this stays a pure widening of what roles can express.
+        Two ways to narrow, and they compose:
+
+        `allowed` is a name whitelist. Empty means no name restriction, and with
+        no `deny` either, the registry itself is returned — so a node that names
+        no whitelist behaves exactly as before and this stays a pure widening of
+        what roles can express.
+
+        `deny` is a predicate over the whole `ToolSpec`, returning "" to permit
+        or the reason to refuse. A name whitelist cannot express a role like
+        "may read but may not write", because a critic's tool set depends on what
+        each tool *does* rather than what it is called — and forged tools are
+        named at runtime. The predicate lets the role's ceiling live in one
+        place (`autonomy/roles.py`) while the enforcement stays here.
         """
         allowed = set(allowed or ())
-        if not allowed:
+        if not allowed and deny is None:
             return self
-        return ScopedRegistry(self, allowed, role=role)
+        return ScopedRegistry(self, allowed, role=role, deny=deny)
 
 
 class ScopedRegistry(ToolRegistry):
-    """Restricts a child agent to a role's whitelist, for real.
+    """Restricts a child agent to a role's whitelist and ceiling, for real.
 
     Exists because `tools_whitelist` used to be parsed, stored, round-tripped
     through the store and asserted in tests — and consulted by nothing. A role
     that does not restrict anything is a label, not a role. This makes it bite
-    at both ends: the whitelisted subset is all the child's model can *see*
+    at both ends: the permitted subset is all the child's model can *see*
     (`schemas`), and all it can *run* (`call`). Both matter — hiding the rest
     stops the model asking, refusing stops it succeeding if it asks anyway.
 
@@ -322,36 +333,52 @@ class ScopedRegistry(ToolRegistry):
     still land in the one real registry. This is a lens, not a fork.
     """
 
-    def __init__(self, base: ToolRegistry, allowed: set[str], *, role: str = "") -> None:
+    def __init__(self, base: ToolRegistry, allowed: set[str], *, role: str = "",
+                 deny: Callable[[ToolSpec], str] | None = None) -> None:
         # Deliberately not calling super().__init__: this view owns no tools of
         # its own. Every registration is the parent's.
         self._base = base
         self._allowed = set(allowed)
+        self._deny = deny
         self.role = role
         self.refusals: list[str] = []
 
+    def _refusal(self, name: str) -> str:
+        """Why this view will not run `name`. "" means permitted.
+
+        One decision point for `allows`, `names`, `schemas` and `call`, so the
+        model's view and the model's reach cannot disagree — a tool visible in
+        the schema list but refused at call time trains the model to ask for
+        things it cannot have.
+        """
+        if self._allowed and name not in self._allowed:
+            label = f" ({self.role})" if self.role else ""
+            return (f"Denied: '{name}' is outside this agent's role{label}. "
+                    f"Allowed here: {', '.join(sorted(self._allowed)) or 'nothing'}.")
+        if self._deny is not None:
+            spec = self._base.get(name)
+            if spec is not None:
+                return self._deny(spec)
+        return ""
+
     def allows(self, name: str) -> bool:
-        return name in self._allowed
+        return not self._refusal(name)
 
     def names(self) -> list[str]:
-        return [n for n in self._base.names() if n in self._allowed]
+        return [n for n in self._base.names() if self.allows(n)]
 
     def schemas(self, *, include: set[ToolState] | None = None) -> list[dict[str, Any]]:
         return [
             s for s in self._base.schemas(include=include)
-            if s.get("function", {}).get("name") in self._allowed
+            if self.allows(s.get("function", {}).get("name"))
         ]
 
     def call(self, name: str, arguments: dict[str, Any], *,
              force: bool = False) -> ToolResult:
-        if name not in self._allowed:
+        why = self._refusal(name)
+        if why:
             self.refusals.append(name)
-            label = f" ({self.role})" if self.role else ""
-            return ToolResult(
-                name, False, "",
-                error=(f"Denied: '{name}' is outside this agent's role{label}. "
-                       f"Allowed here: {', '.join(sorted(self._allowed)) or 'nothing'}."),
-            )
+            return ToolResult(name, False, "", error=why)
         return self._base.call(name, arguments, force=force)
 
     def __getattr__(self, item: str) -> Any:

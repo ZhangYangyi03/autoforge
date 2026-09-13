@@ -38,7 +38,8 @@ from typing import Any
 from .autonomy.policy import FULL_FREEDOM, AutonomyPolicy
 from .autonomy.selfmod import Amendment, SelfModifier
 from .autonomy.spawn import ShareMode, Spawner
-from .autonomy.topology import Topology, TopologyDesigner
+from .autonomy.roles import brief_for_node, role_brief
+from .autonomy.topology import RoleType, Topology, TopologyDesigner
 from .configfile import load
 from .core.agent import Agent, AgentResult
 from .core.compaction import (
@@ -420,6 +421,11 @@ class ForgeAgent:
     # None means "build the default": a model summary with a deterministic
     # fallback. A run that never approaches the window never pays for it.
     compactor: Any = None
+    # Set when this agent is a child spawned into a role (autonomy/roles.py).
+    # Empty for a top-level run, which is what a parent is: nobody is above it
+    # to assign one.
+    role: str = ""
+    role_brief: str = ""
 
     def __post_init__(self) -> None:
         if self.generator is None:
@@ -678,29 +684,55 @@ class ForgeAgent:
             # the team it drew is the team it gets to run. Refusing an unknown
             # role beats silently ignoring it: a whitelist that quietly does
             # nothing is the failure this replaced.
+            #
+            # Resolution falls back to the role vocabulary itself, because a role
+            # is a thing this framework knows how to be, not only a thing the
+            # designer happened to draw. Without that fallback CRITIC, GATE and
+            # FORGE would be unreachable until `design_team` had run and guessed
+            # to include them — the designer deciding whether the runtime has
+            # critics, which is backwards.
             allowed: list[str] = []
+            brief = ""
+            role_name = role
             if role:
                 nodes = list(getattr(self.topology, "nodes", []) or [])
                 node = next((n for n in nodes if n.id == role), None)
                 if node is None:
                     node = next((n for n in nodes
                                  if str(getattr(n.role, "value", n.role)) == role), None)
-                if node is None:
-                    have = ", ".join(n.id for n in nodes) or "none"
-                    return (f"No node named {role!r} in the current topology "
-                            f"(have: {have}). Call design_team first, or spawn "
-                            f"without a role to leave the child unrestricted.")
-                allowed = list(node.tools_whitelist or [])
+                if node is not None:
+                    allowed = list(node.tools_whitelist or [])
+                    role_name = str(getattr(node.role, "value", node.role))
+                    # The node's brief is the role's plus the designer's own
+                    # hint. The ceiling is not passed: Spawner derives it from
+                    # the role, so it holds for every caller of `spawn`, not just
+                    # this one.
+                    brief = brief_for_node(node)
+                else:
+                    try:
+                        known = RoleType(role)
+                    except ValueError:
+                        have = ", ".join(n.id for n in nodes) or "none"
+                        roles = ", ".join(r.value for r in RoleType)
+                        return (
+                            f"No node named {role!r} in the current topology "
+                            f"(have: {have}), and it is not a role either "
+                            f"(known roles: {roles}). Call design_team first, or "
+                            f"spawn without a role to leave the child unrestricted."
+                        )
+                    role_name = known.value
+                    brief = role_brief(known)
 
-            rec = self.spawner.spawn(task, mode=mode, restrict_to=allowed, role=role)
+            rec = self.spawner.spawn(task, mode=mode, restrict_to=allowed,
+                                     role=role_name, brief=brief)
             self._record("spawn", rec.to_dict())
             if rec.error:
                 return f"Child failed: {rec.error}"
 
             bits = [f"Child {rec.child_id} finished in {rec.finished - rec.started:.1f}s."]
             if role:
-                scope = ", ".join(allowed) if allowed else "unrestricted"
-                bits.append(f"Ran as '{role}', scoped to: {scope}.")
+                scope = ", ".join(allowed) if allowed else "unrestricted by name"
+                bits.append(f"Ran as '{role_name}', scoped to: {scope}.")
             if rec.refusals:
                 reached = ", ".join(sorted(set(rec.refusals)))
                 bits.append(f"Reached past its role and was refused: {reached}.")
@@ -2482,6 +2514,16 @@ class ForgeAgent:
                 pass
 
     # ------------------------------------------------------------------
+    def apply_role(self, brief: str, role: str = "") -> None:
+        """Take on a role assigned by the agent that spawned this one.
+
+        The counterpart of `TopologyDesigner`: a designer that can *name* five
+        roles is worth nothing if the runtime that instantiates them ignores the
+        name. Called by `Spawner.spawn` on any child that implements it.
+        """
+        self.role_brief = brief.strip()
+        self.role = role or self.role
+
     def _effective_prompt(self) -> str:
         """The prompt actually sent: the base, plus what was measured.
 
@@ -2492,8 +2534,15 @@ class ForgeAgent:
         facts = "\n".join(host_facts(self.sandbox))
         kept = "\n".join(self._memory_lines())
         menu = "\n".join(self.skills.menu())
-        return (f"{self.system_prompt}\n\n{self._self_report()}\n\n"
-                f"{kept}\n\n{menu}\n\n{facts}")
+        out = (f"{self.system_prompt}\n\n{self._self_report()}\n\n"
+               f"{kept}\n\n{menu}\n\n{facts}")
+        if self.role_brief:
+            # Last, and separately labelled: a role narrows what this run is
+            # for, and the point of putting it after the general instructions is
+            # that the specific beats the general when a model stops reading.
+            out += (f"\n\n## Your role in this team ({self.role or 'unnamed'})"
+                    f"\n\n{self.role_brief}")
+        return out
 
     # ------------------------------------------------------------------
     def run(self, task: str, history: list[Message] | None = None,

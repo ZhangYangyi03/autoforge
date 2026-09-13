@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 from ..tools.registry import ToolRegistry
 from ..tools.spec import ToolSpec, ToolState
+from .roles import ceiling, role_brief
 
 
 class ShareMode(str, Enum):
@@ -49,6 +50,9 @@ class SpawnRecord:
     # than decorative, so it is recorded rather than swallowed.
     role: str = ""
     refusals: list[str] = field(default_factory=list)
+    #: The directive the child was handed, kept so the trace shows the role
+    #: reached a model instead of only reaching a dataclass.
+    brief: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +60,7 @@ class SpawnRecord:
             "task": self.task[:200],
             "mode": self.mode,
             "role": self.role or None,
+            "brief_chars": len(self.brief),
             "tools_forged": self.tools_forged,
             "refusals": self.refusals,
             "duration_s": round(self.finished - self.started, 2) if self.finished else None,
@@ -89,13 +94,25 @@ class Spawner:
         child_registry: ToolRegistry | None = None,
         restrict_to: set[str] | list[str] | None = None,
         role: str = "",
+        brief: str = "",
+        deny: Callable[[Any], str] | None = None,
     ) -> SpawnRecord:
         self.spawn_count += 1
         child_id = f"{self.parent_id}.{self.spawn_count}"
 
+        # A role is enforceable on its own. The caller may add a whitelist, a
+        # richer brief (a node's hint on top of the role's), or a whole different
+        # ceiling — but naming a role is enough to get the role's behaviour, so
+        # there is no way to spawn a "critic" that is not held to a critic's
+        # limits by simply forgetting to pass one.
+        if role:
+            brief = brief or role_brief(role)
+            if deny is None:
+                deny = ceiling(role)
+
         record = SpawnRecord(
             child_id=child_id, task=task, mode=mode.value, parent_id=self.parent_id,
-            role=role,
+            role=role, brief=brief,
         )
 
         if self._depth >= self.max_depth:
@@ -111,11 +128,24 @@ class Spawner:
         # base_reg — which is why the forged-tool diff is taken there: a child
         # that forges something outside its whitelist really did create it, and
         # hiding that from the parent would be the wrong kind of tidiness.
-        reg = base_reg.scoped(restrict_to or (), role=role)
+        #
+        # `deny` is the role's capability ceiling, which is not a whitelist: a
+        # critic's tool set depends on what each tool does, and forged tools are
+        # named at runtime, so the ceiling has to be judged per-spec.
+        reg = base_reg.scoped(restrict_to or (), role=role, deny=deny)
         before = set(base_reg.names())
 
         try:
             child = self.agent_factory(self, reg)
+            # Handed over after construction rather than through the factory
+            # signature, so an existing two-argument `agent_factory` — including
+            # the fakes in the tests — keeps working. A child that does not
+            # implement the hook is simply one that cannot be briefed, and the
+            # record says so by carrying an empty brief.
+            if brief:
+                hook = getattr(child, "apply_role", None)
+                if callable(hook):
+                    hook(brief, role)
             result = child.run(task)
             record.result = getattr(result, "content", str(result))
         except Exception as exc:  # noqa: BLE001
