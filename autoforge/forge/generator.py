@@ -54,6 +54,11 @@ class GeneratedTool:
     parameters: dict[str, Any] = field(default_factory=dict)
     entry: str = ""
     probes: list[TriggerProbe] = field(default_factory=list)
+    # The valid call, and what a right answer looks like. Required by the
+    # prompt: without it the verifier has no positive case and can only ask
+    # "does it run", which a tool that refuses everything answers perfectly.
+    sample_call: dict[str, Any] = field(default_factory=dict)
+    sample_expect: str = ""
     effect_signature: str = ""
     tags: list[str] = field(default_factory=list)
     rationale: str = ""
@@ -365,6 +370,8 @@ Return STRICT JSON only, no prose, with this shape:
      "expect": "call",
      "negative_query": "a request that should NOT trigger it"}
   ],
+  "sample_call": {"argument_name": "a REAL, valid value this tool is meant to handle"},
+  "sample_expect": "a substring that a correct answer to sample_call must contain",
   "effect_signature": "pure | reads:<what> | writes:<what>",
   "tags": ["category"],
   "rationale": "why this tool is worth creating"
@@ -373,6 +380,17 @@ Return STRICT JSON only, no prose, with this shape:
 Rules:
 - The function must be pure Python stdlib unless the description says otherwise.
 - No imports outside the standard library. No file writes unless effect_signature says so.
+- SAMPLE_CALL IS MANDATORY AND IT IS THE EXAM. Give one concrete, real,
+  valid input -- the kind of value this tool exists to handle -- and the
+  substring a correct answer must contain. The verifier runs it FIRST and
+  rejects the tool if it answers "INVALID:", returns nothing, or does not
+  contain sample_expect. Do not pick a value your tool would reject to look
+  safe: a valid example that returns INVALID is an automatic failure, and an
+  empty or absent sample_call means the tool is recorded as UNPROBED, which is
+  worse than a failed probe. For a network tool the example is a real URL and
+  a real query; for a parser, a real well-formed string; for arithmetic, real
+  numbers and the expected result. If you cannot state a valid input and its
+  answer, you do not yet understand the tool well enough to write it.
 - TOTALITY — the verifier enforces this and rejects the tool if you break it:
   never raise, and never return None. On input you cannot process, return a
   short string starting "INVALID:" with the reason, e.g.
@@ -381,6 +399,9 @@ Rules:
   strings, emoji, digits-only, and None-ish tokens ("NULL", "None", "nan"). Any
   raise fails the tool, so guard every parse and index with a length or
   validity check first.
+- Being total is necessary, NOT sufficient. "Returns INVALID for everything"
+  satisfies totality and fails sample_call, which is the point: the tool is
+  judged on the real input it was written for, not on its handling of junk.
 - The invalid result must DIFFER from any valid result, so a wrong-but-total
   function that returns one constant everywhere is also rejected.
 - Be whitespace-insensitive where whitespace is not content: strip surrounding

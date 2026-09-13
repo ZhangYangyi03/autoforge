@@ -157,6 +157,14 @@ class ToolSpec:
     source: str = "human"          # human | generated | composed
     generator: str = ""            # model that wrote it
     probes: list[TriggerProbe] = field(default_factory=list)
+    # A concrete, *valid* call: the arguments a real use would pass, and what a
+    # correct answer looks like. This is the field whose absence made the whole
+    # verification battery vacuous -- see `ToolVerifier.check_execution`. Every
+    # other check fed the tool garbage, so a tool that answered "INVALID" to
+    # everything scored perfectly. Without a positive example there is nothing
+    # to be right about.
+    sample_call: dict[str, Any] = field(default_factory=dict)
+    sample_expect: str = ""        # substring a correct result must contain, if known
     effect_signature: str = ""     # what it touches; used for re-verification
     invariances: list[str] = field(default_factory=list)  # token types whose
     # decoration must not change the answer (e.g. "isbn"). Declared at birth by
@@ -214,6 +222,8 @@ class ToolSpec:
             "stats": self.stats.to_dict(),
             "verification": self.verification,
             "probes": [p.to_dict() for p in self.probes],
+            "sample_call": self.sample_call,
+            "sample_expect": self.sample_expect,
         }
 
 

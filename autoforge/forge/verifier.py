@@ -120,17 +120,110 @@ class ToolVerifier:
         return args
 
     def check_execution(self, spec: ToolSpec, sample_args: dict[str, Any] | None = None) -> CheckResult:
-        """A. Run it out-of-process with sample args."""
-        if sample_args is None:
-            sample_args = self._infer_args(spec)
-        result = self.sandbox.run(spec.code, spec.name, sample_args)
+        """A. Run it out-of-process on a *valid* call, and on schema-shaped args.
+
+        This check used to pass on `result.ok` alone, and that made the whole
+        battery vacuous. `_infer_args` invents arguments from the schema -- for
+        a string parameter it always supplied the literal "978-0-306-40615-7",
+        an ISBN left over from the tool this framework was first built for. The
+        generator is separately instructed to answer "INVALID: <reason>" rather
+        than raise. Put together: every forged tool was handed input it could
+        not process, answered "INVALID", exited 0, and was marked verified.
+
+        The consequence was not a missed bug, it was an inverted incentive. A
+        tool that did nothing scored highest: it survived every fuzz probe by
+        refusing all of them, and it passed here by exiting cleanly. Meanwhile
+        a tool that tried to do the job and failed on a real input looked
+        *worse*. The agent then took "verified" at its word, blamed the
+        environment when the tool failed in use, and spent ninety minutes
+        diagnosing a network that was never broken.
+
+        So the positive case is now the primary one. When the generator
+        declared a `sample_call`, the tool is run on real arguments and the
+        answer must be an answer -- not a refusal, not None. An unparseable or
+        absent sample is reported as un-probed rather than quietly passing,
+        because "we could not test it" and "it works" must not print the same.
+        """
+        args = dict(sample_args) if sample_args else dict(spec.sample_call or {})
+
+        if args:
+            result = self.sandbox.run(spec.code, spec.name, args)
+            evidence = {
+                "sample_call": args,
+                "output": str(result.output)[:300],
+                "duration_ms": round(result.duration_ms, 1),
+            }
+            if result.timed_out:
+                return CheckResult(
+                    "execution", False,
+                    f"timed out on the valid sample call after {self.sandbox.timeout}s",
+                    evidence,
+                )
+            if not result.ok:
+                return CheckResult(
+                    "execution", False,
+                    f"failed on the valid sample call: {result.error or 'no result'}",
+                    evidence,
+                )
+            output = "" if result.output is None else str(result.output).strip()
+            if not output:
+                return CheckResult(
+                    "execution", False,
+                    f"produced nothing for the valid sample call {args!r}; a tool "
+                    f"that returns None or only prints has not been shown to work",
+                    evidence,
+                )
+            # The generator is told to signal "cannot process this" with an
+            # INVALID: prefix. Getting one back for a call the generator itself
+            # certified as valid means the tool does not do the job it was
+            # written for -- exactly the case that used to pass.
+            if output.upper().startswith("INVALID"):
+                return CheckResult(
+                    "execution", False,
+                    f"rejected its own valid sample call {args!r}: {output[:200]}",
+                    evidence,
+                )
+            if spec.sample_expect and spec.sample_expect not in output:
+                return CheckResult(
+                    "execution", False,
+                    f"answer for {args!r} does not contain {spec.sample_expect!r}: "
+                    f"{output[:200]}",
+                    evidence,
+                )
+            # Only now, having been right about something, does the tool earn a
+            # look at whether it is also total. The synthetic probe is run too,
+            # and reported only as a warning: failing on invented garbage is a
+            # robustness problem, not evidence that the tool is wrong.
+            probe = self._infer_args(spec)
+            probe_result = self.sandbox.run(spec.code, spec.name, probe) if probe else None
+            probe_note = ""
+            if probe_result is not None and not probe_result.ok:
+                probe_note = (f"; warning: raised on synthetic probe "
+                              f"{probe!r}: {probe_result.error}")
+            return CheckResult(
+                "execution", True,
+                f"answered {args!r} with {output[:80]!r}{probe_note}",
+                evidence,
+            )
+
+        # No valid example: say so. An un-probed tool must not read as a pass,
+        # and the fix is on the generation side -- the model has to state what
+        # a working call looks like.
+        probe = self._infer_args(spec)
+        result = self.sandbox.run(spec.code, spec.name, probe)
         if result.timed_out:
-            return CheckResult("execution", False, "timed out", {"timeout": self.sandbox.timeout})
+            return CheckResult("execution", False, "timed out",
+                               {"timeout": self.sandbox.timeout, "probe": probe})
         if not result.ok:
-            return CheckResult("execution", False, result.error or "failed", {})
+            return CheckResult("execution", False, result.error or "failed",
+                               {"probe": probe})
         return CheckResult(
-            "execution", True, "ran clean",
-            {"output": str(result.output)[:200], "duration_ms": round(result.duration_ms, 1)},
+            "execution", result.ok,
+            "NO VALID SAMPLE CALL was declared, so correctness is unprobed; this "
+            "only shows the code runs. A tool that rejects every input also "
+            "passes this.",
+            {"output": str(result.output)[:200], "probe": probe,
+             "duration_ms": round(result.duration_ms, 1), "unprobed": True},
         )
 
     def check_robustness(self, spec: ToolSpec) -> CheckResult:
