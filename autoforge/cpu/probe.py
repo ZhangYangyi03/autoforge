@@ -183,16 +183,30 @@ def runs_here(target: str, info: CpuInfo | None = None) -> tuple[bool, str]:
     every CPU in existence.
     """
     info = info or probe()
-    if target in ("", "native", "x86-64", "generic"):
-        if target == "native":
-            return True, ("built with -march=native, so it is specific to the "
-                          "machine that built it; if this is a different machine "
-                          "expect SIGILL, and rebuild rather than retry")
+    if target in ("", "x86-64", "generic"):
+        return True, ""
+    if target == "native":
+        return True, ("built with -march=native, so it is specific to the "
+                      "machine that built it; if this is a different machine "
+                      "expect SIGILL, and rebuild rather than retry")
+    if target == info.arch:
+        # This is the machine's own resolved target, so it runs here by
+        # construction. Checked before the lookup so that a CPU newer than
+        # _ARCH_LEVELS does not refuse to load kernels it just built.
         return True, ""
     want = _arch_level(target)
     have = _arch_level(info.arch)
     if want is None or have is None:
-        return True, f"cannot compare {target!r} against {info.arch!r}; assuming it runs"
+        # Fail closed. An unknown name is most likely a target *newer* than this
+        # table — `znver5`, `raptorlake` — which is precisely the dangerous
+        # case, and the guard exists to prevent a SIGILL, so "I cannot prove it
+        # runs" has to mean no. The cost of being wrong here is one rebuild; the
+        # cost of the other direction is a dead interpreter.
+        unknown = target if want is None else info.arch
+        return False, (
+            f"cannot place {unknown!r} on the microarchitecture scale, so there "
+            f"is no way to prove a {target} artefact runs on {info.arch}; "
+            f"rebuild for this machine (or add the name to _ARCH_LEVELS)")
     if want > have:
         return False, (f"built for {target} (level {want}) on a machine at level "
                        f"{have} ({info.arch}); this is the {SIGILL_RISK}")

@@ -44,6 +44,7 @@ EXECUTION_FREEDOMS = (
     "may_write_filesystem",
     "may_install_packages",
     "may_run_cuda_kernels",
+    "may_run_cpu_kernels",
 )
 
 ENFORCED: frozenset[str] = frozenset({
@@ -62,6 +63,7 @@ ENFORCED: frozenset[str] = frozenset({
     "require_change_rationale",
     "expose_policy_to_self",
     "may_run_cuda_kernels",
+    "may_run_cpu_kernels",
 })
 
 PARTIAL: dict[str, str] = {
@@ -121,6 +123,17 @@ class AutonomyPolicy:
     # agent-authored code on its GPU, and only the second one can hang a
     # display.
     may_run_cuda_kernels: bool = True
+    # Compile and run native (CPU) kernels written by the agent. Separate from
+    # the CUDA field on purpose: a machine is much more likely to have a C
+    # compiler than a GPU, so an operator who wants to keep GPU code off has
+    # said nothing about the CPU layer, and vice versa. Same split, same
+    # reasoning — with it off, `cpu_compile`/`cpu_run_isolated`/`cpu_tune`
+    # refuse and name the field, while probing the toolchain, the SIGILL check,
+    # the preflight lint, the timing-unit audit and the cache report stay
+    # available. The failure mode is why the gate exists at all: a CUDA mistake
+    # returns an error code from a driver, a CPU mistake writes past a buffer
+    # or spins in a loop inside the agent's own interpreter.
+    may_run_cpu_kernels: bool = True
 
     # -- limits it controls itself ---------------------------------------
     self_terminate: bool = True           # it decides when to stop (vs hard cap)
@@ -210,6 +223,10 @@ SUPERVISED = AutonomyPolicy(
     may_access_network=False,
     may_install_packages=False,
     may_run_cuda_kernels=False,
+    # Also off: SUPERVISED is a preset about running agent-authored code on
+    # this machine, and the CPU layer is the same act on hardware every machine
+    # has.
+    may_run_cpu_kernels=False,
     self_terminate=False,
     unlimited_turns=False,
     unbounded_forge_rounds=False,

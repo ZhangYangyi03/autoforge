@@ -481,7 +481,7 @@ def _build_problem(
         av, bv = a.values(), b.values()
         exp = [av[i] + bv[i] for i in range(size)]
         return Problem(kind, CallSpec("vector_add",
-                                      (Buffer(dtype, size, fill, "out", 0, seed),
+                                      (Buffer(dtype, size, fill, "out", seed),
                                        Buffer(dtype, size, fill, "a", seed),
                                        Buffer(dtype, size, fill, "b", seed + 1),
                                        size_t(size)),

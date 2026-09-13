@@ -190,6 +190,15 @@ autoforge/
 │   └── metacog.py     # proactive gap discovery + pre-forging
 ├── route/
 │   └── router.py      # behaviour-aligned tool routing
+├── gpu/
+│   ├── bench.py       # benchmarking that cannot lie about its units
+│   └── units.py       # ms-vs-seconds audits, the do_bench lesson as code
+├── cpu/
+│   ├── probe.py       # what this machine actually is, measured not assumed
+│   ├── ops.py         # the problem set: a described problem, not an instance
+│   ├── kernel.py      # compile → cache → load, refusing targets it cannot run
+│   ├── safety.py      # preflight: the checks that run before anything executes
+│   └── tune.py        # legal search over flags/source, verified then raced
 ├── autonomy/
 │   ├── policy.py      # AutonomyPolicy — freedom is the default, all True
 │   ├── selfmod.py     # every self-modification, with rationale + audit log
@@ -385,8 +394,12 @@ spawning, and self-designed multi-agent topology. On top of it an
 anti-misevolution layer: an independent validity gate, a fitness function the
 mutant cannot author, a frozen baseline that only ratchets forward, Pareto
 selection so safety cannot be paid for with capability, and metamorphic
-oracles so the robustness layer actually has a verdict. 410 tests passing.
-MIT.
+oracles so the robustness layer actually has a verdict. Underneath it a native
+layer: the machine is measured rather than assumed, a target ISA the host cannot
+run is refused before the compile rather than after the crash, a benchmark's
+units are audited so a `ms` label cannot sit over a 1000x value, and kernel
+search reports its own noise floor instead of promoting the fastest noisy run.
+1142 tests passing. MIT.
 
 **Breaking since v0.3.0:** the robustness check now has an oracle. Tools that
 previously passed it by not raising will fail if they are degenerate or break a

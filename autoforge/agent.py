@@ -351,6 +351,21 @@ BUILTIN_SCOPES: dict[str, str] = {
     "gpu_occupancy": "read_only",
     "gpu_units_audit": "read_only",
     "gpu_verify": "read_only",
+    # The CPU layer, split the same way and for the same reason. Reading the
+    # toolchain, asking whether an artefact built for a target can run here,
+    # linting C before it is compiled, the timing-unit audit and the cache
+    # report all touch nothing — a misspelled -march is caught by arithmetic,
+    # not by crashing. Compiling, running and tuning execute agent-authored
+    # code on the host, and unlike the GPU there is no driver to turn a mistake
+    # into an error code, so those three are `system`.
+    "cpu_probe": "read_only",
+    "cpu_runs_here": "read_only",
+    "cpu_preflight": "read_only",
+    "cpu_units_audit": "read_only",
+    "cpu_cache_stats": "read_only",
+    "cpu_compile": "system",
+    "cpu_run_isolated": "system",
+    "cpu_tune": "system",
     # Reading what other processes offer. Nothing is started by either of these
     # two beyond what the config already described.
     "mcp_servers": "read_only",
@@ -569,6 +584,7 @@ class ForgeAgent:
         self._tool_skills()
         self._tool_mcp()
         self._tool_gpu()
+        self._tool_cpu()
         self._tool_notify()
         self._tool_schedule()
         self._tool_browser()
@@ -2481,6 +2497,320 @@ class ForgeAgent:
                 "arch_minor": {"type": "integer"},
             }, "required": ["code"]},
             fn=gpu_bench, source="builtin", tags=["gpu", "run"],
+        ))
+
+    # ------------------------------------------------------------------
+    def _tool_cpu(self) -> None:
+        """Wire the native layer in, tool for tool the GPU layer's shape.
+
+        Same vocabulary on purpose — probe, preflight, units audit, cache,
+        compile, run, tune — because the two layers are the same argument about
+        different silicon, and a reader who learned one should not have to learn
+        a second vocabulary to use the other.
+
+        What genuinely differs is called out rather than smoothed over:
+
+        * `cpu_runs_here` has no CUDA counterpart. A cubin built for sm_90
+          simply fails to load. An x86 library built for a newer target loads
+          fine and kills the interpreter at the first instruction it cannot
+          execute, which is why the check is a separate tool and why
+          `cpu_compile` consults it before building.
+        * Five of the eight tools read or compute, and stay available with the
+          gate off. Only `cpu_compile`, `cpu_run_isolated` and `cpu_tune`
+          execute agent-authored code on the host, and those three refuse and
+          name `may_run_cpu_kernels` when it is off.
+        """
+        from . import cpu as C
+        from .timing import audit_ms_scale, audit_source_tree
+
+        def _denied() -> str:
+            return (
+                "Denied by autonomy policy: may_run_cpu_kernels is off. "
+                "Compiling and running native kernels is disabled; the "
+                "toolchain probe, the SIGILL check, the preflight lint, the "
+                "timing-unit audit and the cache report remain available."
+            )
+
+        def cpu_probe() -> str:
+            info = C.probe()
+            if not info.available:
+                why = "; ".join(info.notes) if info.notes else "no C compiler found"
+                return f"No CPU toolchain usable for forging. {why}"
+            return info.summary()
+
+        def cpu_runs_here(target: str = "native") -> str:
+            info = C.probe()
+            if not info.available:
+                why = "; ".join(info.notes) if info.notes else "no C compiler found"
+                return f"No verdict without a compiler to build for. {why}"
+            ok, why = C.runs_here(target, info)
+            verdict = "RUNS HERE" if ok else "WILL NOT RUN HERE"
+            return f"{verdict}: {target}\n  {why}"
+
+        def cpu_preflight(code: str, name: str = "kernel") -> str:
+            try:
+                src = C.KernelSource(name=name, code=code)
+            except ValueError as exc:
+                return f"Nothing to lint: {exc}"
+            return C.preflight(src).summary()
+
+        def cpu_units_audit(source: str = "", path: str = "") -> str:
+            if path:
+                hits = audit_source_tree([path])
+                if not hits:
+                    return (f"No thousand-factor-against-ms offences in {path}. "
+                            f"(Known false negative: the factor arriving through "
+                            f"a variable and the ms label in a different "
+                            f"statement.)")
+                out = []
+                for f, offs in hits.items():
+                    out.append(f"{f}:")
+                    out += [f"  line {o.line_no}: {o.line}" for o in offs[:10]]
+                return "\n".join(out)
+            offs = audit_ms_scale(source)
+            if not offs:
+                return ("No offence found. Note the two accepted false "
+                        "negatives: a factor smuggled through a variable, and "
+                        "the label and the multiplication in different "
+                        "statements.")
+            return "\n".join(f"line {o.line_no}: {o.line}\n  {o.reason}"
+                             for o in offs)
+
+        def cpu_cache_stats() -> str:
+            st = C.cache_stats()
+            total = st["hits"] + st["misses"]
+            if not total:
+                return (f"Nothing compiled on this machine yet. Cache root "
+                        f"{st['root']} — the first compile will populate it, and "
+                        f"a repeat of the same source, target, compiler and "
+                        f"flags is a cache hit rather than a rebuild.")
+            return (f"{st['hits']} hit(s), {st['misses']} miss(es), "
+                    f"{st['hit_rate']:.0%} hit rate under {st['root']}")
+
+        def cpu_compile(code: str, name: str = "kernel",
+                        target: str = "native") -> str:
+            if not self.policy.may_run_cpu_kernels:
+                return _denied()
+            try:
+                src = C.KernelSource(name=name, code=code, target=target)
+            except ValueError as exc:
+                return f"Refusing to compile: {exc}"
+            if not src.entry_points():
+                return ("Refusing to compile: no callable entry point in the "
+                        "source. Static functions and `main` cannot be called "
+                        "through ctypes, so a kernel made only of those has "
+                        "nothing to invoke. Entry points found: none.")
+            # The module's own ordering argument, enforced: a build for a target
+            # this machine cannot run is worse than no build, because the
+            # failure is SIGILL in the agent's own process rather than an error
+            # the agent can read.
+            resolved = src.resolved_target()
+            ok, why = C.runs_here(resolved, C.probe())
+            if not ok:
+                return (f"Refusing to compile for {target}: {why}\n"
+                        f"  Build for a target this machine can run, or drop the "
+                        f"artefact in a child process and let it die there.")
+            try:
+                k = C.compile_kernel(src)
+            except C.KernelUnavailable as exc:
+                self._record("cpu_compile", {"name": name, "ok": False})
+                return f"Could not compile: {exc}"
+            self._record("cpu_compile", {"name": name, "ok": True,
+                                         "cached": k.from_cache})
+            d = k.to_dict()
+            return (f"Compiled {d['name']} for {d['target']} via {d['compiler']}"
+                    f"{' (cache hit)' if k.from_cache else ''}; "
+                    f"entries: {', '.join(d['entry_points'])}"
+                    f"\ncache key {d['cache_key']}\nartefact {d['artefact']}")
+
+        def cpu_run_isolated(
+            code: str, name: str = "kernel", kind: str = "saxpy",
+            size: int = 1 << 20, n: int = 256, dtype: str = "f32",
+            seed: int = 0, reps: int = 5, warmup: int = 3,
+            timeout: float = 0.0, target: str = "native",
+        ) -> str:
+            """Compile, then verify and time in a child process.
+
+            Isolation is not a convenience here. An unproven kernel's first
+            call must not be in the agent's own process: a wrong index
+            segfaults, an unbounded loop hangs, and both would otherwise end
+            the session instead of producing a report.
+            """
+            if not self.policy.may_run_cpu_kernels:
+                return _denied()
+            try:
+                prob = C.problem(kind, size=size, n=n, dtype=dtype, seed=seed)
+            except C.CallError as exc:
+                return f"No such problem: {exc}"
+            try:
+                src = C.KernelSource(name=name, code=code, target=target)
+            except ValueError as exc:
+                return f"Refusing to run: {exc}"
+            try:
+                k = C.compile_kernel(src)
+            except C.KernelUnavailable as exc:
+                return f"Could not compile: {exc}"
+            guard = C.run_isolated(k, prob, reps=reps, warmup=warmup,
+                                   timeout=timeout or None)
+            self._record("cpu_run_isolated",
+                         {"name": name, "kind": kind, "ok": guard.ok})
+            lines = [guard.summary()]
+            timings = guard.verdict.get("timings_s") or []
+            if guard.ok and timings:
+                lines.append(f"  {len(timings)} timed rep(s), fastest "
+                             f"{min(timings) * 1e3:.4f} ms")
+            lines.append(f"  checked against the reference for {kind!r} "
+                         f"({prob.spec.describe()}) — skipping work fails here "
+                         f"rather than being timed as an improvement.")
+            return "\n".join(lines)
+
+        def cpu_tune(
+            kind: str = "saxpy", size: int = 1 << 20, n: int = 256,
+            dtype: str = "f32", seed: int = 0,
+            max_candidates: int = C.DEFAULT_MAX_CANDIDATES,
+            budget_s: float = C.DEFAULT_BUDGET_S,
+            reps: int = 5, warmup: int = 3,
+        ) -> str:
+            if not self.policy.may_run_cpu_kernels:
+                return _denied()
+            try:
+                res = C.tune_kind(kind, size=size, n=n, dtype=dtype, seed=seed,
+                                  max_candidates=max_candidates,
+                                  budget_s=budget_s, reps=reps, warmup=warmup)
+            except C.CallError as exc:
+                return f"No such problem: {exc}"
+            except KeyError as exc:
+                return f"Nothing to tune: {exc}"
+            self._record("cpu_tune",
+                         {"kind": kind, "candidates": res.n_candidates,
+                          "ok": res.winner is not None})
+            return res.report()
+
+        self._add(ToolSpec(
+            name="cpu_probe",
+            description=(
+                "Report what native silicon and toolchain is reachable: CPU "
+                "name, cores, SIMD features, cache, compiler and version, and "
+                "what -march=native resolves to. Never fails; 'none' is an "
+                "answer."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=cpu_probe, source="builtin", tags=["cpu", "read"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_runs_here",
+            description=(
+                "Ask whether an artefact built for a -march target can run on "
+                "this machine. Call before compiling for anything but the "
+                "local default: a build for a newer target loads fine and "
+                "dies at the first unsupported instruction."
+            ),
+            parameters={"type": "object", "properties": {
+                "target": {"type": "string",
+                           "description": "-march value, e.g. native, x86-64, znver3"},
+            }},
+            fn=cpu_runs_here, source="builtin", tags=["cpu", "read"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_preflight",
+            description=(
+                "Lint C source for the mistakes worth knowing before it is "
+                "compiled: off-by-one loop bounds, unchecked sizes, the "
+                "usual buffer hazards. Advice, not a gate — a finding does "
+                "not stop the build."
+            ),
+            parameters={"type": "object", "properties": {
+                "code": {"type": "string", "description": "C source"},
+                "name": {"type": "string"},
+            }, "required": ["code"]},
+            fn=cpu_preflight, source="builtin", tags=["cpu", "read"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_units_audit",
+            description=(
+                "Lint source for the do_bench-returns-ms bug: a value scaled "
+                "by 1000 in a statement labelled ms. Give source text or a "
+                "path."
+            ),
+            parameters={"type": "object", "properties": {
+                "source": {"type": "string"},
+                "path": {"type": "string", "description": "file or directory"},
+            }},
+            fn=cpu_units_audit, source="builtin", tags=["cpu", "read"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_cache_stats",
+            description=(
+                "Report the content-addressed kernel cache: hit and miss "
+                "counts. Compiling the same source for the same target with "
+                "the same compiler is a hit, not a rebuild."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=cpu_cache_stats, source="builtin", tags=["cpu", "read"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_compile",
+            description=(
+                "Compile C you wrote to a loadable library, content-addressed "
+                "on target, compiler version and flags, so a repeat is a cache "
+                "hit. Refuses a target this machine cannot run, and refuses "
+                "source with no ctypes-callable entry point. Gated by "
+                "may_run_cpu_kernels."
+            ),
+            parameters={"type": "object", "properties": {
+                "code": {"type": "string", "description": "C source"},
+                "name": {"type": "string"},
+                "target": {"type": "string", "description": "-march value"},
+            }, "required": ["code"]},
+            fn=cpu_compile, source="builtin", tags=["cpu", "run"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_run_isolated",
+            description=(
+                "Compile, verify against the problem's reference answer, and "
+                "time - all in a child process, so a segfault or an unbounded "
+                "loop is a report instead of the end of the session. "
+                "Verification runs before measurement, always. Gated by "
+                "may_run_cpu_kernels."
+            ),
+            parameters={"type": "object", "properties": {
+                "code": {"type": "string", "description": "C source"},
+                "name": {"type": "string"},
+                "kind": {"type": "string",
+                         "description": f"problem: {', '.join(sorted(C.NAIVE))}"},
+                "size": {"type": "integer"},
+                "n": {"type": "integer"},
+                "dtype": {"type": "string", "enum": list(C.DTYPES)},
+                "seed": {"type": "integer"},
+                "reps": {"type": "integer"},
+                "warmup": {"type": "integer"},
+                "timeout": {"type": "number",
+                            "description": "seconds; 0 uses the module default"},
+                "target": {"type": "string"},
+            }, "required": ["code"]},
+            fn=cpu_run_isolated, source="builtin", tags=["cpu", "run"],
+        ))
+        self._add(ToolSpec(
+            name="cpu_tune",
+            description=(
+                "Search for a faster correct kernel from a naive starting "
+                "point: generate, compile, verify, measure, mutate, keep the "
+                "winner — against a baseline strong enough that a win means "
+                "something. Gated by may_run_cpu_kernels."
+            ),
+            parameters={"type": "object", "properties": {
+                "kind": {"type": "string",
+                         "description": f"problem: {', '.join(sorted(C.NAIVE))}"},
+                "size": {"type": "integer"},
+                "n": {"type": "integer"},
+                "dtype": {"type": "string", "enum": list(C.DTYPES)},
+                "seed": {"type": "integer"},
+                "max_candidates": {"type": "integer"},
+                "budget_s": {"type": "number"},
+                "reps": {"type": "integer"},
+                "warmup": {"type": "integer"},
+            }},
+            fn=cpu_tune, source="builtin", tags=["cpu", "run"],
         ))
 
     # ------------------------------------------------------------------
