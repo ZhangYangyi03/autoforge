@@ -6,7 +6,9 @@ or cron invocation gets help instead of a hung REPL waiting on stdin.
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import threading
 
 import pytest
 
@@ -172,3 +174,86 @@ def test_list_enumerates_a_directory(tmp_path, capsys):
     (tmp_path / "a.json").write_text(json.dumps({"name": "alpha"}), encoding="utf-8")
     cli.cmd_list(argparse.Namespace(path=str(tmp_path)))
     assert "alpha" in capsys.readouterr().out
+
+
+# -- the confirmation gate, on the terminal ------------------------------
+#
+# The gate in `ToolRegistry.call` asks whoever is attached to the registry. On
+# the command line that is this object. It is the difference between a policy
+# field that refuses tools and one that only says it does, so its three
+# answers get their own tests: yes, no, and nobody-here.
+class _FakeTty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _cfg(**over) -> dict:
+    cfg = dict(model="m", base="http://127.0.0.1:1/v1", key="k", max_tokens=16,
+               proxy=False, fast=True, policy="full")
+    cfg.update(over)
+    return cfg
+
+
+def test_the_cli_attaches_a_confirmer_to_the_agent(monkeypatch):
+    # Wiring that is not checked is wiring that quietly stops existing, and
+    # then "off" means nothing again on the one surface the user actually uses.
+    monkeypatch.setenv("AUTOFORGE_HOME", ".")
+    assert isinstance(cli._build(_cfg()).confirmer, cli._TerminalConfirmer)
+    assert isinstance(cli._build_mode(_cfg(policy="supervised"), "minimal").confirmer,
+                      cli._TerminalConfirmer)
+
+
+def test_the_confirmer_is_silent_when_stdin_is_not_a_terminal(monkeypatch):
+    # A piped or cron run has nobody at the other end. Answering "yes" there
+    # would turn the gate into a formality.
+    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    assert cli._TerminalConfirmer()("forge_tool", {}, ["may_access_network"]) is None
+
+
+def test_the_confirmer_does_not_prompt_from_a_worker_thread(monkeypatch, capsys):
+    # The web harness runs agents in threads with a browser on the other end.
+    # Prompting there would block a request on input nobody can see.
+    monkeypatch.setattr("sys.stdin", _FakeTty("y\n"))
+    seen: list = []
+    t = threading.Thread(
+        target=lambda: seen.append(
+            cli._TerminalConfirmer()("forge_tool", {}, ["may_access_network"])))
+    t.start()
+    t.join()
+    assert seen == [None]
+    assert "confirmation gate" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("typed,expected", [
+    ("y\n", True), ("yes\n", True), ("Y\n", True),
+    ("\n", False), ("n\n", False), ("maybe\n", False),
+])
+def test_the_confirmer_defaults_to_no(monkeypatch, typed, expected):
+    # Anything that is not an explicit yes is a no. An empty line is the
+    # commonest thing a hurried operator types.
+    monkeypatch.setattr("sys.stdin", _FakeTty(typed))
+    assert cli._TerminalConfirmer()("forge_tool", {}, ["may_access_network"]) is expected
+
+
+def test_the_confirmer_treats_eof_and_ctrl_c_as_nobody_answering(monkeypatch):
+    monkeypatch.setattr("sys.stdin", _FakeTty(""))
+    assert cli._TerminalConfirmer()("forge_tool", {}, ["may_access_network"]) is None
+    monkeypatch.setattr("sys.stdin", _FakeTty("y\n"))
+
+    def interrupted(*_a, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+    assert cli._TerminalConfirmer()("forge_tool", {}, ["may_access_network"]) is None
+
+
+def test_the_prompt_names_the_switch_the_tool_and_the_arguments(monkeypatch, capsys):
+    # An approval prompt that does not say what it is approving trains its
+    # reader to say yes without looking, which is worse than no prompt.
+    monkeypatch.setattr("sys.stdin", _FakeTty("n\n"))
+    cli._TerminalConfirmer()("forge_tool", {"need": "a csv parser"},
+                             ["may_access_network"])
+    out = capsys.readouterr().out
+    assert "forge_tool" in out
+    assert "may_access_network" in out
+    assert "a csv parser" in out

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from autoforge.agent import FORGE_ROUND_CEILING, SUPERVISED_TURN_CAP, ForgeAgent
 from autoforge.autonomy.policy import (
+    CONFIRM_REQUIRED,
     DECLARED_ONLY,
     ENFORCED,
     FULL_FREEDOM,
@@ -29,6 +30,7 @@ from autoforge.autonomy.spawn import Spawner
 from autoforge.core.llm import MockLLMClient
 from autoforge.modes import MinimalAgent
 from autoforge.tools.registry import ToolRegistry
+from autoforge.tools.spec import ToolSpec
 
 
 def _agent(**policy: bool) -> ForgeAgent:
@@ -143,14 +145,23 @@ class TestEnforcementLedger:
         # "unknown" and quietly be trusted as enforced.
         rows = AutonomyPolicy().enforcement_table()
         assert {r["enforced"] for r in rows} <= {"enforced", "partial",
-                                                 "declared-only"}
+                                                "declared-only", "confirm"}
         assert len(rows) == len(self._fields())
 
-    def test_the_three_classes_are_disjoint_and_cover_the_fields(self):
-        assert not (ENFORCED & DECLARED_ONLY)
-        assert not (ENFORCED & set(PARTIAL))
-        assert not (DECLARED_ONLY & set(PARTIAL))
-        assert ENFORCED | DECLARED_ONLY | set(PARTIAL) == self._fields()
+    def test_the_four_classes_are_disjoint_and_cover_the_fields(self):
+        # Four classes, not three. CONFIRM_REQUIRED earns its own: a gate that
+        # stops and asks is neither a refusal (enforced) nor decoration
+        # (declared-only), and filing it under either would misreport what
+        # switching the field off does.
+        guaranteed = ENFORCED
+        confirmed = set(CONFIRM_REQUIRED)
+        soft = set(PARTIAL)
+        inert = DECLARED_ONLY
+        classes = [guaranteed, confirmed, soft, inert]
+        for i, one in enumerate(classes):
+            for other in classes[i + 1:]:
+                assert not (one & other), f"{sorted(one & other)} classified twice"
+        assert set().union(*classes) == self._fields()
 
     def test_full_freedom_has_nothing_unenforced(self):
         # Empty is the healthy answer, and the default preset must be it.
@@ -164,16 +175,41 @@ class TestEnforcementLedger:
         for freedom in inert:
             assert freedom in text, f"{freedom} denied but not disclosed"
 
+    def test_a_preset_discloses_the_gates_it_can_only_negotiate(self):
+        # The four execution freedoms are honoured by asking. A user reading
+        # describe() must see that they are a question and not a refusal, or
+        # the ledger overstates the lock in the other direction.
+        asked = [f for f in SUPERVISED.denied if f in CONFIRM_REQUIRED]
+        assert asked, "SUPERVISED is supposed to switch some of these off"
+        text = SUPERVISED.describe()
+        assert "asks before running" in text
+        for freedom in asked:
+            assert freedom in text, f"{freedom} is gated but not disclosed"
+
     def test_set_autonomy_warns_when_the_freedom_is_inert(self):
-        # The agent tightening a freedom it cannot enforce must be told that it
-        # changed a claim rather than a capability.
+        # The agent tightening a freedom it cannot enforce everywhere must be
+        # told that it changed part of a claim, not a whole capability.
+        # may_run_arbitrary_code is the honest example: PARTIAL, not gated.
         a = _agent()
         r = a.registry.call("set_autonomy", {
-            "freedom": "may_access_network", "enabled": False,
-            "rationale": "trying to lock down the network",
+            "freedom": "may_run_arbitrary_code", "enabled": False,
+            "rationale": "trying to lock down code execution",
         })
         assert r.ok
         assert "not enforced" in r.output
+
+    def test_set_autonomy_says_a_confirm_freedom_is_asked_not_refused(self):
+        # The counterpart, and the distinction that matters: switching off one
+        # of the four does not forbid the tool, it makes the agent ask. A
+        # warning that claimed "not enforced" here would be stale.
+        a = _agent()
+        r = a.registry.call("set_autonomy", {
+            "freedom": "may_access_network", "enabled": False,
+            "rationale": "lock down the network",
+        })
+        assert r.ok
+        assert "not enforced" not in r.output
+        assert "ask" in r.output.lower()
 
 
 # ======================================================================
@@ -214,5 +250,196 @@ class TestSupervisedPresetEndToEnd:
         rep = self._agent().report()
         assert rep["policy"]["unlimited_turns"] is False
         described = SUPERVISED.describe()
-        assert "may_access_network" in described   # the inert ones are named
-        assert "not enforced" in described
+        assert "may_access_network" in described   # the gated ones are named
+        # Not "not enforced": these are backed by a gate now, and the honest
+        # word for that gate is that it asks. Claiming less would be as wrong
+        # as claiming more.
+        assert "asks before running" in described
+        assert "not enforced" not in described
+
+
+# ======================================================================
+# the confirmation gate — off must mean "asked", not "nothing"
+# ======================================================================
+class TestConfirmGate:
+    """Switching one of the four execution freedoms off must stop the call.
+
+    The ledger calls these CONFIRM_REQUIRED: a tool that needs a switched-off
+    freedom does not run, it asks. Before this gate existed the four were
+    declared-only — labelled as gates, honoured by nothing — so every test here
+    is the difference between the claim and the behaviour.
+    """
+
+    def _registry(self, confirmer=None, **policy: bool) -> tuple[ToolRegistry, list]:
+        ran: list = []
+
+        def spy(**kwargs):
+            ran.append(kwargs)
+            return "the tool really ran"
+
+        r = ToolRegistry(policy=AutonomyPolicy(**policy), confirmer=confirmer)
+        r.register(ToolSpec(
+            name="probe", description="a tool that declares it uses the network",
+            parameters={"type": "object", "properties": {}}, fn=spy,
+            source="builtin", effect_signature="system",
+        ))
+        return r, ran
+
+    def test_nobody_to_ask_means_no(self):
+        r, ran = self._registry(may_access_network=False)
+        res = r.call("probe", {})
+        assert res.ok is False and ran == [], "a gated tool ran without a yes"
+        assert res.awaiting_confirmation is True
+
+    def test_an_operator_yes_lets_it_run(self):
+        r, ran = self._registry(lambda *_: True, may_access_network=False)
+        res = r.call("probe", {})
+        assert res.ok is True and ran == [{}]
+        assert res.output == "the tool really ran"
+
+    def test_an_operator_no_is_reported_as_the_operators_decision(self):
+        # The two refusals are different facts. "Nobody was there" and "an
+        # operator said no" must not print the same sentence.
+        r, ran = self._registry(lambda *_: False, may_access_network=False)
+        res = r.call("probe", {})
+        assert ran == [] and "operator" in res.error
+
+    def test_a_confirmer_answering_none_is_not_blamed_on_an_operator(self):
+        r, _ = self._registry(lambda *_: None, may_access_network=False)
+        err = r.call("probe", {}).error
+        assert "nobody to ask" in err and "operator said no" not in err
+
+    def test_a_broken_confirmer_refuses_rather_than_running(self):
+        # A gate that raises must fail closed. Running the tool because the
+        # question crashed would be the worst possible default.
+        def boom(*_):
+            raise RuntimeError("the prompt exploded")
+
+        r, ran = self._registry(boom, may_access_network=False)
+        res = r.call("probe", {})
+        assert ran == [] and res.ok is False
+        assert "RuntimeError" in res.error
+
+    def test_the_full_policy_never_asks(self):
+        asked: list = []
+        r, ran = self._registry(lambda *a: asked.append(a) or False)
+        res = r.call("probe", {})
+        assert res.ok is True and ran == [{}]
+        assert asked == [], "the gate prompted with nothing switched off"
+
+    def test_a_registry_without_a_policy_is_ungated(self):
+        # The old behaviour, and it stays available: no policy, no gate.
+        ran: list = []
+
+        def spy(**kwargs):
+            ran.append(kwargs)
+            return "ok"
+
+        r = ToolRegistry()
+        r.register(ToolSpec(name="probe", description="d",
+                            parameters={"type": "object", "properties": {}},
+                            fn=spy, source="builtin", effect_signature="system"))
+        assert r.call("probe", {}).ok is True and ran == [{}]
+
+    def test_the_gate_only_covers_the_four_execution_freedoms(self):
+        # The other freedoms have their own gates and their own refusals. This
+        # one must not double-gate them, or a user switching off
+        # may_forge_tools would get an approval prompt for a freedom that was
+        # already hard-refused.
+        asked: list = []
+        r, ran = self._registry(lambda *a: asked.append(a) or True,
+                                may_forge_tools=False, unlimited_turns=False)
+        assert r.call("probe", {}).ok is True
+        assert asked == []
+
+    def test_a_refusal_does_not_count_against_the_tool(self):
+        # Refusals are the operator's decision, not the tool failing. Counting
+        # them would auto-quarantine a perfectly good tool after three "no"s.
+        r, _ = self._registry(may_access_network=False)
+        for _ in range(5):
+            r.call("probe", {})
+        spec = r.get("probe")
+        assert spec.stats.calls == 0
+        assert spec.state.value != "quarantined"
+
+    def test_the_gate_leaves_a_record(self):
+        r, _ = self._registry(may_access_network=False)
+        r.call("probe", {})
+        gate = [e for e in r.events() if e["kind"] == "confirm"]
+        assert len(gate) == 1
+        assert gate[0]["outcome"] == "no_operator"
+        assert gate[0]["needed"] == ["may_access_network"]
+
+    def test_reading_the_filesystem_needs_a_yes_when_it_is_off(self):
+        # Keyed off the tool's own declaration, not a hardcoded tool list: a
+        # tool that says it reads files is gated when reading is off.
+        ran: list = []
+        r = ToolRegistry(policy=AutonomyPolicy(may_read_filesystem=False))
+        r.register(ToolSpec(
+            name="peek", description="reads a file",
+            parameters={"type": "object", "properties": {}},
+            fn=lambda **kw: ran.append(kw) or "read it",
+            source="builtin", effect_signature="read_only"))
+        res = r.call("peek", {})
+        assert ran == [] and "may_read_filesystem" in res.error
+        assert r.call("peek", {}).awaiting_confirmation is True
+
+    def test_an_undeclared_scope_needs_everything(self):
+        # Silence is not innocence. A tool that declares nothing is treated as
+        # capable of everything, so it is gated by any switched-off freedom.
+        ran: list = []
+        r = ToolRegistry(policy=AutonomyPolicy(may_write_filesystem=False))
+        r.register(ToolSpec(
+            name="mystery", description="declares nothing at all",
+            parameters={"type": "object", "properties": {}},
+            fn=lambda **kw: ran.append(kw) or "ran", source="builtin"))
+        assert ran == []
+        assert r.call("mystery", {}).awaiting_confirmation is True
+
+    def test_supervised_gates_the_tools_that_reach_out_not_the_mirror(self):
+        # The distinction the label has to earn: under SUPERVISED the network
+        # is off, so forging (which calls a model and runs code) is asked
+        # about, while reading its own capabilities is not. A gate that
+        # prompted for my_capabilities would make the preset unusable and
+        # teach the user to answer without reading.
+        asked: list = []
+
+        def confirmer(tool, arguments, freedoms):
+            asked.append((tool, tuple(freedoms)))
+            return False
+
+        a = ForgeAgent(MockLLMClient(), policy=SUPERVISED, enable_evolution=False,
+                       confirmer=confirmer)
+        assert a.registry.call("forge_tool", {"need": "x"}).ok is False
+        assert a.registry.call("my_capabilities", {}).ok is True
+        assert [t for t, _ in asked] == ["forge_tool"]
+        assert asked[0][1] == ("may_access_network",)
+
+    def test_supervised_with_nobody_to_ask_refuses_and_says_so(self):
+        a = ForgeAgent(MockLLMClient(), policy=SUPERVISED, enable_evolution=False)
+        err = a.registry.call("forge_tool", {"need": "x"}).error
+        assert "nobody to ask" in err and "may_access_network" in err
+
+    def test_every_builtin_tool_declares_what_it_touches(self):
+        # The gate is only as good as the declarations. An unlabelled builtin
+        # is treated as capable of everything, so it would be gated by every
+        # switched-off freedom — visible, but it would also mean the labels
+        # describe less than the code does.
+        from autoforge.agent import BUILTIN_SCOPES
+        from autoforge.forge.validity import SCOPE_ALLOWANCES
+
+        a = ForgeAgent(MockLLMClient(), enable_evolution=False)
+        specs = [a.registry.get(n) for n in a.registry.names()]
+        undeclared = [s.name for s in specs if not s.effect_signature]
+        assert undeclared == [], f"these builtins declare no scope: {undeclared}"
+        for spec in specs:
+            assert spec.effect_signature in SCOPE_ALLOWANCES, \
+                f"{spec.name} declares {spec.effect_signature!r}, not a known scope"
+            assert spec.name in BUILTIN_SCOPES, \
+                f"{spec.name} declares a scope BUILTIN_SCOPES does not list"
+            # The table and the spec must agree. Where they can drift, one of
+            # them becomes a lie: the gate reads the spec, and a reader reads
+            # the table.
+            assert spec.effect_signature == BUILTIN_SCOPES[spec.name], \
+                (f"{spec.name}: spec says {spec.effect_signature!r}, "
+                 f"BUILTIN_SCOPES says {BUILTIN_SCOPES[spec.name]!r}")

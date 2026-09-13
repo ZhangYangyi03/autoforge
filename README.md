@@ -260,10 +260,25 @@ score = w_text·similarity + w_success·success_rate + w_trust·state_trust
 ship — `full` (the default: nothing denied) and `supervised` — selected with
 `--policy` or `AUTOFORGE_POLICY`, and `autoforge config` prints which is live.
 Each field in the policy is labelled *enforced* (a gate you can watch close),
-*partial*, or *declared-only* (a promise no code path keeps yet). The report is
-not decoration: `my_capabilities` hands the same classification to the agent,
-and `set_autonomy` warns when you switch off a freedom nothing obeys — so
-"switched off" can never quietly mean "still on".
+*partial*, *confirm* (off means "not without a yes": the tool stops and asks
+before it runs), or *declared-only* (a promise no code path keeps yet — an
+empty class today, kept so a future unclassified field shows up loudly). The
+report is not decoration: `my_capabilities` hands the same classification to the
+agent, `set_autonomy` tells you whether switching a freedom off closes a door,
+narrows one, or turns it into a question, and `describe()` prints
+`[asks before running: ...]` — so "switched off" can never quietly mean
+"still on".
+
+The four execution freedoms (`may_read_filesystem`, `may_write_filesystem`,
+`may_access_network`, `may_install_packages`) are the *confirm* ones. Switching
+one off makes `ToolRegistry.call` ask, once per run, about any tool whose own
+declared scope needs it — a tool that declares nothing is treated as capable of
+everything and is therefore asked about too. Nobody to ask (a headless run, the
+web harness's worker threads) means it does not run; an unanswered prompt is
+never a yes. On a terminal the question is asked by `cli._TerminalConfirmer`,
+which defaults to No and prints the tool, the switch and the arguments. Tools
+declare their scope in `agent.BUILTIN_SCOPES`; a test fails if the table and the
+tool specs ever disagree.
 
 ---
 
@@ -379,7 +394,12 @@ declared normalisation relation.
 
 Known limits: the default sandbox is process isolation, not a security
 boundary against adversarial code (`restrict_builtins` narrows it; use a
-`runner` for real containment). It also does **not** separate the agent from the
+`runner` for real containment). A *confirm* freedom has no approval flow in the
+browser: the web harness runs agents in worker threads with no terminal, so it
+answers "nobody to ask" and refuses rather than hanging a request on input it
+cannot show you. Running `supervised` over the web UI therefore refuses the
+gated tools instead of prompting for them — the CLI is the surface where the
+question can actually be put to a person. It also does **not** separate the agent from the
 host: forged code runs as a subprocess of the agent process on the same machine,
 with the whole host filesystem and outbound network. `Sandbox.reach(probe=True)`
 measures that with a real round-trip rather than asserting it, and

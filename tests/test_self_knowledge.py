@@ -160,14 +160,30 @@ class TestNoPhantomSections:
                 nxt = lines[i + 1] if i + 1 < len(lines) else ""
                 assert nxt.startswith("  - "), f"header with no rows: {line!r}"
 
-    def test_declared_only_off_prints_only_the_inert_section(self):
-        # Only a declared-only freedom is off, so the *enforced* and *partial*
-        # sections are empty. The old code printed their headers anyway, which
-        # reads as a limit that does not exist — the exact failure this whole
-        # report exists to prevent.
+    def test_a_gated_freedom_prints_only_the_asks_section(self):
+        # may_access_network is now CONFIRM_REQUIRED, so it is not "nothing
+        # obeys it" and it is not "actually enforced" — it stops and asks. The
+        # report has to say exactly that, and it must not print the headers of
+        # the sections it is not in: a phantom header reads as a limit that
+        # does not exist, which is the failure this whole report exists to
+        # prevent.
         policy = AutonomyPolicy(may_access_network=False)
         out = _agent(policy=policy).registry.call("my_capabilities", {}).output
         sections = [ln for ln in out.splitlines() if ln.startswith("Switched off")]
-        assert sections == ["Switched off, but nothing obeys it (do not rely on these):"]
+        assert sections == ["Switched off, runs only if you say yes to it:"]
         assert "may_access_network" in out
-        assert "network    — outbound" in out      # the reach line still tells the truth
+        assert "nothing obeys it" not in out     # not decoration any more
+        assert "asks before running" in out
+        assert "network    — outbound" in out    # the reach line still tells the truth
+
+    def test_a_partial_freedom_prints_only_the_places_it_binds(self):
+        # The other half of the same distinction: may_run_arbitrary_code is
+        # PARTIAL, so switching it off changes behaviour on some paths and not
+        # others. That is a third sentence, and the report must not blur it
+        # into either of the other two.
+        policy = AutonomyPolicy(may_run_arbitrary_code=False)
+        out = _agent(policy=policy).registry.call("my_capabilities", {}).output
+        sections = [ln for ln in out.splitlines() if ln.startswith("Switched off")]
+        assert sections == ["Switched off, enforced only in places:"]
+        assert "nothing obeys it" not in out
+        assert "say yes" not in out

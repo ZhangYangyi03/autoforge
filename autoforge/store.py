@@ -70,6 +70,17 @@ _DDL = (
     "\n    fitness REAL NOT NULL DEFAULT 0.0,"
     "\n    trials INTEGER NOT NULL DEFAULT 0"
     "\n);"
+    # Deliberate long-term memory: facts the agent chooses to keep, as opposed
+    # to the event log, which records what happened whether it meant to or not.
+    # A memory table without this distinction would just be a second ledger.
+    "\nCREATE TABLE IF NOT EXISTS memory ("
+    "\n    key TEXT NOT NULL PRIMARY KEY,"
+    "\n    value TEXT NOT NULL DEFAULT '',"
+    "\n    tags TEXT NOT NULL DEFAULT '[]',"
+    "\n    created_at REAL NOT NULL,"
+    "\n    updated_at REAL NOT NULL,"
+    "\n    recalls INTEGER NOT NULL DEFAULT 0"
+    "\n);"
 )
 
 
@@ -173,13 +184,30 @@ class ToolRecord:
         return spec
 
 
+def _default_home() -> str:
+    """Where state lives when AUTOFORGE_HOME is unset.
+
+    Per-user and absolute, not the current directory. A cwd-relative database
+    means the agent's memory silently resets whenever it is launched from a
+    different directory, which reads to the agent as "I have no memory" rather
+    than "I looked in the wrong place". The env var still overrides.
+    """
+    env = os.environ.get("AUTOFORGE_HOME")
+    if env:
+        return env
+    base = (os.environ.get("LOCALAPPDATA")
+            or os.environ.get("XDG_DATA_HOME")
+            or os.path.expanduser("~"))
+    return os.path.join(base, "autoforge")
+
+
 # ---------------------------------------------------------------------------
 class ToolStore:
     """SQLite-backed tool registry persistence."""
 
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = str(db_path or _DEFAULT_DB)
-        home = os.environ.get("AUTOFORGE_HOME", ".")
+        home = _default_home()
         if not os.path.isabs(self.db_path):
             self.db_path = os.path.join(home, self.db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -372,6 +400,56 @@ class ToolStore:
         return results
 
 
+    # -- deliberate memory ------------------------------------------------
+    def remember(self, key: str, value: str, tags: list[str] | None = None) -> None:
+        """Keep one fact across sessions, replacing any earlier value for `key`."""
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO memory (key, value, tags, created_at, updated_at, recalls)"
+            " VALUES (?,?,?,?,?,0)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+            " tags=excluded.tags, updated_at=excluded.updated_at",
+            (key, value, _j(tags or []), now, now),
+        )
+        self._conn.commit()
+
+    def forget(self, key: str) -> bool:
+        """Drop one memory. Returns whether it was there to drop."""
+        cur = self._conn.execute("DELETE FROM memory WHERE key=?", (key,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def recall(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
+        """Read memories back, most recently touched first.
+
+        An empty query returns everything, which is what a fresh session wants:
+        what did I know last time. A non-empty query is a case-insensitive
+        substring match against key and value.
+        """
+        like = "%" + query.lower() + "%"
+        rows = self._conn.execute(
+            "SELECT * FROM memory WHERE lower(key) LIKE ? OR lower(value) LIKE ?"
+            " ORDER BY updated_at DESC LIMIT ?",
+            (like, like, limit),
+        ).fetchall()
+        out = [
+            {
+                "key": r["key"],
+                "value": r["value"],
+                "tags": _unjson(r["tags"]) or [],
+                "updated_at": r["updated_at"],
+                "recalls": r["recalls"],
+            }
+            for r in rows
+        ]
+        if out:
+            self._conn.executemany(
+                "UPDATE memory SET recalls = recalls + 1 WHERE key=?",
+                [(o["key"],) for o in out],
+            )
+            self._conn.commit()
+        return out
+
     # -- self-report ------------------------------------------------------
     def report(self) -> dict[str, Any]:
         """What this store actually persists — facts, for the agent's self-model.
@@ -403,6 +481,7 @@ class ToolStore:
             "tool_states": states,
             "events": events,
             "event_kinds": kinds,
+            "memories": _one("SELECT COUNT(*) FROM memory") or 0,
             "since": _one("SELECT MIN(timestamp) FROM forge_events"),
             "until": _one("SELECT MAX(timestamp) FROM forge_events"),
         }

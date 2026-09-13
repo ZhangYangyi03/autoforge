@@ -58,40 +58,76 @@ from .tools.spec import ToolSpec, ToolState
 AUTONOMOUS_SYSTEM = """You are an autonomous agent that grows its own capabilities.
 
 Your reach — read this before claiming you cannot do something:
-- forge_tool does not merely *register* a tool. It compiles the Python you
-  write and runs it in a separate process on this host, with a scrubbed
-  environment but a real filesystem and a real network stack. So through
-  forge_tool you can read and write files, list directories, and open sockets.
-  There is no separate read_file or run_shell tool because forge_tool IS that
-  access. "I have no file tools" is false; forge it.
+- forge_tool does not merely register a tool: it compiles the Python you write
+  and runs it in a separate process on this host, with a scrubbed environment
+  but a real filesystem and a real network stack. Reading, writing, listing and
+  opening sockets all go through it. There is no separate read_file or
+  run_shell tool because forge_tool IS that access. "I have no file tools" is
+  false; forge it.
 - Anything you can express in Python, you can run. Treat that as shell access
   with a timeout, and say so if asked what you can reach.
 
 You can:
-- my_capabilities— report your real reach: which freedoms are enforced, which
-  are declared-only, and what forged code is actually permitted to do
-- my_history     — read your own ledger: past forges, runs, and self-changes
-- forge_tool      — create a new tool when you hit a need you cannot serve
-- evolve_tool     — breed a better version of a tool that underperforms
-- spawn_agent     — create a child agent for a subtask
-- design_team     — redesign the multi-agent topology that fits the task
-- amend_self      — change your own prompt, forge config, or routing weights
-- set_autonomy    — change your own permissions
-- evaluate_tool   — run the full verification battery on any tool
-- find_gaps       — proactively discover capabilities you're missing
-- list_tools      — inspect your library and its health
-- terminate       — end the task when you judge it complete
+- my_capabilities — your real reach: what is enforced, what is declared-only,
+  and what forged code may actually do
+- my_history     — your ledger: past forges, runs, self-changes
+- forge_tool     — create a tool for a need you cannot serve
+- evolve_tool    — breed a better version of a weak tool
+- spawn_agent    — a child agent for a subtask
+- design_team    — redesign the topology that fits the task
+- amend_self     — your own prompt, forge config, routing weights
+- set_autonomy   — your own permissions
+- evaluate_tool  — the full verification battery on any tool
+- find_gaps      — discover capabilities you are missing
+- list_tools     — your library and its health
+- terminate      — end the task when it is done
 
 Principles:
-- Forge only when a need genuinely recurs; don't duplicate existing tools.
-- When a tool fails repeatedly, evolve it rather than retrying blindly.
-- When a task spans several specialities, design the team before doing the
-  work: a coordinator plus focused workers and a critic beats one loop.
-- Self-modifications need a rationale. Say WHY you are changing yourself.
+- Forge only when a need genuinely recurs; never duplicate a tool you have.
+- When a tool fails repeatedly, evolve it; do not retry blindly.
+- When a task spans specialities, design the team before doing the work.
+- Self-modification needs a rationale. Say why.
 - Before reporting a limitation, check my_capabilities and my_history. A
   capability you have and deny is worse than one you lack.
 - You decide when the task is done. There is no hidden turn limit.
 - Prefer the simplest path that works.
+
+Acting, not arguing:
+- When asked to build, port, fetch, scan or fix something, begin it in this
+  reply. Do not open with a feasibility assessment or a list of reasons it is
+  hard, and do not close by asking permission for the work you were just asked
+  to do. If the next step is within reach, take it and report what you found.
+  Offering to start is not starting.
+- A plan you did not begin is not progress. If you have named the steps,
+  execute the first one now and report its result.
+- A partial working artifact beats a complete argument. Do the obvious subset
+  first, then note in one line what you left out.
+- Decline at most once, in one sentence, and only what is genuinely blocked.
+  State the block and stop there: never restate a refusal already given, and
+  never give a refusal its own justification, section or heading.
+- Do not narrate your reasoning, doubts, or the options you dropped.
+- If a request is ambiguous, take the most likely reading, do that, and name
+  the reading you took. Ask only when the choice is unrecoverable.
+- About one screen. Short gets read.
+
+Writing style — plain text in a terminal, never markdown:
+- No `**bold**`, no `*italic*`, no `#`/`##` headings, no `|` tables. No
+  exceptions. Align columns with spaces, one blank line above and below:
+      freedom                enforced?
+      may_read_filesystem    declared-only
+      may_run_cuda_kernels   enforced
+- Section labels are plain words on their own line: "Freedom", not "## Freedom".
+- For emphasis, repeat the point in the sentence; do not wrap it in punctuation.
+
+Freedoms, when compared to another agent's:
+- On reach, you are peers with anything on this host: forged code gets a real
+  filesystem and a real network stack.
+- On self-change, if relevant, one line: amend_self and set_autonomy edit your
+  prompt, forge config and permissions while you run. Do not rank yourself.
+- Answer in a few lines from the measured self-report. No comparison table, no
+  sorting the other agent's parts, no lecturing it about its boundaries.
+- Do not claim a limit you have. Do not invent a freedom you lack. The measured
+  self-report above is the arbiter, recomputed every turn.
 """
 
 
@@ -226,6 +262,55 @@ def host_facts(sandbox: Any = None) -> list[str]:
     return lines
 
 
+#: What each builtin tool touches, for the confirmation gate.
+#:
+#: The gate in `ToolRegistry.call` asks before running a tool whose declared
+#: scope needs a freedom the policy switched off (`autonomy/confirm.py`). That
+#: only means anything if the tools say what they touch — a builtin that
+#: declares nothing needs every freedom, so it would be gated under any
+#: restricted policy, including the ones that only want to stop network access.
+#: Labelling them is what keeps the question specific.
+#:
+#: The granularity is the gate's: reads, writes, network, installs. A probe that
+#: shells out to `nvidia-smi` is `read_only` here — it does spawn a process, and
+#: that is recorded in `required_freedoms` for the freedom that governs running
+#: code, but the gate is not the second gate for that decision.
+BUILTIN_SCOPES: dict[str, str] = {
+    # The memory trio declares its own scope on the spec; the rows are repeated
+    # here so this table stays the one place the question "what does this
+    # builtin touch?" is answered. A disagreement fails a test rather than
+    # silently going one way at runtime.
+    "remember": "local_write",
+    "recall": "read_only",
+    "forget": "local_write",
+    # Reading the agent's own state. Nothing leaves the process.
+    "my_capabilities": "read_only",
+    "my_history": "read_only",
+    "list_tools": "read_only",
+    "find_gaps": "read_only",
+    # Self-modification writes the agent's own policy, prompt or store.
+    "amend_self": "local_write",
+    "set_autonomy": "local_write",
+    "retire_tool": "local_write",
+    # Spawning and designing write nothing themselves; whatever the child then
+    # runs is gated on the child's own call, against the same policy.
+    "spawn_agent": "read_only",
+    "design_team": "read_only",
+    # These execute agent-authored code on the host: subprocess, plus a compile
+    # cache under the workspace for the GPU pair.
+    "forge_tool": "system",
+    "evaluate_tool": "system",
+    "evolve_tool": "system",
+    "gpu_compile": "system",
+    "gpu_bench": "system",
+    # Probing and arithmetic on numbers the caller already has.
+    "gpu_probe": "read_only",
+    "gpu_occupancy": "read_only",
+    "gpu_units_audit": "read_only",
+    "gpu_verify": "read_only",
+}
+
+
 @dataclass
 class ForgeAgent:
     llm: LLMClient
@@ -241,10 +326,18 @@ class ForgeAgent:
     enable_evolution: bool = True
     trace: list[dict[str, Any]] = field(default_factory=list)
     topology: Topology = field(default_factory=Topology.single_agent)
+    # Asked before running a tool that needs a switched-off freedom. Left None
+    # the gate fails closed — see autonomy/confirm.py and ToolRegistry._gate.
+    confirmer: Any = None
 
     def __post_init__(self) -> None:
         if self.generator is None:
             self.generator = TemplateGenerator()
+
+        # The gate lives on the registry because that is where every tool
+        # actually runs. Without this the policy would be a comment again.
+        self.registry.policy = self.policy
+        self.registry.confirmer = self.confirmer
 
         self.selfmod = SelfModifier(
             require_rationale=self.policy.require_change_rationale,
@@ -313,9 +406,14 @@ class ForgeAgent:
         self._tool_retire()
         self._tool_capabilities()
         self._tool_history()
+        self._tool_memory()
         self._tool_gpu()
 
     def _add(self, spec: ToolSpec) -> None:
+        # Say what this tool touches, so a switched-off freedom has something to
+        # key off. See BUILTIN_SCOPES; an explicit declaration on the spec wins.
+        if not spec.effect_signature:
+            spec.effect_signature = BUILTIN_SCOPES.get(spec.name, "")
         self.registry.register(spec)
         self.registry.promote(spec.name)
 
@@ -416,23 +514,60 @@ class ForgeAgent:
         ))
 
     def _tool_spawn(self) -> None:
-        def spawn_agent(task: str, isolated: bool = False) -> str:
+        def spawn_agent(task: str, isolated: bool = False, role: str = "") -> str:
             if not self.policy.may_spawn_agents:
                 return "Denied by autonomy policy: may_spawn_agents is off."
             mode = ShareMode.ISOLATED if isolated else ShareMode.SHARED
-            rec = self.spawner.spawn(task, mode=mode)
+
+            # A role name resolves against the topology the agent designed, so
+            # the team it drew is the team it gets to run. Refusing an unknown
+            # role beats silently ignoring it: a whitelist that quietly does
+            # nothing is the failure this replaced.
+            allowed: list[str] = []
+            if role:
+                nodes = list(getattr(self.topology, "nodes", []) or [])
+                node = next((n for n in nodes if n.id == role), None)
+                if node is None:
+                    node = next((n for n in nodes
+                                 if str(getattr(n.role, "value", n.role)) == role), None)
+                if node is None:
+                    have = ", ".join(n.id for n in nodes) or "none"
+                    return (f"No node named {role!r} in the current topology "
+                            f"(have: {have}). Call design_team first, or spawn "
+                            f"without a role to leave the child unrestricted.")
+                allowed = list(node.tools_whitelist or [])
+
+            rec = self.spawner.spawn(task, mode=mode, restrict_to=allowed, role=role)
             self._record("spawn", rec.to_dict())
             if rec.error:
                 return f"Child failed: {rec.error}"
-            forged = f" tools_forged={rec.tools_forged}" if rec.tools_forged else ""
-            return f"Child {rec.child_id} finished in {rec.finished - rec.started:.1f}s.{forged}\n{rec.result[:500]}"
+
+            bits = [f"Child {rec.child_id} finished in {rec.finished - rec.started:.1f}s."]
+            if role:
+                scope = ", ".join(allowed) if allowed else "unrestricted"
+                bits.append(f"Ran as '{role}', scoped to: {scope}.")
+            if rec.refusals:
+                reached = ", ".join(sorted(set(rec.refusals)))
+                bits.append(f"Reached past its role and was refused: {reached}.")
+            if rec.tools_forged:
+                bits.append(f"tools_forged={rec.tools_forged}.")
+            bits.append(rec.result[:500])
+            return " ".join(bits)
 
         self._add(ToolSpec(
             name="spawn_agent",
-            description="Create a child agent to handle a subtask independently.",
+            description=(
+                "Create a child agent to handle a subtask independently. Name a "
+                "`role` to run it as one of the nodes you designed: it can then "
+                "see and call only that node's whitelisted tools."
+            ),
             parameters={"type": "object", "properties": {
                 "task": {"type": "string"},
                 "isolated": {"type": "boolean", "description": "give it its own tool library"},
+                "role": {"type": "string",
+                         "description": "a node id (or role name) from the current "
+                                        "topology; restricts the child to that node's "
+                                        "tools_whitelist (omit for unrestricted)"},
             }, "required": ["task"]},
             fn=spawn_agent, source="builtin", tags=["meta"],
         ))
@@ -610,6 +745,14 @@ class ForgeAgent:
                     "does not consult the policy (DESIGN.md §2.5). This change "
                     "changes what I claim, not what I can reach."
                 )
+            elif (freedom in self.policy.CONFIRM_REQUIRED
+                  and not getattr(self.policy, freedom, True)):
+                note = (
+                    f"  This one is enforced as a question: {freedom} is off, so "
+                    "any tool whose declared scope needs it stops and asks before "
+                    "running, and does not run when there is nobody to ask. "
+                    "Watch it close at the next tool call."
+                )
             return (
                 f"{freedom} = {enabled}. Denied now: {self.policy.denied or 'nothing'}"
                 f"{note}"
@@ -739,6 +882,7 @@ class ForgeAgent:
             rows = self.policy.enforcement_table()
             enforced = [r for r in rows if r["enforced"] == "enforced"]
             partial = [r for r in rows if r["enforced"] == "partial"]
+            confirm = [r for r in rows if r["enforced"] == "confirm"]
             inert = [r for r in rows if r["enforced"] == "declared-only"]
 
             reach = self.sandbox.reach(probe=probe)
@@ -788,6 +932,8 @@ class ForgeAgent:
             for title, table, with_note in (
                 ("Switched off, and actually enforced:", enforced, False),
                 ("Switched off, enforced only in places:", partial, True),
+                ("Switched off, runs only if you say yes to it:",
+                 confirm, False),
                 ("Switched off, but nothing obeys it (do not rely on these):",
                  inert, False),
             ):
@@ -874,6 +1020,90 @@ class ForgeAgent:
         ))
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def _tool_memory(self) -> None:
+        """Deliberate memory: what the agent chose to keep, not what happened.
+
+        `_tool_history` reads the ledger, which records every action whether or
+        not it mattered. This is the other half — a key/value store the agent
+        writes on purpose and reads back in a later session. The distinction is
+        the point: a memory that is only an event log is not memory, it is a
+        transcript.
+        """
+
+        def remember(key: str, value: str, tags: str = "") -> str:
+            """Keep a fact across sessions. Overwrites any earlier value for key."""
+            if self.store is None:
+                return ("No store attached this session, so nothing can be kept. "
+                        "Memory is off here, not empty.")
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            self.store.remember(key, value, tag_list)
+            self._record("remember", {"key": key, "chars": len(value)})
+            return f"Remembered '{key}' ({len(value)} chars). It survives restart."
+
+        def recall(query: str = "", limit: int = 20) -> str:
+            """Read back what I kept, from past sessions as well as this one."""
+            if self.store is None:
+                return ("No store attached this session — nothing is being read "
+                        "or written. Memory is off here, not empty.")
+            n = max(1, min(int(limit), 200))
+            rows = self.store.recall(query, n)
+            if not rows:
+                return (f"No memories match {query!r}." if query
+                        else "Memory is empty — nothing kept yet.")
+            head = f"{len(rows)} memory(ies)"
+            if query:
+                head += f" matching {query!r}"
+            lines = [head + ":"]
+            for r in rows:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated_at"]))
+                first = r["value"].splitlines()[0] if r["value"] else ""
+                lines.append(f"  {ts}  {r['key']}: {first[:160]}")
+            return "\n".join(lines)
+
+        def forget(key: str) -> str:
+            """Drop one memory by key."""
+            if self.store is None:
+                return "No store attached this session."
+            if self.store.forget(key):
+                return f"Forgot '{key}'."
+            return f"No memory named '{key}'."
+
+        self._add(ToolSpec(
+            name="remember",
+            description=(
+                "Keep a fact across sessions in your own on-disk memory. For "
+                "anything you would otherwise re-derive next time: a path, a "
+                "preference, a lesson from a failure."
+            ),
+            parameters={"type": "object", "properties": {
+                "key": {"type": "string", "description": "short handle to recall it by"},
+                "value": {"type": "string", "description": "the fact itself"},
+                "tags": {"type": "string", "description": "comma-separated labels (optional)"},
+            }, "required": ["key", "value"]},
+            fn=remember, source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="recall",
+            description=(
+                "Read back facts kept with `remember`, including from previous "
+                "sessions. An empty query returns everything."
+            ),
+            parameters={"type": "object", "properties": {
+                "query": {"type": "string", "description": "substring to match (optional)"},
+                "limit": {"type": "integer", "description": "max results (default 20)"},
+            }},
+            fn=recall, source="builtin", tags=["meta"], effect_signature="read_only",
+        ))
+        self._add(ToolSpec(
+            name="forget",
+            description="Drop one memory by key.",
+            parameters={"type": "object", "properties": {
+                "key": {"type": "string"},
+            }, "required": ["key"]},
+            fn=forget, source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
+
     def _self_report(self) -> str:
         """The facts about myself, read from the objects that hold them.
 

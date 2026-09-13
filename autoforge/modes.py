@@ -172,6 +172,7 @@ def _minimal_tools(policy: AutonomyPolicy | None = None) -> dict[str, ToolSpec]:
             fn=_gated_bash,
             source="builtin",
             tags=["shell"],
+            effect_signature="system",   # shell: reads, writes, spawns, networks
             state=ToolState.ACTIVE,
             cost_hint="moderate",
         ),
@@ -200,6 +201,7 @@ def _minimal_tools(policy: AutonomyPolicy | None = None) -> dict[str, ToolSpec]:
             fn=_editor,
             source="builtin",
             tags=["files"],
+            effect_signature="local_write",
             state=ToolState.ACTIVE,
             cost_hint="cheap",
         ),
@@ -220,13 +222,16 @@ class MinimalAgent:
     max_turns: int | None = None
     cwd: str | None = None
     policy: AutonomyPolicy | None = None   # None = no gate, the old behaviour
+    confirmer: Any = None                # asked before a gated tool runs
     trace: list[dict[str, Any]] = field(default_factory=list)
     pipeline: Any = None                 # cannot forge — the harness checks this
     store: Any = None
     registry: ToolRegistry = field(init=False)
 
     def __post_init__(self) -> None:
-        self.registry = ToolRegistry()
+        # `bash` declares scope `system`, so a policy that switches off network
+        # or read/write reaches it; `str_replace_editor` is a filesystem write.
+        self.registry = ToolRegistry(policy=self.policy, confirmer=self.confirmer)
         for name, spec in _minimal_tools(self.policy).items():
             if self.cwd:
                 # Pin both tools to the mode's workspace instead of whatever

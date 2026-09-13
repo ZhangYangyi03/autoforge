@@ -61,7 +61,7 @@ registry 持有 schema 列表，新工具下一轮即可用。prompt caching 的
 工具是 Python 函数，可被组合、可被复用、可被序列化进库。但**不是所有代码都进上下文** —— 只有 ACTIVE 的 schema 进。→ CodeAct 的表达力 + 分级暴露的克制。
 
 ### 8. 限制必须可强制，否则如实标注（反「声称有门其实没门」）
-`AutonomyPolicy` 里每个自由度都归三类之一：**enforced**（有代码路径在查，关掉就真有一道门合上）、**partial**、**declared-only**（`may_read_filesystem`／`may_write_filesystem`／`may_access_network`／`may_install_packages` —— 沙箱限的是**爆炸半径**不是能力上限，所以关掉这四个**不产生任何效果**）。这不是文档措辞，是数据结构：`enforcement_table()` 逐字段给结论，`unenforced` 列出「假装有门」的项，`set_autonomy` 关一个 inert 自由度时当场警告，`my_capabilities` 把同一张表交给 agent 自己。两个预设：`full`（默认，无否决）与 `supervised`（`--policy` 或 `AUTOFORGE_POLICY` 选）。→ 一个「已关闭」的开关若没人守，**比开着更危险** —— 它让人以为有边界。同一规则也管自述：`my_capabilities` 绝不打印没有内容的表头（曾报「Switched off, and actually enforced:」却零条，读起来像一道并不存在的限制）。
+`AutonomyPolicy` 里每个自由度都归四类之一：**enforced**（有代码路径在查，关掉就真有一道门合上）、**partial**、**confirm**（`may_read_filesystem`／`may_write_filesystem`／`may_access_network`／`may_install_packages` —— 关掉不是禁止，是**停下来问**：`ToolRegistry.call` 在每次运行前，按工具自己声明的 scope 判断它需不需要这四个里的某一个，需要就问你；没人可问（headless、web 线程）就不跑）、**declared-only**（现在是空集：留着这个类，是为了让将来「谁都没查」的新字段**响亮地**出现，而不是被悄悄归进别的类）。这不是文档措辞，是数据结构：`enforcement_table()` 逐字段给结论，`unenforced` 列出「假装有门」的项，`set_autonomy` 关一个 confirm 自由度时说明它变成了一道要问的闸，`my_capabilities` 把同一张表交给 agent 自己，`describe()` 打出 `[asks before running: ...]`。闸的实现是 `autonomy/confirm.py` 加 `ToolRegistry._gate`，工具的范围声明在 `agent.BUILTIN_SCOPES`（有测试保证表与 spec 不漂移），人在终端时由 `cli._TerminalConfirmer` 提问（默认 No；非 tty、非主线程一律不答＝拒绝）。两个预设：`full`（默认，无否决）与 `supervised`（`--policy` 或 `AUTOFORGE_POLICY` 选）。→ 一个「已关闭」的开关若没人守，**比开着更危险** —— 它让人以为有边界。同一规则也管自述：`my_capabilities` 绝不打印没有内容的表头（曾报「Switched off, and actually enforced:」却零条，读起来像一道并不存在的限制）。
 
 ---
 

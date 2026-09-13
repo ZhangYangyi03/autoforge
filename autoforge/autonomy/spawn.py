@@ -44,13 +44,20 @@ class SpawnRecord:
     result: str = ""
     tools_forged: list[str] = field(default_factory=list)
     error: str | None = None
+    # Which role the child ran as, and — if it tried to reach past that role —
+    # what it was refused. A refusal is evidence the whitelist is live rather
+    # than decorative, so it is recorded rather than swallowed.
+    role: str = ""
+    refusals: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "child_id": self.child_id,
             "task": self.task[:200],
             "mode": self.mode,
+            "role": self.role or None,
             "tools_forged": self.tools_forged,
+            "refusals": self.refusals,
             "duration_s": round(self.finished - self.started, 2) if self.finished else None,
             "error": self.error,
         }
@@ -80,12 +87,15 @@ class Spawner:
         *,
         mode: ShareMode = ShareMode.SHARED,
         child_registry: ToolRegistry | None = None,
+        restrict_to: set[str] | list[str] | None = None,
+        role: str = "",
     ) -> SpawnRecord:
         self.spawn_count += 1
         child_id = f"{self.parent_id}.{self.spawn_count}"
 
         record = SpawnRecord(
             child_id=child_id, task=task, mode=mode.value, parent_id=self.parent_id,
+            role=role,
         )
 
         if self._depth >= self.max_depth:
@@ -94,8 +104,15 @@ class Spawner:
             self.history.append(record)
             return record
 
-        reg = self.registry if mode == ShareMode.SHARED else (child_registry or ToolRegistry())
-        before = set(reg.names())
+        base_reg = self.registry if mode == ShareMode.SHARED else (
+            child_registry or ToolRegistry())
+        # A role's whitelist becomes a lens over the real registry, so the child
+        # can only see and call what its role allows. Registration still lands on
+        # base_reg — which is why the forged-tool diff is taken there: a child
+        # that forges something outside its whitelist really did create it, and
+        # hiding that from the parent would be the wrong kind of tidiness.
+        reg = base_reg.scoped(restrict_to or (), role=role)
+        before = set(base_reg.names())
 
         try:
             child = self.agent_factory(self, reg)
@@ -104,8 +121,9 @@ class Spawner:
         except Exception as exc:  # noqa: BLE001
             record.error = f"{type(exc).__name__}: {exc}"
 
-        after = set(reg.names())
+        after = set(base_reg.names())
         record.tools_forged = sorted(after - before)
+        record.refusals = list(getattr(reg, "refusals", []) or [])
         record.finished = time.time()
         self.history.append(record)
         return record

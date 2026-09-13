@@ -31,6 +31,8 @@ from typing import Any, ClassVar
 # ENFORCED      — some code path consults it and can refuse. Turning it off
 #                 changes behaviour in a way you can watch.
 # PARTIAL       — enforced on some paths but not all; the note says which.
+# CONFIRM       — turning it off stops execution and asks the operator. A real
+#                 gate, but a negotiable one: the answer "yes" runs the tool.
 # DECLARED_ONLY — never consulted anywhere. Turning it off does nothing.
 #                 Keep it for the roadmap, but never mistake it for a gate.
 # ---------------------------------------------------------------------------
@@ -69,16 +71,26 @@ PARTIAL: dict[str, str] = {
     ),
 }
 
-# The four filesystem/network/install freedoms are enforced nowhere: the
-# sandbox deliberately bounds blast radius rather than capping capability
-# (DESIGN.md §2.5). Listed explicitly so the gap is a decision, not an
-# oversight.
-DECLARED_ONLY: frozenset[str] = frozenset({
+# The four execution freedoms are honoured by ASKING, not by refusing. They
+# used to be declared-only: switching one off was inert, which is the worst of
+# both worlds — it reads as a safety net and behaves as a comment. Each is now
+# backed by a gate at the one place every tool actually runs
+# (`ToolRegistry.call`), keyed off the scope the tool itself declares. With the
+# freedom off, a tool that needs it stops and asks the operator; with nobody to
+# ask, it does not run. So "off" means "not without a yes", a behaviour you can
+# watch, rather than "off" meaning "nothing". See autonomy/confirm.py.
+CONFIRM_REQUIRED: frozenset[str] = frozenset({
     "may_read_filesystem",
     "may_write_filesystem",
     "may_access_network",
     "may_install_packages",
 })
+
+# Nothing is declared-only any more. Kept as an empty set rather than deleted:
+# every reader of this module branches on membership, and a field that is
+# neither enforced nor confirmed should reappear here, loudly, not be silently
+# unclassified.
+DECLARED_ONLY: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -122,6 +134,7 @@ class AutonomyPolicy:
 
     # The enforcement ledger, reachable from the class as well as the module.
     ENFORCED: ClassVar[frozenset[str]] = ENFORCED
+    CONFIRM_REQUIRED: ClassVar[frozenset[str]] = CONFIRM_REQUIRED
     DECLARED_ONLY: ClassVar[frozenset[str]] = DECLARED_ONLY
     PARTIAL: ClassVar[dict[str, str]] = PARTIAL
 
@@ -140,6 +153,10 @@ class AutonomyPolicy:
         Empty is the healthy answer: it means every 'off' in this policy is a
         gate you can watch close. Non-empty means part of this policy is a
         promise the implementation does not keep yet.
+
+        The four execution freedoms left this list when they became
+        CONFIRM_REQUIRED: `ToolRegistry.call` consults them on every run, so
+        switching one off now changes what happens next.
         """
         return [f for f in self.denied if f in DECLARED_ONLY or f in PARTIAL]
 
@@ -148,10 +165,13 @@ class AutonomyPolicy:
         head = "full autonomy — nothing is denied" if not d else "denied: " + ", ".join(d)
         inert = [f for f in d if f in DECLARED_ONLY]
         soft = [f for f in d if f in PARTIAL]
+        asked = [f for f in d if f in CONFIRM_REQUIRED]
         if inert:
             head += f"  [not enforced: {', '.join(inert)}]"
         if soft:
             head += f"  [partially enforced: {', '.join(soft)}]"
+        if asked:
+            head += f"  [asks before running: {', '.join(asked)}]"
         return head
 
     def enforcement_table(self) -> list[dict[str, Any]]:
@@ -162,6 +182,8 @@ class AutonomyPolicy:
                 level = "enforced"
             elif name in PARTIAL:
                 level = "partial"
+            elif name in CONFIRM_REQUIRED:
+                level = "confirm"
             elif name in DECLARED_ONLY:
                 level = "declared-only"
             else:                                    # pragma: no cover - guard
@@ -199,6 +221,7 @@ __all__ = [
     "FULL_FREEDOM",
     "SUPERVISED",
     "ENFORCED",
+    "CONFIRM_REQUIRED",
     "DECLARED_ONLY",
     "PARTIAL",
     "EXECUTION_FREEDOMS",

@@ -36,10 +36,12 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from . import configfile, setup_wizard
 from .agent import ForgeAgent
-from .autonomy.policy import FULL_FREEDOM, SUPERVISED, AutonomyPolicy
+from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
+                             AutonomyPolicy)
 from .core.llm import OpenAICompatClient
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
@@ -208,6 +210,53 @@ def _config(args: argparse.Namespace) -> dict:
     return _resolve(args)[0]
 
 
+class _TerminalConfirmer:
+    """Ask the operator, on the terminal, before a gated tool runs.
+
+    Answers the gate's three-way question: True (yes), False (no), None (nobody
+    to ask). Silence is never a yes — an empty line, a Ctrl-C, a closed stdin,
+    or a worker thread with a browser on the other end all answer None, and the
+    gate refuses on None.
+
+    The prompt names the switch, the tool and the arguments: an approval prompt
+    that does not say what is being approved trains its reader to say yes
+    without looking, which is worse than having no prompt at all.
+    """
+
+    def __init__(self, *, stream: Any = None) -> None:
+        self._stream = stream            # injectable so a test can read it back
+
+    def _usable(self) -> bool:
+        # A worker thread has no terminal of its own even when the process does.
+        # The web harness runs agents in threads, so prompting there would block
+        # a request on input nobody can see.
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        try:
+            return sys.stdin.isatty()
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    def __call__(self, tool: str, arguments: dict,
+                 freedoms: list[str]) -> bool | None:
+        if not self._usable():
+            return None
+        out = self._stream or sys.stdout
+        print(_c(_Y, "\n  -- confirmation gate --"), file=out)
+        print(f"  {tool!r} needs {', '.join(freedoms)}, which your policy has off.",
+              file=out)
+        if arguments:
+            shown = json.dumps(arguments, ensure_ascii=False, default=str)
+            print(f"  arguments: {shown[:400]}{'...' if len(shown) > 400 else ''}",
+                  file=out)
+        try:
+            reply = input(f"{_c(_C, 'allow>')} [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(file=out)
+            return None
+        return reply in ("y", "yes")
+
+
 def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
     llm = OpenAICompatClient(
         model=cfg["model"], base_url=cfg["base"], api_key=cfg["key"], timeout=600,
@@ -228,6 +277,7 @@ def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
         forge_config=ForgeConfig(promote_on_pass=True, max_rounds=2),
         policy=POLICIES.get(cfg.get("policy", "full"), FULL_FREEDOM),
         enable_meta_cognition=meta_cognition,
+        confirmer=_TerminalConfirmer(),
     )
     # __post_init__ built its own verifier; make both points honour --fast so
     # the agent can never disagree with itself about whether a tool passed.
@@ -259,7 +309,8 @@ def _build_mode(cfg: dict, mode: str = "standard"):
         # compares like with like. Under the default preset nothing changes:
         # bash stays ungated, which is what the comparison depends on.
         return MinimalAgent(llm=llm, cwd=os.getcwd(),
-                            policy=_policy_for(cfg.get("policy", "full")))
+                            policy=_policy_for(cfg.get("policy", "full")),
+                            confirmer=_TerminalConfirmer())
 
     agent = _build(cfg)
     # The CLI's `forge` writes JSON artifacts by hand; the harness wants the
@@ -702,14 +753,22 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     # Mirrors the agent's own my_capabilities: a policy that reads like a cage
     # while some of its fields are never consulted is worse than no policy.
+    # Three answers, not two — a denial can close a door, only narrow it, or
+    # turn it into a question, and printing the wrong one is its own small lie.
     preset = _policy_for(cfg["policy"])
     print(f"\n  {_c(_D, 'policy')}  {preset.describe()}")
+    asked = [f for f in preset.denied if f in CONFIRM_REQUIRED]
     inert = preset.unenforced
-    if inert:
-        print(_c(_Y, f"  not enforced by any code path: {', '.join(inert)}"))
-        print(_c(_D, "  (the sandbox does not consult the policy — DESIGN.md §2.5)"))
+    if not preset.denied:
+        print(_c(_D, "  nothing is denied in this preset"))
     else:
-        print(_c(_D, "  every denial in this preset is enforced"))
+        if asked:
+            print(_c(_D, f"  runs only after asking you: {', '.join(asked)}"))
+        if inert:
+            print(_c(_Y, f"  not enforced by any code path: {', '.join(inert)}"))
+            print(_c(_D, "  (partly enforced at best — DESIGN.md §8)"))
+        if not asked and not inert:
+            print(_c(_D, "  every denial in this preset is enforced"))
 
     origin = src.get("api_key", "")
     if not cfg["key"]:

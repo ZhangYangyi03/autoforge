@@ -16,6 +16,7 @@ Two ideas are borrowed from DeepSeek Harness because they are the right ones:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import queue
@@ -148,6 +149,10 @@ class Session:
         self._agent = None
         self._lock = threading.Lock()
         self._feed: list[queue.Queue] = []
+        # How many trace entries have already been streamed to subscribers.
+        # Tracked so a live observer can flush the tail without re-sending
+        # everything the page has already seen.
+        self._pushed = 0
 
     # -- lazy build so listing sessions is instant ------------------------
 
@@ -214,6 +219,47 @@ class Session:
 # --------------------------------------------------------------------------
 # the harness
 # --------------------------------------------------------------------------
+
+
+def _streamed_run(agent: Any, live: Any) -> tuple[Callable[..., Any], Callable[[], None]]:
+    """Call `agent.run` so its trace streams, whatever shape that agent is.
+
+    ForgeAgent takes an observer as a keyword; MinimalAgent (and anything else
+    written before the observer existed) does not, and passing it anyway would
+    turn a working turn into a TypeError. So: hand it over as an argument when
+    the signature accepts one, otherwise attach it to the attribute the agent's
+    own `_record` consults. Either way the trace is still pumped at the end, so
+    a mode with no observer at all degrades to the old batched behaviour rather
+    than to no trajectory.
+
+    Returns `(run, detach)`; `detach` always runs, even if the turn raised.
+    """
+    try:
+        params = inspect.signature(agent.run).parameters
+        accepts = "progress" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):                 # builtins, C callables
+        accepts = False
+
+    if accepts:
+        def run(text: str, history: Any = None) -> Any:
+            return agent.run(text, history=history, progress=live)
+
+        def detach() -> None:
+            return None
+
+        return run, detach
+
+    agent._progress = live                          # what ForgeAgent._record reads
+
+    def run(text: str, history: Any = None) -> Any:
+        return agent.run(text, history=history)
+
+    def detach() -> None:
+        agent._progress = None
+
+    return run, detach
 
 
 class Harness:
@@ -284,7 +330,13 @@ class Harness:
 
         def work() -> None:
             mark = len(session.agent.trace)
-            result = session.agent.run(text, history=session.history)
+            session._pushed = mark
+            live = self._live(session)
+            run, detach = _streamed_run(session.agent, live)
+            try:
+                result = run(text, history=session.history)
+            finally:
+                detach()
             self._pump_trace(session, mark)
             if result.content:
                 session.push(_event("assistant", text=result.content))
@@ -306,7 +358,16 @@ class Harness:
             if pipeline is None:
                 raise RuntimeError("this mode cannot forge (no pipeline mounted)")
             mark = len(agent.trace)
-            result = pipeline.forge(need)
+            session._pushed = mark
+            live = self._live(session)
+            # forge() takes no observer argument; it records through the agent,
+            # so attaching here is what makes the rounds stream instead of
+            # landing in one dump when the last round ends.
+            agent._progress = live
+            try:
+                result = pipeline.forge(need)
+            finally:
+                agent._progress = None
             self._pump_trace(session, mark)
             ok = bool(getattr(result, "ok", False))
             spec = getattr(result, "spec", None)      # ForgeResult.spec: ToolSpec | None
@@ -327,9 +388,32 @@ class Harness:
 
         threading.Thread(target=lambda: self._run(session, work), daemon=True).start()
 
+    # -- live streaming ---------------------------------------------------
+    def _live(self, session: Session) -> Callable[[str, dict], None]:
+        """Push trace entries to subscribers the moment they are recorded.
+
+        Without this the console showed "user said X" and then nothing at all
+        until the whole run finished: a 40s model call and a wedged process
+        were indistinguishable in the browser, exactly as they were in the CLI
+        before it got an observer. `ForgeAgent._record` appends to the trace
+        *before* calling the observer, so whatever is new on the trace is
+        already safe to send.
+        """
+        def on_event(_kind: str, _payload: dict) -> None:
+            self._flush(session)
+        return on_event
+
+    def _flush(self, session: Session) -> None:
+        trace = session.agent.trace
+        while session._pushed < len(trace):
+            session.push(_normalise(trace[session._pushed]))
+            session._pushed += 1
+
     def _pump_trace(self, session: Session, mark: int) -> None:
-        for raw in session.agent.trace[mark:]:
-            session.push(_normalise(raw))
+        """Backstop for anything recorded without a live observer attached."""
+        if session._pushed < mark:
+            session._pushed = mark
+        self._flush(session)
 
     @staticmethod
     def _checks(result: Any) -> list[dict[str, Any]]:
