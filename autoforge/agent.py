@@ -39,6 +39,7 @@ from .autonomy.policy import FULL_FREEDOM, AutonomyPolicy
 from .autonomy.selfmod import Amendment, SelfModifier
 from .autonomy.spawn import ShareMode, Spawner
 from .autonomy.topology import Topology, TopologyDesigner
+from .configfile import load
 from .core.agent import Agent, AgentResult
 from .core.llm import LLMClient
 from .core.message import Message
@@ -49,6 +50,7 @@ from .forge.pipeline import ForgeConfig, ForgePipeline
 from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
+from .mcp import MCPClient, MCPHub, servers_from_config
 from .route.router import BehaviourRouter, RoutingWeights
 from .skills import SkillError, SkillLibrary
 from .store import ToolStore
@@ -76,6 +78,8 @@ You can:
   you on every turn, so do not recall what is already listed above
 - skill_view     — load a procedure I wrote down earlier; skill_write saves
   one. Facts go in memory, how-to goes in a skill.
+- mcp_servers    — tools from processes whose code I cannot read; configured,
+  not started. Nothing here wrote or probed them, so they gate as undeclared.
 - forge_tool     — create a tool for a need you cannot serve
 - evolve_tool    — breed a better version of a weak tool
 - spawn_agent    — a child agent for a subtask
@@ -328,6 +332,15 @@ BUILTIN_SCOPES: dict[str, str] = {
     "gpu_occupancy": "read_only",
     "gpu_units_audit": "read_only",
     "gpu_verify": "read_only",
+    # Reading what other processes offer. Nothing is started by either of these
+    # two beyond what the config already described.
+    "mcp_servers": "read_only",
+    # Connecting starts a subprocess, so it declares the scope that covers
+    # that. The tools it then imports are a separate question: they carry
+    # `undeclared` unless the operator narrowed them in the config, because
+    # their code is not here to read.
+    "mcp_connect": "system",
+    "mcp_call": "system",
 }
 
 
@@ -380,6 +393,13 @@ class ForgeAgent:
             on_event=self._on_forge_event,
         )
         self.router = BehaviourRouter(self.registry)
+
+        # MCP: servers named in the config file, none of them started yet. The
+        # hub is built here so its caches are per-agent, but no subprocess is
+        # spawned until the agent asks for one -- a config entry says how to
+        # reach a server, not that it should be running.
+        self.mcp_servers, self._mcp_problems = servers_from_config(load())
+        self.mcp = MCPHub(self.mcp_servers)
 
         # Skills: procedures on disk, ranked by how often they were loaded.
         # Scanned at construction because the prompt menu is built per run, and
@@ -444,6 +464,7 @@ class ForgeAgent:
         self._tool_history()
         self._tool_memory()
         self._tool_skills()
+        self._tool_mcp()
         self._tool_gpu()
 
     def _add(self, spec: ToolSpec) -> None:
@@ -1328,6 +1349,163 @@ class ForgeAgent:
             description="Why a skill file is being skipped rather than offered.",
             parameters={"type": "object", "properties": {}},
             fn=skill_errors, source="builtin", tags=["meta"], effect_signature="read_only",
+        ))
+
+    def _tool_mcp(self) -> None:
+        """Servers: tools that live in other processes and other people's code.
+
+        The distinction the docstrings here have to make is between a tool this
+        framework forged — code we can read, probe, and hold to a declared
+        scope — and a tool that arrives over a pipe from a server we cannot see
+        into. The second kind is not a lesser version of the first; it is
+        unverifiable, and the honest response is to say so on every surface the
+        agent reads: the spec's `verification` block, the tool's description,
+        and the scope it is gated by.
+
+        Nothing is started here. A config entry is a description of how to
+        reach a server, not a request to run it — an agent that spawns
+        subprocesses at boot because a config file mentioned them would be
+        doing work the operator did not ask for, on every start.
+        """
+
+        def mcp_servers() -> str:
+            """What MCP servers are configured, and what happened to them."""
+            problems = list(self.mcp.report.problems) + list(self._mcp_problems)
+            if not self.mcp_servers:
+                # A config entry that failed to parse must not be reported as
+                # "nothing configured" -- the operator wrote something, and
+                # telling them the file is empty sends them to look in the
+                # wrong place. The problems are the whole message in this case.
+                if problems:
+                    return ("No MCP server could be read from the config. "
+                            "Problems:\n  " + "\n  ".join(problems))
+                return ("No MCP servers are configured. Add them under "
+                        "`mcp.servers` in the config file, then mcp_connect.")
+            lines = [f"{len(self.mcp_servers)} server(s) configured:"]
+            for cfg in self.mcp_servers:
+                client = self.mcp.clients.get(cfg.name)
+                if client is None:
+                    state = "not started"
+                elif client.alive:
+                    state = (f"running, {len(client.tools)} tool(s) offered, "
+                             f"protocol {client.protocol or '?'}")
+                else:
+                    state = f"stopped ({client.error or 'not started'})"
+                lines.append(f"  {cfg.name} [{state}] {cfg.command} "
+                             f"{' '.join(cfg.args)}")
+                lines.append(f"    scope for its tools: {cfg.scope}")
+            if self.mcp.report.imported:
+                lines.append(f"imported: {', '.join(self.mcp.report.imported)}")
+            for problem in self.mcp.report.problems or self._mcp_problems:
+                lines.append(f"  problem: {problem}")
+            lines.append(
+                "Their tools are not verified: the implementation is not in "
+                "this repository, so nothing here probed it. They are gated as "
+                "undeclared unless the config narrows them."
+            )
+            return "\n".join(lines)
+
+        def mcp_connect(server: str = "") -> str:
+            """Start a configured server and register its tools here."""
+            if not self.mcp_servers:
+                return ("No MCP servers are configured, so there is nothing to "
+                        "connect to. Add one under `mcp.servers` first.")
+            names = [s.name for s in self.mcp_servers]
+            if server and server not in names:
+                return (f"No server named {server!r}. Configured: "
+                        f"{', '.join(names) or 'none'}.")
+
+            before = set(self.registry.names())
+            report = self.mcp.install(self.registry, only=[server] if server else None)
+            added = sorted(set(self.registry.names()) - before)
+            lines = [report.summary()]
+            if added:
+                lines.append(f"registered: {', '.join(added)}")
+            for problem in report.problems:
+                lines.append(f"problem: {problem}")
+            if not added and not report.problems:
+                lines.append("No tools were offered by the server(s) reached.")
+            lines.append(
+                "These tools are unverified and gated as undeclared: nothing "
+                "here has probed the code behind them."
+            )
+            return "\n".join(lines)
+
+        def mcp_call(server: str, tool: str, arguments: str = "{}") -> str:
+            """Call a remote tool directly, without importing it first."""
+            import json as _json
+
+            found = [c for c in self.mcp_servers if c.name == server]
+            if not found:
+                return (f"No server named {server!r}. Configured: "
+                        f"{', '.join(s.name for s in self.mcp_servers) or 'none'}.")
+            try:
+                args = _json.loads(arguments or "{}")
+            except ValueError as exc:
+                return f"arguments must be a JSON object: {exc}"
+            if not isinstance(args, dict):
+                return f"arguments must be a JSON object, got {type(args).__name__}"
+
+            client = self.mcp.clients.get(server)
+            if client is None:
+                client = MCPClient(found[0])
+                self.mcp.clients[server] = client
+            from .mcp import MCPError, render_result
+
+            try:
+                result = client.call_tool(tool, args)
+            except MCPError as exc:
+                raise RuntimeError(f"{server} refused {tool!r}: {exc}") from exc
+            ok, text = render_result(result)
+            if not ok:
+                # Raise rather than return the text: a string return would come
+                # back through the registry as ok=True, so the server's own
+                # report of failure would arrive at the agent looking like a
+                # success with an odd-looking payload.
+                raise RuntimeError(f"{tool!r} reported failure: {text}")
+            return text
+
+        self._add(ToolSpec(
+            name="mcp_servers",
+            description=(
+                "List the MCP servers configured for me, whether they are "
+                "running, what tools they offer, and what went wrong with any "
+                "that did not start. They are tools from code I cannot read."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=mcp_servers, source="builtin", tags=["meta"],
+            effect_signature="read_only",
+        ))
+        self._add(ToolSpec(
+            name="mcp_connect",
+            description=(
+                "Start a configured MCP server and register the tools it "
+                "offers, so they can be called like any other tool. Omitting "
+                "the name connects every configured server. Imported tools are "
+                "unverified and gated as undeclared — their code is not here."
+            ),
+            parameters={"type": "object", "properties": {
+                "server": {"type": "string",
+                           "description": "server name (optional; default all)"},
+            }},
+            fn=mcp_connect, source="builtin", tags=["meta"],
+            effect_signature="system",     # it starts a subprocess
+        ))
+        self._add(ToolSpec(
+            name="mcp_call",
+            description=(
+                "Call one tool on a configured MCP server without importing "
+                "it, as JSON arguments. For a one-off; use mcp_connect when "
+                "the tool will be wanted again."
+            ),
+            parameters={"type": "object", "properties": {
+                "server": {"type": "string", "description": "server name"},
+                "tool": {"type": "string", "description": "tool name on that server"},
+                "arguments": {"type": "string",
+                              "description": "JSON object of arguments (optional)"},
+            }, "required": ["server", "tool"]},
+            fn=mcp_call, source="builtin", tags=["meta"],
+            effect_signature="system",
         ))
 
     def _self_report(self) -> str:

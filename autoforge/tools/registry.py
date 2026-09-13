@@ -133,6 +133,20 @@ class ToolRegistry:
                 out = spec.runner(name, arguments)
             else:
                 out = spec.fn(**arguments)
+            # A runner may answer with a ToolResult of its own. `spec.runner`
+            # is documented as `ToolResult-ish` and an out-of-process tool
+            # knows its own failure semantics better than we can infer them
+            # -- an MCP server's `isError` is not an exception, and a sandbox
+            # timeout is not an empty success. Without this branch the object
+            # fell through to `json.dumps`, so the registry reported ok=True
+            # and an `output` of the dataclass repr: a failure laundered into
+            # a success with the real error buried in a string.
+            if isinstance(out, ToolResult):
+                out.duration_ms = (time.perf_counter() - started) * 1000
+                spec.stats.record_call(out.ok, out.error)
+                if self.auto_quarantine:
+                    self._maybe_quarantine(spec)
+                return out
             if out is None:
                 out = ""
             elif not isinstance(out, str):
