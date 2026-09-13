@@ -57,7 +57,8 @@ from .forge.pipeline import ForgeConfig, ForgePipeline
 from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
-from .mcp import MCPClient, MCPHub, servers_from_config
+from .mcp import MCPClient, MCPHub
+from .ecosystem import merged_servers, read_all as ecosystem_read_all
 from .browser import (
     Browser,
     BrowserError,
@@ -454,11 +455,14 @@ class ForgeAgent:
         )
         self.router = BehaviourRouter(self.registry)
 
-        # MCP: servers named in the config file, none of them started yet. The
-        # hub is built here so its caches are per-agent, but no subprocess is
-        # spawned until the agent asks for one -- a config entry says how to
-        # reach a server, not that it should be running.
-        self.mcp_servers, self._mcp_problems = servers_from_config(load())
+        # MCP: servers named in the config file, plus -- when the config asks
+        # for it -- the ones the other agents on this machine already have.
+        # None of them started yet. The hub is built here so its caches are
+        # per-agent, but no subprocess is spawned until the agent asks for one:
+        # a config entry says how to reach a server, not that it should be
+        # running. `merged_servers` reads the ecosystem only if
+        # `mcp.ecosystem` is on, so the default costs one dict lookup.
+        self.mcp_servers, self._mcp_problems = merged_servers(load())
 
         # Reaching a human. Built from the config at construction for the same
         # reason MCP servers are: a config entry says how to reach someone, not
