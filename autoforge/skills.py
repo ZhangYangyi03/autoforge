@@ -1,0 +1,413 @@
+"""Skills: procedural knowledge the agent keeps as files and finds by use.
+
+Tools answer "what can be done here". Skills answer "how this is done here" —
+the sequence, the pitfalls, the thing that went wrong last time. The agent had
+plenty of the first and none of the second, which is why it re-derived the same
+approach every session and could not tell a procedure it had run forty times
+from one it had never tried.
+
+Two decisions shape everything below.
+
+*The files own the content.* A skill is markdown with a frontmatter header, on
+disk, in a directory a human can open and edit. No part of a skill's text lives
+only in the database, so a skill outlives the agent that wrote it.
+
+*The database owns the history.* `loads` counts how often the agent actually
+opened a skill. That counter is what makes retrieval behavioural rather than
+lexical: a procedure that keeps getting reached for outranks one that merely
+reads as relevant. The counter is written by the act of loading, so it cannot
+drift away from what happened.
+
+Progressive disclosure: the prompt carries a menu — name, when-to-use, load
+count — and never the bodies. A library of forty skills costs forty lines, and
+the agent pays for a body only when it decides to read one. That decision is
+the retrieval event, which is why the menu is not a summary of the library but
+the index of it.
+"""
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .store import _default_home
+
+SKILL_SUFFIX = ".md"
+ARCHIVE_DIR = ".archive"
+ENV_DIRS = "AUTOFORGE_SKILLS_DIRS"
+
+MENU_LINE_CHARS = 160      # per-entry cap in the prompt menu
+MENU_BUDGET_CHARS = 1400   # whole-menu cap, for the same reason memory has one
+
+
+class SkillError(ValueError):
+    """A skill file that cannot be used as written."""
+
+
+# ---------------------------------------------------------------------------
+@dataclass
+class Skill:
+    """One skill, as read from disk, with its usage history from the store."""
+
+    name: str
+    description: str
+    when_to_use: str
+    body: str
+    path: str
+    source: str = "user"
+    tags: list[str] = field(default_factory=list)
+    loads: int = 0
+    last_loaded: float | None = None
+
+    def menu_line(self) -> str:
+        """One line for the prompt: what it is, when to reach for it, how proven.
+
+        The load count is shown because it is real information the agent can act
+        on: a procedure used twenty times is a different bet from one that has
+        never run. Hiding it would make the menu look like an equal menu.
+        """
+        when = self.when_to_use or self.description
+        if len(when) > MENU_LINE_CHARS:
+            when = when[:MENU_LINE_CHARS].rstrip() + " ..."
+        if self.loads:
+            use = f"used {self.loads}x"
+        else:
+            use = "never used"
+        return f"    {self.name} ({use}) -- {when}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name, "description": self.description,
+            "when_to_use": self.when_to_use, "tags": list(self.tags),
+            "source": self.source, "path": self.path, "loads": self.loads,
+            "last_loaded": self.last_loaded, "body_chars": len(self.body),
+        }
+
+
+# ---------------------------------------------------------------------------
+# frontmatter -- hand-parsed, no dependency, and strict enough to catch a file
+# that would otherwise be silently misread as having no description.
+# ---------------------------------------------------------------------------
+def split_frontmatter(text: str, *, origin: str = "") -> tuple[dict[str, str], str]:
+    """Split `---`-fenced frontmatter from the body.
+
+    Raises SkillError rather than guessing when the fence is missing or
+    unterminated: a file whose header was silently ignored would present as a
+    skill with no description, which is a routing bug that looks like a content
+    bug, and those take an afternoon to tell apart.
+    """
+    lines = text.splitlines()
+    where = f" ({origin})" if origin else ""
+    if not lines or lines[0].strip() != "---":
+        raise SkillError(
+            f"skill{where} does not start with a '---' frontmatter line")
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return _parse_meta(lines[1:i], origin=origin), _join_body(lines[i + 1:])
+    raise SkillError(f"skill{where} has frontmatter with no closing '---'")
+
+
+def _join_body(lines: list[str]) -> str:
+    return "\n".join(lines).strip("\n")
+
+
+def _parse_meta(lines: list[str], *, origin: str = "") -> dict[str, str]:
+    meta: dict[str, str] = {}
+    where = f" ({origin})" if origin else ""
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise SkillError(
+                f"skill{where} frontmatter line is not 'key: value': {raw!r}")
+        key, _, value = line.partition(":")
+        k = key.strip().lower().replace("-", "_")
+        v = value.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]                      # quoted value: strip the quotes
+        meta[k] = v
+    if not meta.get("description"):
+        raise SkillError(f"skill{where} has no description, so it cannot be routed")
+    return meta
+
+
+def parse_tags(raw: str) -> list[str]:
+    """Tags are comma-separated, because that is what a human types."""
+    return [t.strip() for t in (raw or "").split(",") if t.strip()]
+
+
+def render_skill_text(name: str, description: str, when_to_use: str,
+                      tags: list[str], body: str) -> str:
+    """Serialise a skill back to the on-disk format. Round-trips through parse."""
+    lines = ["---", f"name: {name}", f"description: {description}"]
+    if when_to_use:
+        lines.append(f"when_to_use: {when_to_use}")
+    if tags:
+        lines.append("tags: " + ", ".join(tags))
+    lines.append("---")
+    lines.append("")
+    lines.append(body.rstrip() or f"# {name}")
+    return "\n".join(lines) + "\n"
+
+
+def valid_name(name: str) -> bool:
+    """Lower-case, hyphens/underscores/digits — a filename a human can type.
+
+    Enforced rather than sanitised: silently rewriting `My Skill!` into
+    `my-skill` would leave the agent unable to find the skill it just wrote,
+    which reads as a broken write rather than as a rejected name.
+    """
+    if not name or len(name) > 64:
+        return False
+    if name[0] == "-" or name[0] == "_":
+        return False
+    return all(c.islower() or c.isdigit() or c in "-_" for c in name)
+
+
+# ---------------------------------------------------------------------------
+def default_skill_dirs(cwd: str | None = None, home: str | None = None
+                       ) -> list[tuple[str, str]]:
+    """Where skills are looked for, most specific first: (source, path).
+
+    Project before user, because a project's conventions should beat a general
+    one of the same name — and a shadowed skill is reported rather than hidden,
+    so "why is my edit not taking effect" has an answer on the first look.
+    """
+    env = os.environ.get(ENV_DIRS)
+    if env:
+        out = []
+        for i, part in enumerate(env.split(os.pathsep)):
+            if part.strip():
+                out.append((f"env{i}" if i else "env", os.path.abspath(part.strip())))
+        return out
+    home = home or _default_home()
+    cwd = cwd or os.getcwd()
+    dirs = [(("project"), os.path.join(os.path.abspath(cwd), "skills"))]
+    dirs.append(("user", os.path.join(home, "skills")))
+    return dirs
+
+
+# ---------------------------------------------------------------------------
+class SkillLibrary:
+    """Skills on disk, plus the usage history that makes them rankable."""
+
+    def __init__(self, store: Any = None, dirs: list[tuple[str, str]] | None = None,
+                 cwd: str | None = None) -> None:
+        self.store = store
+        self.dirs = dirs if dirs is not None else default_skill_dirs(cwd=cwd)
+        self._skills: dict[str, Skill] = {}
+        self.errors: list[str] = []       # unreadable files, with the reason
+        self.shadowed: list[tuple[str, str]] = []   # (name, winning path)
+
+    # -- reading ----------------------------------------------------------
+    def dirs_present(self) -> list[tuple[str, str]]:
+        return [(s, p) for s, p in self.dirs if os.path.isdir(p)]
+
+    def scan(self) -> list[Skill]:
+        """Read every skill directory. Content comes from disk, always.
+
+        Errors are collected, never raised: one malformed file among forty must
+        not cost the agent the other thirty-nine, and a silent skip would let
+        the agent believe it has no skill for a task it has one for.
+        """
+        found: dict[str, Skill] = {}
+        self.errors = []
+        self.shadowed = []
+        for source, directory in self.dirs:
+            if not os.path.isdir(directory):
+                continue
+            for path in sorted(Path(directory).glob("*" + SKILL_SUFFIX)):
+                try:
+                    skill = self._read(path, source)
+                except SkillError as exc:
+                    self.errors.append(str(exc))
+                    continue
+                except OSError as exc:
+                    self.errors.append(f"skill {path} is unreadable: {exc}")
+                    continue
+                prior = found.get(skill.name)
+                if prior is not None:
+                    self.shadowed.append((skill.name, prior.path))
+                    continue
+                found[skill.name] = skill
+
+        # usage history is attached last, so a load count can never be
+        # overwritten by whatever the file happens to say about itself.
+        if self.store is not None:
+            known = {r["name"]: r for r in self.store.skill_rows()}
+            for name, skill in found.items():
+                row = known.get(name)
+                if row is not None:
+                    skill.loads = int(row["loads"])
+                    skill.last_loaded = row["last_loaded"]
+                self.store.upsert_skill(
+                    skill.name, skill.path, skill.source, skill.description,
+                    skill.when_to_use, skill.tags)
+            for stale in set(known) - set(found):
+                self.store.forget_skill_row(stale)
+        self._skills = found
+        return self.all()
+
+    def _read(self, path: Path, source: str) -> Skill:
+        text = path.read_text(encoding="utf-8")
+        meta, body = split_frontmatter(text, origin=str(path))
+        name = (meta.get("name") or path.stem).strip()
+        if not valid_name(name):
+            raise SkillError(
+                f"skill {path} has an unusable name {name!r}: use lower-case "
+                "letters, digits, hyphens or underscores")
+        return Skill(
+            name=name, description=meta["description"],
+            when_to_use=meta.get("when_to_use", ""), body=body, path=str(path),
+            source=source, tags=parse_tags(meta.get("tags", "")),
+        )
+
+    def all(self) -> list[Skill]:
+        """Every skill, most-used first — the order the router blends on."""
+        return sorted(self._skills.values(),
+                      key=lambda s: (-s.loads, s.name))
+
+    def get(self, name: str) -> Skill | None:
+        return self._skills.get(name)
+
+    def load(self, name: str) -> Skill | None:
+        """Read a skill whole, and count that as the retrieval event it is.
+
+        The counter is bumped here and not by `scan`, so "used" means the agent
+        actually opened it. A menu that scores a skill it never reads would be
+        measuring the library, not the agent.
+        """
+        skill = self._skills.get(name)
+        if skill is None:
+            return None
+        if self.store is not None:
+            n = self.store.skill_load(name)
+            if n:
+                skill.loads = n
+        skill.last_loaded = time.time()
+        return skill
+
+    # -- writing ----------------------------------------------------------
+    def _target_dir(self, name: str, scope: str) -> str:
+        """Where a write for `name` goes: in place if it exists, else `scope`.
+
+        Editing in place is deliberate. Writing a same-named skill into a
+        different directory would shadow the file the agent just read, and the
+        symptom — "I edited it and nothing changed" — points at everything
+        except the cause.
+        """
+        existing = self._skills.get(name)
+        if existing is not None:
+            return os.path.dirname(existing.path)
+        for source, directory in reversed(self.dirs):
+            if source == scope:
+                return directory
+        return self.dirs[-1][1]
+
+    def write(self, name: str, description: str, when_to_use: str = "",
+              body: str = "", tags: list[str] | None = None,
+              scope: str = "user") -> Skill:
+        """Create or update a skill file, and index it straight away."""
+        if not valid_name(name):
+            raise SkillError(
+                f"unusable skill name {name!r}: lower-case letters, digits, "
+                "hyphens or underscores, starting with a letter or digit")
+        if not (description or "").strip():
+            raise SkillError("a skill needs a description or it cannot be routed")
+        target_dir = self._target_dir(name, scope)
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, name + SKILL_SUFFIX)
+        existing = self._skills.get(name)
+        text = render_skill_text(name, description.strip(), when_to_use.strip(),
+                                 list(tags or []), body)
+        # write to a sibling then move, so a crash mid-write cannot leave a
+        # half-file where a skill used to be.
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        skill = self._read(Path(path), existing.source if existing else scope)
+        if existing is not None:
+            skill.loads = existing.loads
+            skill.last_loaded = existing.last_loaded
+        self._skills[name] = skill
+        if self.store is not None:
+            self.store.upsert_skill(skill.name, skill.path, skill.source,
+                                    skill.description, skill.when_to_use,
+                                    skill.tags)
+        return skill
+
+    def archive(self, name: str) -> str:
+        """Move a skill out of the library without destroying it.
+
+        Archive rather than delete: a skill is a written-down procedure whose
+        value is precisely that it outlives the moment it was written. Its row
+        goes, because a retired skill that still ranks is worse than one that
+        never existed. A clashing archive name gets a timestamp, never an
+        overwrite.
+        """
+        skill = self._skills.get(name)
+        if skill is None:
+            raise SkillError(f"no skill named {name!r}")
+        src = Path(skill.path)
+        dest_dir = src.parent / ARCHIVE_DIR
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        if dest.exists():
+            dest = dest_dir / f"{src.stem}-{int(time.time())}{src.suffix}"
+        os.replace(src, dest)
+        self._skills.pop(name, None)
+        if self.store is not None:
+            self.store.forget_skill_row(name)
+        return str(dest)
+
+    # -- prompt surface ---------------------------------------------------
+    def menu(self, budget: int = MENU_BUDGET_CHARS) -> list[str]:
+        """The index lines that ride in every prompt. Bodies never do.
+
+        Bounded, and it says when it truncated: an agent that cannot see its
+        own menu was cut will conclude it has no procedure for a task it does
+        have one for, which is the failure this whole module exists to fix.
+        """
+        skills = self.all()
+        if not skills:
+            return ["- Skills: none yet (skill_write(name, description, body) "
+                    "saves one)."]
+        lines = ["- Skills (procedures; skill_view(name) reads one in full):"]
+        shown = 0
+        used = 0
+        for skill in skills:
+            line = skill.menu_line()
+            if shown and used + len(line) > budget:
+                break
+            lines.append(line)
+            used += len(line)
+            shown += 1
+        rest = len(skills) - shown
+        if rest:
+            lines.append(f"    (+{rest} more -- skill_list reads them all)")
+        return lines
+
+    def report(self) -> dict[str, Any]:
+        """Facts for the agent's self-model, measured rather than asserted."""
+        skills = self.all()
+        return {
+            "skills": len(skills),
+            "loads_total": sum(s.loads for s in skills),
+            "never_loaded": [s.name for s in skills if not s.loads],
+            "most_used": [s.name for s in skills[:3] if s.loads],
+            "dirs": [d for _, d in self.dirs_present()],
+            "unreadable": list(self.errors),
+            "shadowed": [name for name, _ in self.shadowed],
+            "backend": "markdown on disk; usage in the store",
+        }
+
+
+__all__ = [
+    "Skill", "SkillLibrary", "SkillError", "default_skill_dirs",
+    "render_skill_text", "split_frontmatter", "valid_name",
+    "parse_tags", "SKILL_SUFFIX", "ARCHIVE_DIR", "MENU_BUDGET_CHARS",
+]

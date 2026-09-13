@@ -81,6 +81,23 @@ _DDL = (
     "\n    updated_at REAL NOT NULL,"
     "\n    recalls INTEGER NOT NULL DEFAULT 0"
     "\n);"
+    # Skill usage. The markdown files own the *content* -- they are what the
+    # agent reads and what a human edits. This table owns the *history*: how
+    # often each skill was actually loaded, which is the signal the router
+    # scores on. Two sources of truth by design, split along that line:
+    # re-scanning the directory refreshes content and never resets counters.
+    "\nCREATE TABLE IF NOT EXISTS skills ("
+    "\n    name TEXT NOT NULL PRIMARY KEY,"
+    "\n    path TEXT NOT NULL DEFAULT '',"
+    "\n    source TEXT NOT NULL DEFAULT 'user',"
+    "\n    description TEXT NOT NULL DEFAULT '',"
+    "\n    when_to_use TEXT NOT NULL DEFAULT '',"
+    "\n    tags TEXT NOT NULL DEFAULT '[]',"
+    "\n    loads INTEGER NOT NULL DEFAULT 0,"
+    "\n    last_loaded REAL,"
+    "\n    created_at REAL NOT NULL,"
+    "\n    updated_at REAL NOT NULL"
+    "\n);"
 )
 
 
@@ -480,6 +497,76 @@ class ToolStore:
             for r in rows
         ]
 
+    # -- skills (usage history; the content lives in markdown on disk) -----
+    def upsert_skill(self, name: str, path: str, source: str, description: str,
+                     when_to_use: str, tags: list[str]) -> None:
+        """Refresh a skill's metadata, preserving the counters.
+
+        Called on every scan of the skills directories. The counters are the
+        reason this table exists, so a re-scan must never reset them: a skill
+        loaded forty times is a different candidate from one that has never
+        run, and the router scores that difference. Content fields are
+        overwritten — the file is what the agent and the human edit — while
+        `loads` and `last_loaded` survive untouched.
+        """
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO skills (name, path, source, description, when_to_use,"
+            " tags, loads, last_loaded, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET"
+            " path=excluded.path, source=excluded.source,"
+            " description=excluded.description,"
+            " when_to_use=excluded.when_to_use,"
+            " tags=excluded.tags, updated_at=excluded.updated_at",
+            (name, path, source, description, when_to_use, _j(list(tags)), now, now),
+        )
+        self._conn.commit()
+
+    def skill_rows(self) -> list[dict[str, Any]]:
+        """Every known skill, most-loaded first — the order the router blends."""
+        rows = self._conn.execute(
+            "SELECT * FROM skills ORDER BY loads DESC, name ASC").fetchall()
+        return [
+            {
+                "name": r["name"], "path": r["path"], "source": r["source"],
+                "description": r["description"], "when_to_use": r["when_to_use"],
+                "tags": _unjson(r["tags"]) or [], "loads": r["loads"],
+                "last_loaded": r["last_loaded"], "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def skill_load(self, name: str) -> int:
+        """Count one load. Returns the new count, or 0 if there is no such skill.
+
+        A skill the agent never loads and a skill that was never written look
+        identical from the outside; this counter is how they are told apart,
+        so it is bumped by the load itself rather than inferred later.
+        """
+        row = self._conn.execute(
+            "SELECT loads FROM skills WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return 0
+        n = int(row["loads"]) + 1
+        self._conn.execute(
+            "UPDATE skills SET loads=?, last_loaded=? WHERE name=?",
+            (n, _now(), name))
+        self._conn.commit()
+        return n
+
+    def forget_skill_row(self, name: str) -> bool:
+        """Drop a skill's row. The caller archives the file; usage goes with it.
+
+        Kept separate from archiving because they can diverge: a skill file
+        that a human deleted out from under the agent should lose its row on
+        the next scan without any archiving happening.
+        """
+        cur = self._conn.execute("DELETE FROM skills WHERE name=?", (name,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # -- self-report ------------------------------------------------------
     def report(self) -> dict[str, Any]:
         """What this store actually persists — facts, for the agent's self-model.
@@ -512,6 +599,10 @@ class ToolStore:
             "events": events,
             "event_kinds": kinds,
             "memories": _one("SELECT COUNT(*) FROM memory") or 0,
+            "skills": _one("SELECT COUNT(*) FROM skills") or 0,
+            "skill_loads": _one("SELECT SUM(loads) FROM skills") or 0,
+            "skills_never_loaded": _one(
+                "SELECT COUNT(*) FROM skills WHERE loads = 0") or 0,
             "since": _one("SELECT MIN(timestamp) FROM forge_events"),
             "until": _one("SELECT MAX(timestamp) FROM forge_events"),
         }

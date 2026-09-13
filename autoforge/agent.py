@@ -50,6 +50,7 @@ from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .route.router import BehaviourRouter, RoutingWeights
+from .skills import SkillError, SkillLibrary
 from .store import ToolStore
 from .tools.registry import ToolRegistry
 from .tools.spec import ToolSpec, ToolState
@@ -73,6 +74,8 @@ You can:
 - my_history     — your ledger: past forges, runs, self-changes
 - remember       — keep a fact across sessions; kept facts are put in front of
   you on every turn, so do not recall what is already listed above
+- skill_view     — load a procedure I wrote down earlier; skill_write saves
+  one. Facts go in memory, how-to goes in a skill.
 - forge_tool     — create a tool for a need you cannot serve
 - evolve_tool    — breed a better version of a weak tool
 - spawn_agent    — a child agent for a subtask
@@ -298,6 +301,13 @@ BUILTIN_SCOPES: dict[str, str] = {
     "my_history": "read_only",
     "list_tools": "read_only",
     "find_gaps": "read_only",
+    # Procedures. Reading one is a read; writing or retiring one edits a file
+    # under the skills directories and the index row that points at it.
+    "skill_list": "read_only",
+    "skill_view": "read_only",
+    "skill_errors": "read_only",
+    "skill_write": "local_write",
+    "skill_forget": "local_write",
     # Self-modification writes the agent's own policy, prompt or store.
     "amend_self": "local_write",
     "set_autonomy": "local_write",
@@ -371,6 +381,18 @@ class ForgeAgent:
         )
         self.router = BehaviourRouter(self.registry)
 
+        # Skills: procedures on disk, ranked by how often they were loaded.
+        # Scanned at construction because the prompt menu is built per run, and
+        # a menu assembled from a stale scan would offer procedures that are no
+        # longer there — worse than offering none.
+        self.skills = SkillLibrary(store=self.store)
+        try:
+            self.skills.scan()
+        except OSError:
+            # An unreadable skills directory is not a reason to refuse to run.
+            # The library records the failure and reports it in the menu.
+            pass
+
         # unlimited_turns is the agent's own claim on unbounded loops. When it
         # is off, an unbounded request gets a real ceiling instead of the
         # "there is no hidden turn limit" the prompt promises. Set explicitly
@@ -421,6 +443,7 @@ class ForgeAgent:
         self._tool_capabilities()
         self._tool_history()
         self._tool_memory()
+        self._tool_skills()
         self._tool_gpu()
 
     def _add(self, spec: ToolSpec) -> None:
@@ -1162,6 +1185,151 @@ class ForgeAgent:
             body.append(f"    (+{dropped} more kept — recall() reads the rest)")
         return [head, *body]
 
+    def _tool_skills(self) -> None:
+        """Procedures: what worked, written down, and read when the need recurs.
+
+        Tools and skills are different questions. A tool is *what can be done*;
+        a skill is *how this is done here* — the order, the pitfall, the flag
+        that bit last time. Forging a tool for a procedure was always possible
+        and wrong: a procedure is not a function, and a library of one-off tools
+        is how the registry filled up with things nobody called twice.
+
+        Loading is the retrieval event, and it is counted at the moment of
+        reading. That is the whole reason a skill can be ranked by behaviour:
+        the number the router scores is a record of the agent having reached
+        for it, not of it having been written down.
+        """
+
+        def skill_list(query: str = "") -> str:
+            """Every skill I have, with when to use it and how often I have."""
+            self.skills.scan()
+            skills = self.skills.all()
+            if query:
+                needle = query.lower()
+                skills = [s for s in skills if needle in
+                          f"{s.name} {s.description} {s.when_to_use} "
+                          f"{' '.join(s.tags)}".lower()]
+            if not skills:
+                return (f"No skills match {query!r}." if query
+                        else "No skills yet — skill_write saves one.")
+            head = f"{len(skills)} skill(s):"
+            lines = [head]
+            for s in skills:
+                when = s.when_to_use or s.description
+                lines.append(f"  {s.name} [{s.loads}x] {when}")
+            if self.skills.errors:
+                lines.append(f"  ({len(self.skills.errors)} file(s) unusable — "
+                             f"skill_errors reads why)")
+            return "\n".join(lines)
+
+        def skill_view(name: str) -> str:
+            """Read one skill in full, and count that as having used it."""
+            self.skills.scan()
+            skill = self.skills.load(name)
+            if skill is None:
+                near = [s.name for s in self.skills.all()
+                        if name.lower() in s.name.lower()]
+                hint = f" Closest: {', '.join(near)}." if near else ""
+                return f"No skill named {name!r}.{hint}"
+            self._record("skill_view", {"name": name, "loads": skill.loads})
+            return (f"# {skill.name}  ({skill.loads} load(s), {skill.source}, "
+                    f"{skill.path})\n\n{skill.body}")
+
+        def skill_write(name: str, description: str, body: str,
+                        when_to_use: str = "", tags: str = "") -> str:
+            """Write a procedure down, for the next time this need appears."""
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            try:
+                skill = self.skills.write(name, description, when_to_use,
+                                          body, tag_list)
+            except SkillError as exc:
+                return f"Not saved: {exc}"
+            self._record("skill_write", {"name": skill.name,
+                                         "chars": len(skill.body)})
+            return (f"Saved '{skill.name}' to {skill.path} "
+                    f"({len(skill.body)} chars). It is in the menu from the "
+                    f"next turn, and it survives restart.")
+
+        def skill_forget(name: str) -> str:
+            """Retire a skill: archived on disk, dropped from the menu."""
+            try:
+                dest = self.skills.archive(name)
+            except SkillError as exc:
+                return str(exc)
+            self._record("skill_forget", {"name": name, "archived_to": dest})
+            return f"Retired '{name}' — archived at {dest}, no longer offered."
+
+        def skill_errors() -> str:
+            """Why a skill file is not being offered, when one is not."""
+            self.skills.scan()
+            if not self.skills.errors and not self.skills.shadowed:
+                return "Every skill file parsed. Nothing is being skipped."
+            lines = []
+            if self.skills.errors:
+                lines.append(f"{len(self.skills.errors)} unusable file(s):")
+                lines += [f"  {e}" for e in self.skills.errors]
+            if self.skills.shadowed:
+                lines.append("Shadowed (a more specific directory already "
+                             "defines the name):")
+                lines += [f"  {n} — keeping {p}" for n, p in self.skills.shadowed]
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="skill_list",
+            description=(
+                "List my skills — written-down procedures — with when to use "
+                "each and how often I have loaded it. An empty query lists all."
+            ),
+            parameters={"type": "object", "properties": {
+                "query": {"type": "string", "description": "substring to filter by (optional)"},
+            }},
+            fn=skill_list, source="builtin", tags=["meta"], effect_signature="read_only",
+        ))
+        self._add(ToolSpec(
+            name="skill_view",
+            description=(
+                "Read one skill's full text. Loading it counts as using it, "
+                "which is what ranks skills by behaviour rather than wording."
+            ),
+            parameters={"type": "object", "properties": {
+                "name": {"type": "string", "description": "skill name"},
+            }, "required": ["name"]},
+            fn=skill_view, source="builtin", tags=["meta"], effect_signature="read_only",
+        ))
+        self._add(ToolSpec(
+            name="skill_write",
+            description=(
+                "Write a procedure down as a skill so it is offered next time "
+                "this need appears. Use it for how-to knowledge: steps, order, "
+                "pitfalls. Use forge_tool instead when the need is a function."
+            ),
+            parameters={"type": "object", "properties": {
+                "name": {"type": "string",
+                         "description": "short lower-case handle, e.g. deploy-verify"},
+                "description": {"type": "string",
+                                "description": "what the procedure does (one line)"},
+                "body": {"type": "string", "description": "the procedure itself, markdown"},
+                "when_to_use": {"type": "string",
+                                "description": "the trigger — when should future-you reach for this?"},
+                "tags": {"type": "string", "description": "comma-separated labels (optional)"},
+            }, "required": ["name", "description", "body"]},
+            fn=skill_write, source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="skill_forget",
+            description="Retire a skill: archived on disk, dropped from the menu.",
+            parameters={"type": "object", "properties": {
+                "name": {"type": "string"},
+            }, "required": ["name"]},
+            fn=skill_forget, source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="skill_errors",
+            description="Why a skill file is being skipped rather than offered.",
+            parameters={"type": "object", "properties": {}},
+            fn=skill_errors, source="builtin", tags=["meta"], effect_signature="read_only",
+        ))
+
     def _self_report(self) -> str:
         """The facts about myself, read from the objects that hold them.
 
@@ -1191,6 +1359,22 @@ class ForgeAgent:
             ]
         else:
             lines.append("- Memory: no store attached this session — nothing persists.")
+        sk = self.skills.report()
+        if sk["skills"]:
+            loaded = (f"{sk['loads_total']} load(s) across them, "
+                      f"{len(sk['never_loaded'])} never loaded")
+            lines.append(
+                f"- Skills: {sk['skills']} procedure(s) on disk, {loaded}. "
+                f"Bodies stay out of the prompt until I load one.")
+        else:
+            lines.append(
+                "- Skills: none written yet — a procedure I write down with "
+                "skill_write is offered to me next session.")
+        if sk["unreadable"] or sk["shadowed"]:
+            lines.append(
+                f"- Skills skipped: {len(sk['unreadable'])} unusable file(s), "
+                f"{len(sk['shadowed'])} shadowed by a more specific directory "
+                f"— skill_errors says which and why.")
         lines += [
             f"- Self: my own source is {__file__} on this same filesystem; I can",
             "  read it. I am not opaque to myself.",
@@ -1476,8 +1660,9 @@ class ForgeAgent:
         """
         facts = "\n".join(host_facts(self.sandbox))
         kept = "\n".join(self._memory_lines())
+        menu = "\n".join(self.skills.menu())
         return (f"{self.system_prompt}\n\n{self._self_report()}\n\n"
-                f"{kept}\n\n{facts}")
+                f"{kept}\n\n{menu}\n\n{facts}")
 
     # ------------------------------------------------------------------
     def run(self, task: str, history: list[Message] | None = None,

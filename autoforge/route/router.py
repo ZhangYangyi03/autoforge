@@ -45,16 +45,20 @@ def _tokens(text: str) -> Counter:
     return Counter(w.lower() for w in _WORD.findall(text or "") if len(w) > 1)
 
 
-def text_similarity(query: str, spec: ToolSpec) -> float:
-    """Lightweight lexical cosine — no embedding model, no network."""
-    q = _tokens(query)
-    d = _tokens(f"{spec.name} {spec.description} {' '.join(spec.tags)}")
+def _cosine(q: Counter, d: Counter) -> float:
+    """Shared by tool and skill similarity: no embedding model, no network."""
     if not q or not d:
         return 0.0
     common = set(q) & set(d)
     num = sum(q[t] * d[t] for t in common)
     den = math.sqrt(sum(v * v for v in q.values())) * math.sqrt(sum(v * v for v in d.values()))
     return num / den if den else 0.0
+
+
+def text_similarity(query: str, spec: ToolSpec) -> float:
+    """Lightweight lexical cosine — no embedding model, no network."""
+    return _cosine(_tokens(query),
+                   _tokens(f"{spec.name} {spec.description} {' '.join(spec.tags)}"))
 
 
 @dataclass
@@ -148,4 +152,66 @@ class BehaviourRouter:
         return [c.name for c in self.rank(query)[:k]]
 
 
-__all__ = ["BehaviourRouter", "RoutingWeights", "RouteCandidate", "text_similarity"]
+def skill_similarity(query: str, skill: Any) -> float:
+    """Lexical cosine over the fields a skill is described by.
+
+    `when_to_use` carries the weight a description does not: it is written as a
+    trigger ("when a deploy needs proving"), which is the shape of the thing
+    being matched, rather than as a summary of the thing itself.
+    """
+    fields = (f"{skill.name} {skill.description} {skill.when_to_use} "
+              f"{' '.join(skill.tags)}")
+    return _cosine(_tokens(query), _tokens(fields))
+
+
+class SkillRouter:
+    """Rank skills by fit, blended with evidence that they have been used.
+
+    The lexical half is honest about what it is: at routing time, the only
+    cheap signal about a skill is how its own words line up with the need. What
+    makes the ranking *behavioural* is the second term. `proven` is built from
+    `loads` — how many times the agent actually opened the skill — so a
+    procedure that keeps getting reached for climbs above one that merely reads
+    well. That is the failure this repo exists to argue against: nearest-
+    description retrieval returns the skill that reads right and runs wrong.
+
+    Two of the tool router's four terms are deliberately absent. A skill has no
+    state lifecycle to score trust from and no cost hint, so including them
+    would mean inventing numbers and calling the result a measurement. Where
+    the tool router says "not measured yet" (0.5 for too-few calls), the skill
+    router says zero: a never-loaded skill has no evidence, and rounding that
+    up to neutral would let an unread procedure tie a proven one.
+    """
+
+    def __init__(self, library: Any, *, weights: RoutingWeights | None = None) -> None:
+        self.library = library
+        self.weights = weights or RoutingWeights()
+
+    def score(self, query: str, skill: Any) -> RouteCandidate:
+        w = self.weights
+        text = skill_similarity(query, skill)
+        proven = min(1.0, skill.loads / max(1, w.min_calls_for_success))
+        total = w.text * text + w.success * proven
+        return RouteCandidate(
+            name=skill.name,
+            score=total,
+            breakdown={"text": w.text * text, "proven": w.success * proven},
+            state="used" if skill.loads else "never-used",
+        )
+
+    def rank(self, query: str) -> list[RouteCandidate]:
+        cands = [self.score(query, s) for s in self.library.all()]
+        # Ties go to the more-used skill, then to name order, so the same
+        # library always ranks the same way and a diff means something.
+        cands.sort(key=lambda c: (-c.score, c.name))
+        return cands
+
+    def route(self, query: str, k: int = 3) -> list[str]:
+        """Names of the top-k skills for this need, best first."""
+        return [c.name for c in self.rank(query)[:k]]
+
+
+__all__ = [
+    "BehaviourRouter", "RoutingWeights", "RouteCandidate", "text_similarity",
+    "SkillRouter", "skill_similarity",
+]
