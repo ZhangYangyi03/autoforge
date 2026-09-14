@@ -39,7 +39,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from . import configfile, setup_wizard
+from . import __version__, configfile, setup_wizard
 from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
@@ -1020,7 +1020,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--policy", choices=list(POLICIES),
                    help="autonomy preset: full (default) or supervised "
                         "(AUTOFORGE_POLICY)")
-    p.add_argument("--version", action="version", version="autoforge 0.4.0")
+    # Read, not written down. This said "autoforge 0.4.0" as a literal, which is
+    # the one place a user actually reads the number -- so it was the one place
+    # that would go on reporting the old release after a bump, printing a
+    # version the installed package did not have.
+    p.add_argument("--version", action="version", version=f"autoforge {__version__}")
 
     sub = p.add_subparsers(dest="command")
     sub.add_parser("chat", help="talk to the agent in a REPL")

@@ -293,6 +293,21 @@ def test_parser_exposes_setup_and_config():
     assert {"chat", "forge", "list", "setup", "config"} <= set(names)
 
 
+def test_version_flag_reports_the_package_version(monkeypatch, capsys):
+    """`auto --version` is the one place a user reads the number.
+
+    It was a literal -- ``"autoforge 0.4.0"`` -- so it would have gone on
+    printing the previous release after the bump, and printing it confidently.
+    Driving it with a version nobody would type by accident is what makes this
+    fail on a literal instead of agreeing with it.
+    """
+    monkeypatch.setattr(cli, "__version__", "9.9.9-sentinel")
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["--version"])
+    assert exit_info.value.code == 0
+    assert "9.9.9-sentinel" in capsys.readouterr().out
+
+
 def test_setup_flags_reach_the_wizard(monkeypatch):
     seen = {}
     monkeypatch.setattr(cli.setup_wizard, "run", lambda a: seen.update(vars(a)) or 0)

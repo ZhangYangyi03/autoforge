@@ -84,20 +84,25 @@ __all__ = [
 ]
 
 #: What this program calls itself when a server asks. Read from the installed
-#: distribution so it cannot drift from `pyproject.toml`, with a literal
-#: fallback for the source-checkout case where nothing is installed. The
-#: distribution is `autoforge-agent` (the bare name `autoforge` on the index is
-#: somebody else's package), so looking up `autoforge` here would not raise --
-#: it would find nothing installed and quietly serve a stale version forever.
+#: distribution so it cannot drift from `pyproject.toml`, with a fallback for the
+#: source-checkout case where nothing is installed. The distribution is
+#: `autoforge-agent` (the bare name `autoforge` on the index is somebody else's
+#: package), so looking up `autoforge` here would not raise -- it would find
+#: nothing installed and quietly serve a stale version forever.
+#:
+#: The fallback is deliberately not a plausible version. It used to be the
+#: release number, which is worse than useless: on release day the fallback and
+#: the real answer are the same string, so a broken lookup looks exactly like a
+#: working one -- and a test that compares the two cannot tell them apart.
 try:
     from importlib.metadata import PackageNotFoundError as _NotFound
     from importlib.metadata import version as _pkg_version
     try:
         _VERSION = _pkg_version("autoforge-agent")
     except _NotFound:
-        _VERSION = "0.4.0"
+        _VERSION = "0.0.0+unknown"
 except ImportError:                                    # pragma: no cover
-    _VERSION = "0.4.0"
+    _VERSION = "0.0.0+unknown"
 
 #: Per-page budget for what the model sees. Generous because this spends
 #: context rather than API dollars, and a page cut to 5k is a page whose

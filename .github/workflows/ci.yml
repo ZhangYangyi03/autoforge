@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest tests -q
+
+  # The release artifact is a thing nobody on this machine ever runs: the tests
+  # here run against the checkout, where every helper file is present by
+  # construction. The sdist is what a reader downloads, and it ships the suite
+  # (setuptools picks up tests/test*.py on its own) -- so it has to ship the
+  # conftest.py and shared fakes that suite imports too. It did not, and
+  # tool-market's reproduce job found it by unpacking the release: 39 test
+  # modules, none of them collectable. This job is that check, in the repo that
+  # can fix it.
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade pip build
+
+      - name: build the sdist
+        run: python -m build --sdist
+
+      - name: it carries what its own suite imports
+        run: |
+          tarball=$(ls dist/*.tar.gz)
+          echo "checking $tarball"
+          for f in tests/conftest.py tests/_terminal.py; do
+            tar tzf "$tarball" | grep -q "/$f$" \
+              || { echo "::error::$tarball ships a suite without $f"; exit 1; }
+          done
+
+      # Named the same way a reader would get it: unpack the tarball, install
+      # from it, run what is inside it. Nothing from the checkout is on the path.
+      - name: the unpacked sdist passes its own suite
+        run: |
+          tarball=$(ls dist/*.tar.gz)
+          mkdir -p /tmp/artifact && cd /tmp/artifact
+          tar xzf "$GITHUB_WORKSPACE/$tarball"
+          cd autoforge_agent-*
+          python -m pip install -e ".[dev]"
+          python -m pytest tests -q -p no:cacheprovider
