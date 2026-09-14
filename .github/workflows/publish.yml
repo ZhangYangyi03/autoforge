@@ -16,9 +16,9 @@ jobs:
       contents: read # checkout needs it: naming any permission zeroes the rest
       id-token: write # minted per run and verified by PyPI; the whole point
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
