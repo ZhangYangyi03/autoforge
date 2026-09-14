@@ -1,6 +1,10 @@
 # The sdist ships the test suite (setuptools picks up tests/test*.py on its own),
-# so it has to ship everything that suite imports — conftest.py, and the shared
-# fakes the terminal tests drive. Without this the tarball contains 39 test
-# modules that cannot even be collected, which `reproduce.yml` in tool-market
-# caught by unpacking the release and running it.
+# so it has to ship everything that suite imports or reads:
+#   - conftest.py and the shared fakes the terminal and MCP tests drive
+#   - probes/: the captured generator replies test_json_repair reads by path
+# Without this the tarball carried 39 test modules that could not be collected,
+# plus two that failed on a missing fixture. Found by unpacking the release and
+# running it -- which is now a job in ci.yml, and was briefly a job in
+# tool-market's reproduce workflow before it moved to the repo that can fix it.
 recursive-include tests *.py
+recursive-include probes *.txt *.md *.py

@@ -24,15 +24,19 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest tests -q
 
-  # The release artifact is a thing nobody on this machine ever runs: the tests
-  # here run against the checkout, where every helper file is present by
-  # construction. The sdist is what a reader downloads, and it ships the suite
-  # (setuptools picks up tests/test*.py on its own) -- so it has to ship the
-  # conftest.py and shared fakes that suite imports too. It did not, and
-  # tool-market's reproduce job found it by unpacking the release: 39 test
-  # modules, none of them collectable. This job is that check, in the repo that
-  # can fix it.
-  sdist:
+  # The release artifact is a thing nobody on this machine ever runs: the tests in
+  # the job above run against the checkout, where every helper file and every
+  # static asset is present by construction. Both artifacts are checked here
+  # because both were broken, and the checkout stayed green through all of it:
+  #   - the sdist ships the suite (setuptools picks up tests/test*.py on its own)
+  #     but shipped none of what that suite imports or reads: no conftest.py, no
+  #     shared fakes, no probes/ fixtures. 39 modules, none collectable.
+  #   - the web UI is the one non-Python file in the package and nothing declared
+  #     it, so the wheel -- the thing pip actually installs -- served a 404 for
+  #     every user, while the suite passed against the file on disk.
+  # Found by unpacking a release and running it. Both checks live in the repo that
+  # can fix what they find.
+  artifacts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -43,10 +47,25 @@ jobs:
 
       - run: python -m pip install --upgrade pip build
 
-      - name: build the sdist
-        run: python -m build --sdist
+      - name: build both artifacts
+        run: python -m build
 
-      - name: it carries what its own suite imports
+      - name: the wheel carries the web UI
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/python -m pip install --quiet dist/*.whl
+          # Resolved through the installed distribution, with no checkout on the
+          # path: the only thing that can satisfy this is package-data.
+          /tmp/wheelcheck/bin/python - <<'PY'
+          from importlib.resources import files
+
+          index = files("autoforge.web") / "static" / "index.html"
+          assert index.is_file(), f"web UI missing from the installed wheel: {index}"
+          print("web UI present in the installed wheel:", index)
+          PY
+          /tmp/wheelcheck/bin/python -m autoforge --version
+
+      - name: the sdist carries what its own suite imports
         run: |
           tarball=$(ls dist/*.tar.gz)
           echo "checking $tarball"
@@ -54,10 +73,11 @@ jobs:
           # first match, tar gets SIGPIPE and prints "tar: stdout: write error"
           # next to a passing check.
           listing=$(tar tzf "$tarball")
-          for f in tests/conftest.py tests/_terminal.py; do
+          for f in tests/conftest.py tests/_terminal.py tests/mcp_server_fixture.py \
+                   probes/raw_generator_reply_clean.txt autoforge/web/static/index.html; do
             case "$listing" in
               *"/$f"*) echo "  present: $f" ;;
-              *) echo "::error::$tarball ships a suite without $f"; exit 1 ;;
+              *) echo "::error::$tarball is missing $f"; exit 1 ;;
             esac
           done
 

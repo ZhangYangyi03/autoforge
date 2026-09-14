@@ -28,3 +28,11 @@ dev = ["pytest>=7", "pytest-xdist", "pyyaml"]
 
 [tool.setuptools.packages.find]
 include = ["autoforge*"]
+
+[tool.setuptools.package-data]
+# The web UI is one static file, and it is the only thing in this package that is
+# not Python. Nothing declared it, so neither the wheel nor the sdist carried it:
+# every install served a missing index.html while the suite stayed green in a
+# checkout, where the file happens to be on disk. A test that serves the UI from
+# a built wheel is what keeps this declared.
+"autoforge.web" = ["static/*"]
