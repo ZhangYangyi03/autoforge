@@ -53,15 +53,37 @@ jobs:
       - name: the wheel carries the web UI
         run: |
           python -m venv /tmp/wheelcheck
-          /tmp/wheelcheck/bin/python -m pip install --quiet dist/*.whl
-          # Resolved through the installed distribution, with no checkout on the
-          # path: the only thing that can satisfy this is package-data.
+          /tmp/wheelcheck/bin/python -m pip install --quiet "$GITHUB_WORKSPACE"/dist/*.whl
+
+          # Read the archive's own index: nothing about this can resolve to the
+          # checkout by accident.
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert "autoforge/web/static/index.html" in names, f"web UI missing from {whl}"
+          print("  in the archive:", whl)
+          PY
+
+          # And resolvable through the install -- run from OUTSIDE the checkout.
+          # Run this from the repo root and `import autoforge` finds ./autoforge
+          # on sys.path instead of the wheel, which is how this check passed on a
+          # wheel that had no UI in it at all.
+          cd /tmp
           /tmp/wheelcheck/bin/python - <<'PY'
+          import pathlib
           from importlib.resources import files
 
-          index = files("autoforge.web") / "static" / "index.html"
-          assert index.is_file(), f"web UI missing from the installed wheel: {index}"
-          print("web UI present in the installed wheel:", index)
+          import autoforge
+
+          where = str(pathlib.Path(autoforge.__file__).resolve())
+          assert "site-packages" in where or "wheelcheck" in where, where
+          ui = files("autoforge.web") / "static" / "index.html"
+          assert ui.is_file(), f"web UI missing from the install: {ui}"
+          print("  imported from:", where)
+          print("  UI in the install:", ui)
           PY
           /tmp/wheelcheck/bin/python -m autoforge --version
 
