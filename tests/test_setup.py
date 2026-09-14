@@ -44,6 +44,49 @@ def test_package_version_matches_pyproject():
     )
 
 
+def test_metadata_is_read_by_the_distribution_name_not_the_import_name(monkeypatch):
+    """The import is `autoforge`; the distribution is `autoforge-agent`.
+
+    The bare name on the index belongs to an unrelated 3D-printing tool, so a
+    module asking for `autoforge` gets NotFound, silently keeps its literal
+    fallback, and then misreports its own version forever -- silently, which is
+    the whole problem. Two modules did exactly that (`__init__`, `webtools`),
+    and the rename is what exposed them.
+
+    Comparing `_VERSION` to the installed version would not catch it: the
+    fallback literal *is* the installed version on the day of the release, so
+    both paths agree. The question that has a different answer is which
+    distribution gets asked, so that is what this drives -- metadata is
+    replaced by a sentinel that cannot be reached by accident.
+    """
+    import importlib
+    import importlib.metadata as md
+
+    import autoforge
+    from autoforge import webtools
+
+    # A set, not a list: an editable install is legitimately seen twice (the
+    # egg-info in the working tree and the dist-info pip writes), and the
+    # assertion is about *which* name claims the import, not how many times.
+    assert set(md.packages_distributions()["autoforge"]) == {"autoforge-agent"}
+    assert autoforge.__version__ == md.version("autoforge-agent")
+
+    asked: list[str] = []
+    with monkeypatch.context() as m:
+        m.setattr(md, "version",
+                  lambda name: asked.append(name) or "9.9.9-sentinel")
+        importlib.reload(webtools)
+        assert webtools._VERSION == "9.9.9-sentinel", (
+            f"webtools reported {webtools._VERSION!r}, i.e. its literal fallback "
+            f"won -- the metadata lookup failed silently"
+        )
+        assert asked == ["autoforge-agent"], (
+            f"webtools asked metadata for {asked!r}"
+        )
+    importlib.reload(webtools)          # real lookup back for the rest of the suite
+    assert webtools._VERSION == md.version("autoforge-agent")
+
+
 def _args(**kw) -> argparse.Namespace:
     base = dict(model=None, base_url=None, api_key=None, fast=False,
                 max_tokens=None, no_proxy=False, proxy=None)

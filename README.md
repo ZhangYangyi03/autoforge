@@ -24,7 +24,18 @@ ledger        degraded?       quarantine / rehab / retire
 
 ## Quick start
 
-Straight from a fresh clone — no install step, one command:
+One command, any machine, nothing to clone:
+
+```bash
+pip install autoforge-agent
+auto setup                          # one wizard: provider, key, model
+auto                                # the REPL
+```
+
+`autoforge-agent` is the distribution name; the import is `autoforge` and the
+command is `auto` (or `autoforge`).
+
+Working from a checkout instead:
 
 ```bash
 git clone https://github.com/<you>/autoforge && cd autoforge
@@ -122,6 +133,29 @@ questions are skipped automatically.
 
 Inside the REPL: `/help`, `/tools` (library + health), `/report` (policy and
 self-amendments), `/trace` (the decision log), `/reset`, `/quit`.
+
+### The keyboard stays yours
+
+A run is not a modal dialog. In `chat` the input line is live the whole time —
+the run narrates itself *above* it, so you can keep typing while a tool is
+running:
+
+```
+  [14:02:11] turn 1 +0.4s  asking the model…
+  [14:02:19] +8.6s  -> bash
+      … waiting on model (12s)
+  you> also handle the empty file case
+```
+
+Type a sentence mid-run and it reaches the agent at its next step, labelled as
+a correction rather than a new task. `/status` asks where the run is, `/stop`
+ends it after the current step, and a leading space sends something that starts
+with `/` as text. Paste a block and it collapses to a one-line
+`[Pasted text #1: 40 lines → …]` placeholder — the text is kept on disk and
+expanded again before it reaches the model.
+
+The behaviour degrades honestly: a pipe, a redirect, or a test gets the plain
+cooked-mode reader and no heartbeat, because there is no terminal to own.
 
 Offline demo, zero API keys:
 

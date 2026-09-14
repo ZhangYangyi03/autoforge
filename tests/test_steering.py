@@ -22,6 +22,8 @@ from autoforge.modes import MinimalAgent
 from autoforge.tools.registry import ToolRegistry
 from autoforge.tools.spec import ToolSpec
 
+from _terminal import FakeTerm, Out
+
 
 class Tty(io.StringIO):
     """A stream that claims to be a terminal, so the reader thread starts."""
@@ -238,6 +240,67 @@ def _scripted() -> MockLLMClient:
         LLMResponse(content="", tool_calls=[ToolCall("c2", "note", {"text": "b"})]),
         LLMResponse(content="done"),
     ])
+
+
+class TestTheEditorIsTheReader:
+    """The seam between the line editor and the channel.
+
+    The pieces are tested apart; what matters is that they are bolted
+    together — a keystroke has to travel from the terminal's byte stream,
+    through the editor, into the queue the loop drains, while the run's own
+    progress is being printed over the top of it.
+    """
+
+    @staticmethod
+    def _wired(chunks, columns=40, paste_to=None):
+        from autoforge.core.lineedit import LineEditor
+
+        term = FakeTerm(chunks, columns=columns)
+        out = Out()
+        editor = LineEditor(stream=object(), out=out, term=term, paste_to=paste_to)
+        editor.start()
+        editor.set_prompt("you> ")
+        # The stream is only a fallback: the editor wins, so it is never read.
+        s = Steering(Tty(), printer=lambda _t: None, editor=editor)
+        assert s.interactive is True
+        started = s.start()
+        assert started.editing is True, "the editor took the terminal"
+        return started, editor, out
+
+    def test_a_typed_correction_reaches_the_agent(self):
+        s, _editor, _out = self._wired(["use ", "csv not parquet", "\r"])
+        s._thread.join(timeout=5)
+        assert s.take_supplements() == [operator_message("use csv not parquet")]
+
+    def test_progress_printed_mid_typing_keeps_the_input_intact(self):
+        """The whole point of owning the bottom line.
+
+        The run narrates itself over the top of a half-typed correction, and
+        both survive: the input row is redrawn underneath, still holding what
+        was typed.
+        """
+        s, editor, out = self._wired(["half a sen", None])
+        out.parts.clear()
+        editor.write("  -> running bash")
+        editor.tick("  ~ turn 3   12s")
+
+        assert out.screen().lines() == ["  -> running bash",
+                                        "  ~ turn 3   12s",
+                                        "you> half a sen"]
+        assert "".join(editor._buf) == "half a sen"
+
+    def test_a_pasted_block_reaches_the_agent_expanded(self, tmp_path):
+        """What the model is sent is the text, not the placeholder."""
+        block = "\n".join(f"line {i}" for i in range(9))
+        s, _editor, _out = self._wired([block, "\r"], paste_to=tmp_path)
+        s._thread.join(timeout=5)
+        got = s.take_supplements()
+
+        assert len(got) == 1
+        assert "line 0\nline 1" in got[0]          # the text, not the placeholder
+        assert "line 8" in got[0]                   # the tail survived the file
+        assert "[Pasted text" not in got[0]         # expanded before it is sent
+        assert list(tmp_path.glob("paste_*.txt")), "the text was kept on disk"
 
 
 class TestTheLoopAbsorbs:

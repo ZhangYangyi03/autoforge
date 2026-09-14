@@ -28,6 +28,8 @@ import sys
 import threading
 from typing import Any, Callable, Iterable
 
+from .lineedit import LineEditor, expand_paste_refs
+
 __all__ = ["Steering", "OPERATOR_PREFIX"]
 
 
@@ -68,6 +70,11 @@ class Steering:
         and never interleave mid-character.
     status:
         ``status() -> str`` — the snapshot ``/status`` prints. Set per run.
+    editor:
+        The line editor that owns the bottom line of the terminal. Built here
+        if not supplied, and only *opened* in :meth:`start` — a ``StringIO``
+        (a test, a pipe) cannot be opened, so such a session keeps the plain
+        cooked-mode reader it had before.
     """
 
     def __init__(
@@ -76,10 +83,12 @@ class Steering:
         *,
         printer: Callable[[str], None] | None = None,
         status: Callable[[], str] | None = None,
+        editor: LineEditor | None = None,
     ) -> None:
         self.stream = stream if stream is not None else sys.stdin
         self.printer = printer or (lambda text: print(text, flush=True))
         self.status = status
+        self.editor = editor if editor is not None else LineEditor(stream=self.stream)
         self._pending: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._closed = threading.Event()
@@ -93,11 +102,22 @@ class Steering:
     def interactive(self) -> bool:
         return bool(getattr(self.stream, "isatty", lambda: False)())
 
+    @property
+    def editing(self) -> bool:
+        """True once the terminal is under the editor's control."""
+        return bool(self.editor.available)
+
     def start(self) -> "Steering":
         """Start reading the stream, if there is a person on the other end."""
-        if self.interactive and self._thread is None:
+        if self._thread is not None:
+            return self
+        if self.interactive and self.editor.start():
+            self._thread = threading.Thread(target=self._read_keys, daemon=True)
+        elif self.interactive:
             self._thread = threading.Thread(target=self._read, daemon=True)
-            self._thread.start()
+        else:
+            return self
+        self._thread.start()
         return self
 
     def watch(self, live: Any) -> "Steering":
@@ -112,6 +132,21 @@ class Steering:
 
     def close(self) -> None:
         self._closed.set()
+        # Give the terminal back before the process exits: leaving it in
+        # cbreak would hand the shell a prompt that does not echo.
+        self.editor.close()
+
+    def emit(self, text: str = "") -> None:
+        """Print a line of the session's own output.
+
+        With the editor running, every line the session prints has to go
+        *above* the input area, or it lands on top of what is being typed.
+        Without it this is ``print``, unchanged.
+        """
+        if self.editing:
+            self.editor.write(text)
+        else:
+            print(text, flush=True)
 
     def _read(self) -> None:
         try:
@@ -120,6 +155,19 @@ class Steering:
                     break
                 self.submit(line)
         except (ValueError, OSError):     # stream closed under us
+            pass
+        finally:
+            self._eof.set()
+
+    def _read_keys(self) -> None:
+        """:meth:`_read`, for a terminal the editor has taken over."""
+        try:
+            while not self._closed.is_set():
+                line = self.editor.readline()
+                if line is None:          # ^D
+                    break
+                self.submit(line)
+        except Exception:                 # noqa: BLE001 - a dead reader must not kill the session
             pass
         finally:
             self._eof.set()
@@ -177,7 +225,10 @@ class Steering:
         out: list[str] = []
         while True:
             try:
-                out.append(operator_message(self._pending.get_nowait()))
+                # A collapsed paste leaves a placeholder on the input line; the
+                # model gets the text. That is the point of collapsing it — the
+                # line stays short without the message getting shorter.
+                out.append(operator_message(expand_paste_refs(self._pending.get_nowait())))
             except queue.Empty:
                 break
         self.delivered += len(out)
@@ -198,20 +249,27 @@ class Steering:
         typed, so this reads like `input()` to the person at the terminal —
         while the line itself still arrives through the queue, which is what
         lets a reader thread own the stream for the whole session.
+
+        With the editor running there is nothing to echo and nothing to print:
+        the editor has already drawn the prompt, and it redraws the line under
+        whatever the run writes while you are in the middle of it.
         """
         try:
-            return self._pending.get_nowait()
+            return expand_paste_refs(self._pending.get_nowait())
         except queue.Empty:
             pass
-        if not self.interactive:
-            return self.stream.readline()
-        print(prompt, end="", flush=True)
+        if self.editing:
+            self.editor.set_prompt(prompt)
+        elif not self.interactive:
+            return expand_paste_refs(self.stream.readline())
+        else:
+            print(prompt, end="", flush=True)
         # A queue has no EOFError, so end-of-input has to be noticed by hand.
         # Without this the REPL would block forever after a closed stdin
         # instead of exiting, which is how a control-D turns into a hung shell.
         while True:
             try:
-                return self._pending.get(timeout=0.2)
+                return expand_paste_refs(self._pending.get(timeout=0.2))
             except queue.Empty:
                 if self._eof.is_set():
                     return ""

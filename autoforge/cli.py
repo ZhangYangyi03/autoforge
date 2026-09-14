@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -336,13 +337,19 @@ def _describe(cfg: dict, agent: ForgeAgent) -> None:
 # ----------------------------------------------------------------------
 # trace rendering (shared by chat and forge)
 # ----------------------------------------------------------------------
-def _show_trace(agent: ForgeAgent, from_idx: int, skip_streamed: bool = False) -> None:
+def _show_trace(agent: ForgeAgent, from_idx: int, skip_streamed: bool = False,
+                emit=None) -> None:
     """The decision log for one task.
 
     With `skip_streamed`, the kinds the live line already narrated are dropped —
     so a run that was watched live ends with the few events that need saying
     twice, not a replay of everything already on screen.
+
+    `emit` is how a line reaches the terminal. `chat` passes the steering
+    channel's, because in an interactive session the input line is owned by the
+    line editor and a bare `print` would land on top of it.
     """
+    say = emit or print
     err_rounds = {ev.get("round") for ev in agent.trace[from_idx:]
                   if ev.get("kind") == "forge_error"}
     for ev in agent.trace[from_idx:]:
@@ -350,24 +357,24 @@ def _show_trace(agent: ForgeAgent, from_idx: int, skip_streamed: bool = False) -
         if skip_streamed and kind in _LiveRun.STREAMED:
             continue
         if kind == "call":
-            print(_c(_D, f"  -> {ev.get('tool')}"))
+            say(_c(_D, f"  -> {ev.get('tool')}"))
         elif kind == "forge_attempt":
             # Failures only: a success is reported once, by forge_done. A round
             # already narrated as a forge_error is not repeated here either.
             if ev.get("accepted") or ev.get("round") in err_rounds:
                 continue
             err = str(ev.get("error") or "verification failed")[:64]
-            print(f"{_c(_Y, '  round')} {ev.get('round')}: {err}")
+            say(f"{_c(_Y, '  round')} {ev.get('round')}: {err}")
         elif kind == "forge_done":
             ok = ev.get("ok")
             name = ev.get("name") or ev.get("tool") or "?"
-            print(f"  {_c(_G, 'sealed') if ok else _c(_Y, 'rejected')} {name}")
+            say(f"  {_c(_G, 'sealed') if ok else _c(_Y, 'rejected')} {name}")
         elif kind == "auto_quarantine":
-            print(f"{_c(_Y, '  quarantined')} {ev.get('name', '?')} (failed review)")
+            say(f"{_c(_Y, '  quarantined')} {ev.get('name', '?')} (failed review)")
         else:
             line = _LiveRun._milestone(kind, ev)
             if line:
-                print(f"  {line}")
+                say(f"  {line}")
 
 
 def _print_checks(result) -> None:
@@ -391,14 +398,20 @@ class _LiveRun:
     way to tell a slow request from a wedged process. Two signals fix that —
     an immediate line the moment each request goes out, and a ticking counter
     on that same line while the response is in flight.
+
+    `editor` is the terminal's line editor, when `chat` has one. Everything
+    then routes through it: the heartbeat gets a row of its own above the input
+    line, and progress lines are written *above* it rather than over it. Without
+    one (a pipe, `run`, a test) the rendering is the `\\r`-rewrite it always was.
     """
 
     WIDTH = 72
 
-    def __init__(self, stream=None) -> None:
+    def __init__(self, stream=None, editor=None) -> None:
         self.stream = stream or sys.stdout
+        self.editor = editor if editor is not None and editor.available else None
         self.t0 = time.time()
-        self.live = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.live = bool(self.editor) or bool(getattr(self.stream, "isatty", lambda: False)())
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._waiting_since: float | None = None
@@ -416,19 +429,47 @@ class _LiveRun:
 
     # -- plumbing ------------------------------------------------------
     def _write(self, text: str) -> None:
+        if self.editor is not None:
+            with self._lock:
+                self.editor.write(text)
+            return
         with self._lock:
             self.stream.write(text)
             self.stream.flush()
 
+    def _width(self) -> int:
+        """How wide the line can be before the terminal wraps it.
+
+        A tick line longer than the window wraps, and a wrapped tick line
+        cannot be erased by rewriting one row — it leaves a tail behind. The
+        previous fixed 72 was wrong on any terminal that is not 72 columns.
+        """
+        if not self.live:
+            return self.WIDTH
+        try:
+            return max(20, shutil.get_terminal_size().columns)
+        except Exception:                 # noqa: BLE001 - width is a nicety
+            return self.WIDTH
+
     def _tickline(self, text: str) -> None:
-        if self.live:
-            self._write("\r" + text.ljust(self.WIDTH)[: self.WIDTH])
+        if self.editor is not None:
+            with self._lock:
+                self.editor.tick(text[:self._width() - 1])
+        elif self.live:
+            # Erase to end of line rather than padding with spaces: padding is
+            # only correct if the width guess matches the terminal's.
+            self._write("\r" + text[: self._width() - 1] + "\x1b[K")
         else:
             self._write(text + "\n")
 
     def _clear(self) -> None:
+        if self.editor is not None:
+            # The editor erases its own input area on every write; a `\r`
+            # rewrite on top of it would land in the middle of the line being
+            # typed, which is the bug this whole class of changes is about.
+            return
         if self.live:
-            self._write("\r" + " " * self.WIDTH + "\r")
+            self._write("\r" + " " * self._width() + "\r")
 
     def _stamp(self) -> str:
         return time.strftime("%H:%M:%S")
@@ -635,7 +676,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
     # One reader owns stdin for the whole session. During a run its lines are
     # steering; between runs they are the next prompt. That is what makes
     # mid-run typing possible at all — the loop cannot block on a keyboard.
+    #
+    # `start()` is where the terminal changes hands: from here on the line
+    # editor draws the input line, and every line this function prints has to
+    # go through `emit` (i.e. above that line) instead of `print` (on top of
+    # it). Everything before this point is still an ordinary print.
     steering = Steering().start()
+    emit = steering.emit
     agent.steer = steering
     history: list = []
 
@@ -644,10 +691,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
             try:
                 line = steering.take_line(f"\n{_c(_C, 'you>')} ")
             except KeyboardInterrupt:
-                print()
+                emit("")
                 break
             if line == "":                 # end of input, not a blank line
-                print()
+                emit("")
                 break
             line = line.strip()
             if not line:
@@ -657,51 +704,51 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if cmd in ("/quit", "/exit", "/q"):
                 break
             if cmd == "/help":
-                print(HELP_BODY)
+                emit(HELP_BODY)
                 continue
             if cmd == "/tools":
                 rep = agent.registry.report()
                 if not rep["tools"]:
-                    print(_c(_D, "(no tools yet — ask for something you need)"))
+                    emit(_c(_D, "(no tools yet — ask for something you need)"))
                 for t in rep["tools"]:
-                    print(f"  {t.get('name'):<24} {_c(_D, str(t.get('state')))}")
+                    emit(f"  {t.get('name'):<24} {_c(_D, str(t.get('state')))}")
                 continue
             if cmd == "/report":
-                print(json.dumps(agent.report(), indent=2, default=str))
+                emit(json.dumps(agent.report(), indent=2, default=str))
                 continue
             if cmd == "/trace":
                 for ev in agent.trace:
-                    print(f"  {str(ev.get('kind')):<14} {str(ev)[:110]}")
+                    emit(f"  {str(ev.get('kind')):<14} {str(ev)[:110]}")
                 continue
             if cmd == "/reset":
                 history = []
-                print(_c(_D, "conversation cleared; forged tools kept"))
+                emit(_c(_D, "conversation cleared; forged tools kept"))
                 continue
 
             mark = len(agent.trace)
-            live = _LiveRun().start()
+            live = _LiveRun(editor=steering.editor).start()
             steering.watch(live)          # replies and /status point at this run
             try:
                 result = agent.run(line, history=history, progress=live)
             except KeyboardInterrupt:
                 live.stop()
-                print(f"\n{_c(_D, 'interrupted')}")
+                emit(f"\n{_c(_D, 'interrupted')}")
                 continue
             except Exception as exc:                                   # noqa: BLE001
                 live.stop()
-                print(f"{_c(_Y, 'error:')} {type(exc).__name__}: {exc}")
+                emit(f"{_c(_Y, 'error:')} {type(exc).__name__}: {exc}")
                 continue
             live.stop()
             live.done(result)
 
-            print()
-            _show_trace(agent, mark, skip_streamed=True)
+            emit("")
+            _show_trace(agent, mark, skip_streamed=True, emit=emit)
             if result.content:
-                print(f"\n{_c(_C, 'agent>')} {result.content}")
+                emit(f"\n{_c(_C, 'agent>')} {result.content}")
             if result.self_terminated:
-                print(_c(_D, "(the agent decided the task was done)"))
+                emit(_c(_D, "(the agent decided the task was done)"))
             if getattr(result, "stopped_by_operator", False):
-                print(_c(_Y, "(you stopped this run — the work above stands)"))
+                emit(_c(_Y, "(you stopped this run — the work above stands)"))
             history = result.messages
     finally:
         steering.close()

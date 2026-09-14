@@ -3,13 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autoforge"
+name = "autoforge-agent"
 version = "0.4.0"
 description = "Agent framework with verifiable self-made tools (the forge pipeline)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Zhang Yangyi" }]
+keywords = ["agents", "llm", "tools", "self-improvement", "verification"]
 dependencies = ["requests>=2.28"]
 
 [project.scripts]

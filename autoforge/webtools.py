@@ -85,12 +85,15 @@ __all__ = [
 
 #: What this program calls itself when a server asks. Read from the installed
 #: distribution so it cannot drift from `pyproject.toml`, with a literal
-#: fallback for the source-checkout case where nothing is installed.
+#: fallback for the source-checkout case where nothing is installed. The
+#: distribution is `autoforge-agent` (the bare name `autoforge` on the index is
+#: somebody else's package), so looking up `autoforge` here would not raise --
+#: it would find nothing installed and quietly serve a stale version forever.
 try:
     from importlib.metadata import PackageNotFoundError as _NotFound
     from importlib.metadata import version as _pkg_version
     try:
-        _VERSION = _pkg_version("autoforge")
+        _VERSION = _pkg_version("autoforge-agent")
     except _NotFound:
         _VERSION = "0.4.0"
 except ImportError:                                    # pragma: no cover

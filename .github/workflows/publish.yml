@@ -1,0 +1,39 @@
+name: publish
+
+# Tag-driven release. `git tag v0.4.0 && git push origin v0.4.0` and the package
+# goes out; no API token is stored anywhere, in a secret or on a laptop. PyPI
+# trusts this workflow through OIDC, which is also why nothing here can expire
+# out from under a release six months from now.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read # checkout needs it: naming any permission zeroes the rest
+      id-token: write # minted per run and verified by PyPI; the whole point
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A tag that disagrees with the tree ships the wrong number to the index,
+      # where it cannot be taken back. Cheap to check, impossible to undo.
+      - name: the tag names the version in pyproject
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          echo "tag=$tag pyproject=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag but pyproject declares $ver"; exit 1; }
+
+      - name: build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

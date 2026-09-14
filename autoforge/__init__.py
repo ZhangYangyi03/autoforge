@@ -22,7 +22,10 @@ Freedom is the default; verification lets you *trust* what the freedom produced.
 try:
     from importlib.metadata import version as _pkg_version
 
-    __version__ = _pkg_version("autoforge")
+    # The distribution is `autoforge-agent`; the import stays `autoforge`. The
+    # bare name on the index is a different project, so asking for it here would
+    # not fail loudly -- it would report "0.0.0+unknown" on an installed build.
+    __version__ = _pkg_version("autoforge-agent")
 except Exception:  # pragma: no cover - source tree without an install
     __version__ = "0.0.0+unknown"
 
