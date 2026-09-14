@@ -50,9 +50,15 @@ jobs:
         run: |
           tarball=$(ls dist/*.tar.gz)
           echo "checking $tarball"
+          # Listed once into a variable: `tar tzf | grep -q` lets grep exit on the
+          # first match, tar gets SIGPIPE and prints "tar: stdout: write error"
+          # next to a passing check.
+          listing=$(tar tzf "$tarball")
           for f in tests/conftest.py tests/_terminal.py; do
-            tar tzf "$tarball" | grep -q "/$f$" \
-              || { echo "::error::$tarball ships a suite without $f"; exit 1; }
+            case "$listing" in
+              *"/$f"*) echo "  present: $f" ;;
+              *) echo "::error::$tarball ships a suite without $f"; exit 1 ;;
+            esac
           done
 
       # Named the same way a reader would get it: unpack the tarball, install

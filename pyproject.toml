@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoforge-agent"
-version = "0.4.1"
+version = "0.4.2"
 description = "Agent framework with verifiable self-made tools (the forge pipeline)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,7 +18,13 @@ autoforge = "autoforge.cli:main"
 auto = "autoforge.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-xdist"]
+# pyyaml is here, not in the runtime deps: reading a YAML config is optional at
+# runtime (the loader says "pip install pyyaml" when it is absent, and a test
+# drives exactly that path by monkeypatching the import). But the test suite
+# reads a real YAML file to prove the happy path, so a machine without pyyaml
+# fails two tests -- which is what a fresh CI runner turned out to be. Declaring
+# it keeps the suite testing what it claims instead of testing this laptop.
+dev = ["pytest>=7", "pytest-xdist", "pyyaml"]
 
 [tool.setuptools.packages.find]
 include = ["autoforge*"]
