@@ -363,3 +363,33 @@ def test_short_pastes_reach_the_model_unchanged(tmp_path, lines):
     steering.submit(steering.take_line("you> ").strip())
     (sent,) = steering.take_supplements()
     assert body.split("\n")[0] in sent
+
+
+def _fake_term(cols):
+    class _T:
+        columns = cols
+
+    return _T()
+
+@pytest.mark.parametrize('cols', [20, 40])
+def test_wide_chars_never_overflow_a_row(cols):
+    '''A row holding CJK text must fit its terminal width.
+
+    ASCII and CJK are not one column each, so slicing a row by character
+    count overflowed the terminal and the driver wrapped the row itself --
+    which put the cursor somewhere other than the insertion point. Every row
+    built by _layout() has to be no wider than the terminal.
+    '''
+    from autoforge.core.lineedit import LineEditor, _visible_len
+
+    editor = LineEditor(term=_fake_term(cols))
+    editor.set_prompt('> ')
+    text = '你好世界' * 6
+    editor._buf = [text]
+    editor._cursor = len(text)
+    rows, row, col = editor._layout()
+    for line in rows:
+        assert _visible_len(line) <= cols, repr(line)
+    assert col >= _visible_len('> '), repr(col)
+
+

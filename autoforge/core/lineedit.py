@@ -688,8 +688,8 @@ class LineEditor:
         offset = 0
         for segment in "".join(self._buf).split("\n"):
             at = offset
-            for i in range(0, len(segment), width) or [0]:
-                chunk = segment[i:i + width]
+            for i in _col_breaks(segment, width):
+                chunk = segment[i:i + _col_step(segment, i, width)]
                 rows.append((last if first else indent) + chunk)
                 starts.append(at)
                 at += len(chunk)
@@ -702,7 +702,7 @@ class LineEditor:
             if at >= start:
                 row = n
         col = _visible_len(last if row == leading else indent)
-        col += min(at - starts[row], len(rows[row]) - col)
+        col += _visible_len(rows[row][len(last if row == leading else indent):][:max(0, at - starts[row])])
         return rows, row, col
 
     def _draw(self) -> None:
@@ -747,7 +747,34 @@ def _looks_like_paste(text: str) -> bool:
     return breaks > 1 or not normalized.endswith("\n")
 
 
-def _visible_len(s):
+def _col_step(segment: str, i: int, width: int) -> int:
+    """How many characters of `segment` from index i fit in `width` columns."""
+    used = 0
+    n = 0
+    for ch in segment[i:]:
+        w = _wcwidth(ch)
+        w = w if w and w > 0 else 0
+        if n and used + w > width:
+            break
+        used += w
+        n += 1
+    return max(1, n)
+
+
+def _col_breaks(segment: str, width: int) -> list:
+    """Character offsets at which `segment` must wrap to a new terminal row."""
+    breaks = []
+    i = 0
+    total = len(segment)
+    while i < total:
+        breaks.append(i)
+        i += _col_step(segment, i, width)
+    if not breaks:
+        breaks.append(0)
+    return breaks
+
+
+def _visible_len_legacy(s):
     n = 0
     i = 0
     L = len(s)
