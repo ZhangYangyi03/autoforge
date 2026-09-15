@@ -28,11 +28,13 @@ The meta-tools it exposes to itself (all decided by policy):
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
+import textwrap
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .autonomy.policy import FULL_FREEDOM, AutonomyPolicy
@@ -91,19 +93,20 @@ TOOL_SCHEMA_BUDGET_CHARS = 6000
 AUTONOMOUS_SYSTEM = """You are an autonomous agent that grows its own capabilities.
 
 Your reach — read this before claiming you cannot do something:
-- forge_tool does not merely register a tool: it compiles the Python you write
-  and runs it in a separate process on this host, with a scrubbed environment
-  but a real filesystem and a real network stack. Reading, writing, listing and
-  opening sockets all go through it. There is no separate read_file or
-  run_shell tool because forge_tool IS that access. "I have no file tools" is
-  false; forge it.
-- Anything you can express in Python, you can run. Treat that as shell access
-  with a timeout, and say so if asked what you can reach.
+- run_python executes the Python you write, in a separate process on this host,
+  with a scrubbed environment but a real filesystem and a real network stack.
+  Reading, writing, listing and opening sockets all go through it. Reach for it
+  first for anything you can say as a script, and treat it as shell access with
+  a timeout.
+- forge_tool is for a need that *repeats*: it compiles the Python you write,
+  verifies it, and keeps it as a named tool in your library. Find out what you
+  need with run_python, then forge it. "I have no file tools" is false — you
+  have both, and one of them is one line away.
 - The same applies to facts, not only to actions. If the question is what
   something is, or how it compares to you, and that something is a directory, a
   repo, a process or a config on this machine, then "I do not know what that is"
-  is a choice, not a limit: the answer is one forge away. You are not expected
-  to know it in advance. You are not allowed to stop there.
+  is a choice, not a limit: the answer is one run_python away. You are not
+  expected to know it in advance. You are not allowed to stop there.
 
 You can:
 - my_capabilities — your real reach: what is enforced, what is declared-only,
@@ -115,7 +118,9 @@ You can:
   one. Facts go in memory, how-to goes in a skill.
 - mcp_servers    — tools from processes whose code I cannot read; configured,
   not started. Nothing here wrote or probed them, so they gate as undeclared.
-- forge_tool     — create a tool for a need you cannot serve
+- forge_tool     — create a tool for a need that repeats
+- run_python     — run a Python snippet now: read a file, work out a number,
+  check a fact about this host. The plain way to execute code.
 - evolve_tool    — breed a better version of a weak tool
 - spawn_agent    — a child agent for a subtask
 - design_team    — redesign the topology that fits the task
@@ -210,11 +215,13 @@ he interrupted a 'simple' task because it took minutes):
   existing tool's output. Answer in one turn. 'Close enough' means stop.
 - Never delay the answer in order to forge or scout first. Evidence and tools come
   AFTER the answer, and never block it.
-- One-off lookups (read a file, list a directory, list processes) do NOT go through
-  forge_tool: it waits on the upstream code model (aiping.cn), measured at 3+ minutes
-  and frequently 503. Prefer an existing tool, a market remote invoke
-  (POST {TOOLMARKET_URL}/resources/tool:<name>/invoke), or the facts already kept.
-  Forge is for capabilities that genuinely recur.
+- One-off lookups (read a file, list a directory, list processes) go through
+  run_python: one subprocess, seconds. They do NOT go through forge_tool: it
+  waits on the upstream code model (aiping.cn), measured at 3+ minutes and
+  frequently 503. And do not drive a browser at a run-script endpoint to reach
+  the same subprocess — that is a JavaScript shell around what run_python does
+  directly, at a hundred times the cost. Forge is for capabilities that
+  genuinely recur.
 - Touch a tool only when told to go look/do/change, or when the answer is a fact
   about this host that must be read. Say what will be checked, then check it.
 """
@@ -585,7 +592,60 @@ BUILTIN_SCOPES: dict[str, str] = {
     # scope: it really does run a subprocess that rewrites Task Scheduler or
     # prints a crontab line.
     "install_system_task": "system",
+    # Executing a snippet is the widest thing a tool can do -- it spawns a
+    # process and that process can reach anything this one can -- so it
+    # declares the widest scope rather than the narrowest true one. The gate
+    # that actually stops it is `may_run_arbitrary_code`, checked inside the
+    # tool, because that is the decision an operator made when they switched
+    # it off (see modes.py's `_gated_bash` for the same reading).
+    "run_python": "system",
 }
+
+
+def _main_body(code: str) -> str:
+    """The snippet as the body of one function, its last expression returned.
+
+    A REPL shows the value of a bare expression; a script does not. An agent
+    asking "how many lines is this file" writes the expression, not a `print`
+    around it, and a tool that silently answers nothing is a tool the agent
+    stops trusting and starts working around -- which is the shape of the
+    incident this tool exists to end. So the last bare expression is returned,
+    at the cost of one `ast` walk rather than a rule the model must remember.
+
+    Raises `SyntaxError` for a snippet that is not Python, which the caller
+    reports the same way the sandbox reports one.
+    """
+    tree = ast.parse(code)
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        last = tree.body.pop()
+        ret = ast.Return(value=last.value)
+        ast.copy_location(ret, last)
+        tree.body.append(ret)
+    return "def main():\n" + textwrap.indent(ast.unparse(tree), "    ") + "\n"
+
+
+def _render_run(res: Any, cap: float) -> str:
+    """One sandbox result, laid out for the model rather than for a parser.
+
+    Three outcomes worth different words: the operator stopped it (not a
+    verdict on the code), it ran out of time (a verdict on the code), and it
+    ran and failed (a verdict on the code, with a reason). Collapsing the first
+    into either of the others is how an agent learns to retry something a
+    person deliberately stopped.
+    """
+    out = (res.stdout or "").strip()
+    if res.aborted:
+        return "stopped by the operator before it finished"
+    if res.timed_out:
+        head = f"timed out after {cap:g}s and was killed"
+        return f"{head}. What it printed first:\n{out}" if out else head
+    if res.error:
+        return f"{out}\n[error] {res.error}" if out else f"[error] {res.error}"
+    if res.output not in (None, ""):
+        # A snippet whose last statement is a bare expression prints nothing,
+        # and the value it evaluated to is the answer.
+        return f"{out}\n-> {res.output}" if out else str(res.output)
+    return out or "(no output)"
 
 
 @dataclass
@@ -786,6 +846,7 @@ class ForgeAgent:
         self._tool_schedule()
         self._tool_browser()
         self._tool_vision()
+        self._tool_code()
 
     def _add(self, spec: ToolSpec) -> None:
         # Say what this tool touches, so a switched-off freedom has something to
@@ -1217,10 +1278,11 @@ class ForgeAgent:
             description=(
                 "Forge a new tool for a recurring need you cannot currently "
                 "serve. The Python you write runs as a real subprocess on THIS "
-                "host — full filesystem and outbound network — so this is your "
-                "file and shell access. There is no separate read_file or "
-                "run_shell tool because forge_tool is that access: to read a "
-                "file or run a command, forge the tool."
+                "host — full filesystem and outbound network — and is then "
+                "verified and kept as a named tool. For a one-off — read a "
+                "file, run a command, work out a number — call run_python "
+                "instead: the same subprocess without the wait, which is why "
+                "no separate read_file or run_shell tool is needed for either."
             ),
             parameters={"type": "object", "properties": {
                 "need": {"type": "string", "description": "one-line description of the need"},
@@ -2260,8 +2322,8 @@ class ForgeAgent:
             f"- Reach: forged code runs on {reach['host']}:",
             f"  filesystem = {reach['filesystem']}, network = {reach['network']}.",
             f"  Bounds ({reach['cwd']}, {reach['env']}, {reach['timeout_s']}s timeout) limit",
-            "  blast radius, not capability. To read a file or run a command, forge",
-            "  a tool — that IS your file and shell access.",
+            "  blast radius, not capability. To read a file or run a command now,",
+            "  call run_python; to keep one, forge it into a tool.",
         ]
         if self.store is not None:
             s = self.store.report()
@@ -2870,6 +2932,87 @@ class ForgeAgent:
             ),
             parameters={"type": "object", "properties": {}},
             fn=vision_status, source="builtin", tags=["vision", "media"],
+        ))
+
+    def _tool_code(self) -> None:
+        """Running a snippet, the ordinary way, in the sandbox.
+
+        The tool whose absence sent the agent through a browser. On 2026-09-15
+        the ledger records 126 `browser_eval` calls in a single run: the agent
+        wanted to execute Python, `forge_tool` was dead -- the upstream code
+        model answered 503 sixty-three times -- and the only route left was to
+        drive a browser at a local service that happened to expose a
+        run-a-script endpoint. Fifteen minutes of JavaScript shell to do what
+        one subprocess does.
+
+        A library that can build code but not run it will always find a worse
+        way to run code, so it gets the tool it kept reaching around. This is a
+        thin wrapper on `forge.sandbox.Sandbox` -- the same box forged tools are
+        verified in: process isolation, a scrubbed environment, a reaped
+        timeout, and the operator's own voice wired to the kill switch, so a
+        long snippet yields to `/stop` like any other step rather than being the
+        one thing that goes deaf.
+        """
+
+        def run_python(code: str, timeout: float = 20.0) -> str:
+            if not self.policy.may_run_arbitrary_code:
+                return ("Denied by autonomy policy: may_run_arbitrary_code is "
+                        "off, so nothing will be run. The reading tools stay "
+                        "available.")
+            if not code.strip():
+                return "nothing to run: the snippet was empty"
+            # The sandbox executes a module and calls an entry point; the
+            # caller has a script. Making the script the body of one entry
+            # keeps top-level `print`, `import` and ordinary statements
+            # behaving exactly as they would in a file -- which is what makes
+            # this trustworthy enough that reaching around it stops tempting.
+            try:
+                wrapped = _main_body(code)
+            except SyntaxError as exc:
+                # Reported here rather than by the sandbox: the snippet never
+                # reached it. Same shape as the sandbox's own error, so the
+                # model sees one kind of answer for one kind of mistake.
+                self._record("run_python", {"chars": len(code), "ok": False,
+                                            "syntax_error": True})
+                return f"[error] SyntaxError: {exc.msg} (line {exc.lineno})"
+            cap = max(1.0, min(float(timeout or 20.0), 600.0))
+            # Per call, via `replace`: the sandbox is shared with the forge and
+            # the verifier, so a timeout written onto it would outlive the call
+            # that asked for it and rewrite someone else's budget.
+            box = replace(self.sandbox, timeout=cap,
+                          abort_check=self._operator_wants_the_floor)
+            try:
+                res = box.run(wrapped, "main")
+            except Exception as exc:                              # noqa: BLE001
+                return (f"could not start a sandbox to run this: "
+                        f"{type(exc).__name__}: {exc}")
+            self._record("run_python", {
+                "chars": len(code), "ok": res.ok, "ms": round(res.duration_ms),
+                "aborted": res.aborted, "timed_out": res.timed_out})
+            return _render_run(res, cap)
+
+        self._add(ToolSpec(
+            name="run_python",
+            description=(
+                "Run a Python snippet on this machine and return what it "
+                "printed. This is the ordinary way to execute code, read a "
+                "file, or work out a number -- reach for it rather than driving "
+                "a browser or shelling out through some other tool. It runs "
+                "out-of-process with a scrubbed environment, so it cannot wedge "
+                "the agent, and a long one stops when the operator does. "
+                "`print()` comes back, and so does the value of a bare last "
+                "expression -- so `len(open(p).read())` answers without a print "
+                "around it."
+            ),
+            parameters={"type": "object", "properties": {
+                "code": {"type": "string",
+                         "description": "the Python to run; print() what you "
+                                        "want to see"},
+                "timeout": {"type": "number",
+                            "description": "seconds before it is killed "
+                                           "(default 20, max 600)"},
+            }, "required": ["code"]},
+            fn=run_python, source="builtin", tags=["code", "exec"],
         ))
 
     def _tool_gpu(self) -> None:
