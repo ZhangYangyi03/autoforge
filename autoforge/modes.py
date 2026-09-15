@@ -287,15 +287,34 @@ class MinimalAgent:
         except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
-    def run(self, task: str, history: list | None = None) -> AgentResult:
+    def run(self, task: str, history: list | None = None,
+            progress: Callable[[str, dict[str, Any]], None] | None = None) -> AgentResult:
+        """Run one task.
+
+        `progress(kind, payload)` is called as the loop moves — `request` before
+        each model call, `call`/`result` around each tool. The CLI passes it so
+        a slow model reads as "waiting", not "hung".
+
+        This mode wraps a plain `Agent`, which takes one callback per event
+        rather than a single `progress`, so the translation lives here. Without
+        it `auto run --mode minimal` raised `TypeError`: the CLI hands every
+        mode the same `progress=`, and only the full agent declared it.
+        """
+        def _emit(kind: str, **payload: Any) -> None:
+            if progress:
+                progress(kind, payload)
+
         agent = Agent(
             self.llm, self.registry,
             system_prompt=self.system_prompt,
             max_turns=self.max_turns,
             allow_self_terminate=True,
-            on_tool_call=lambda n, a: self._record("call", {"tool": n, "args": a}),
-            on_tool_result=lambda n, r: self._record(
-                "result", {"tool": n, "ok": getattr(r, "ok", None)}),
+            on_request=lambda turn: _emit("request", turn=turn),
+            on_tool_call=lambda n, a: (
+                self._record("call", {"tool": n, "args": a}), _emit("call", tool=n)),
+            on_tool_result=lambda n, r: (
+                self._record("result", {"tool": n, "ok": getattr(r, "ok", None)}),
+                _emit("result", tool=n)),
             on_steer=lambda text: self._record("steer", {"text": text[:300]}),
             steer=self.steer,
             compactor=self.compactor,

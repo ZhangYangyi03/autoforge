@@ -174,6 +174,36 @@ def test_unknown_mode_is_refused():
     assert "telepathy" in str(err.value)
 
 
+def test_minimal_agent_hands_its_progress_to_the_caller(tmp_path):
+    """The CLI hands every mode the same `progress=`; minimal must accept it.
+
+    It wraps a bare `Agent`, which takes one callback per event rather than a
+    single `progress`, so this is where the translation lives. Without it
+    `auto run --mode minimal` died with `TypeError: run() got an unexpected
+    keyword argument 'progress'` while `--mode standard` worked — a mismatch
+    no test covered, because every other test calls `run(task)`.
+    """
+    llm = Scripted([
+        LLMResponse(content="", tool_calls=[ToolCall("c1", "bash", {"command": "echo hi"})]),
+        LLMResponse(content="done"),
+    ])
+    agent = MinimalAgent(llm=llm, cwd=str(tmp_path))
+    seen: list[tuple[str, dict]] = []
+    agent.run("echo hi", progress=lambda kind, payload: seen.append((kind, payload)))
+
+    kinds = [k for k, _ in seen]
+    # Each of these is a line the operator would otherwise not see. `request`
+    # is the one that matters most: it is what turns a slow model from "hung"
+    # into "waiting".
+    assert "request" in kinds, "no request event — a slow model reads as hung"
+    assert "call" in kinds, "no call event — the tool line never prints"
+    assert "result" in kinds
+
+    # The payload rides through as a dict, not flattened to a bare value.
+    payload = next(p for k, p in seen if k == "call")
+    assert payload["tool"] == "bash"
+
+
 def test_modes_are_declared_once():
     from autoforge.cli import MODES
 

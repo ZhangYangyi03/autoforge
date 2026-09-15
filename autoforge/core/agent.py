@@ -333,6 +333,19 @@ class Agent:
                 # informed. The turn is given back: a turn that produced no
                 # answer is not a turn spent, and counting it would let an
                 # operator's own corrections race the turn cap.
+                # Unless the abort was not this loop's to answer. A nested loop
+                # -- a verification probe agent, an adversary's attacker -- runs
+                # on the same client as the run that spawned it, so it inherits
+                # that run's abort predicate and can be woken by a line
+                # addressed to somebody else. Going round again here would spin:
+                # this loop's own channel is empty, `_absorb` has nothing to
+                # fold in, and the inherited predicate is still true, so the
+                # next call aborts immediately and forever. Only a line this
+                # loop can actually absorb is worth another turn; anything else
+                # belongs to the caller, which is where the operator's message
+                # is waiting.
+                if not self._operator_wants_the_floor():
+                    raise
                 turn -= 1
                 continue
             msgs.append(Message.assistant(resp.content, resp.tool_calls))

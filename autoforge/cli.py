@@ -456,6 +456,13 @@ class _LiveRun:
         self._turn = 0
         self._last_tool: str | None = None
         self._forging: str | None = None
+        # Which round of the forge is running, and when it began. `_forging`
+        # holds the need, which is the same string in round 1 as in round 4 --
+        # on its own it makes every heartbeat line identical, and a run that
+        # repeats itself word for word reads as a run that is stuck repeating
+        # itself. These two are what make each line say something new.
+        self._forge_round: int | None = None
+        self._forge_since: float | None = None
         # The round whose failure was already narrated as a forge_error, so the
         # attempt line that follows it doesn't say the same thing twice.
         self._err_round: int | None = None
@@ -547,6 +554,9 @@ class _LiveRun:
         self._clear()
         if self._forging:
             doing = f"still forging {self._forging}"
+            if self._forge_round:
+                spent = int(time.time() - (self._forge_since or time.time()))
+                doing += f" · round {self._forge_round} · {spent}s in this round"
         elif self._waiting_since is not None:
             doing = (f"still waiting on the model "
                      f"({int(time.time() - self._waiting_since)}s)")
@@ -593,15 +603,27 @@ class _LiveRun:
             # whole run, so it starts the heartbeat before the first request.
             self._clear()
             self._forging = str(payload.get("need", ""))[:48]
+            self._forge_round = 1
+            self._forge_since = time.time()
             self._waiting_since = time.time()
             self._ticks = 0
+            total = payload.get("max_rounds")
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
-                        f"forging {str(payload.get('need', ''))[:48]}…\n")
+                        f"forging {str(payload.get('need', ''))[:48]} "
+                        f"(round 1 of {total or '?'})…\n")
         elif kind == "forge_attempt":
             # Only failures are worth a line: a success is reported once, by
             # forge_done, so the reader never sees "round 1: accepted" followed
             # immediately by "sealed". Failures are the interesting case anyway
             # — they are why a forge takes more than one round.
+            #
+            # Before the branch, not inside it: `forge_attempt` is the only
+            # signal that one round ended and the next began. If only the
+            # failure path moved the round on, a forge whose rounds keep coming
+            # back clean-then-worse would report round 1 forever, which is the
+            # frozen line by another route.
+            self._forge_round = payload.get("round")
+            self._forge_since = time.time()
             if not payload.get("accepted"):
                 if payload.get("round") == self._err_round:
                     # Same failure, already reported as a forge_error above.
@@ -609,8 +631,12 @@ class _LiveRun:
                 self._clear()
                 self._waiting_since = time.time()   # another round is coming
                 err = str(payload.get("error") or "verification failed")[:60]
+                # The duration is the difference between "hard need" and "that
+                # round took eleven minutes": without it they read identically.
+                spent = payload.get("duration_ms")
+                took = f" ({int(spent / 1000)}s)" if spent else ""
                 self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
-                            f"round {payload.get('round')}: {err}\n")
+                            f"round {payload.get('round')}{took}: {err}\n")
         elif kind == "forge_error":
             # The exception that ended a round — louder than the attempt line,
             # so it takes the round slot and the attempt stays quiet.
@@ -625,6 +651,8 @@ class _LiveRun:
             self._clear()
             self._waiting_since = None
             self._forging = None
+            self._forge_round = None
+            self._forge_since = None
             ok = payload.get("ok")
             name = payload.get("name") or payload.get("need") or "?"
             rounds = payload.get("rounds")
@@ -639,6 +667,8 @@ class _LiveRun:
             self._clear()
             self._waiting_since = None
             self._forging = None
+            self._forge_round = None
+            self._forge_since = None
             why = str(payload.get("reason", "interrupted"))
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
                         f"forge stopped before a verdict — {why}\n")

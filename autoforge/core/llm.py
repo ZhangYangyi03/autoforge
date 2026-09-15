@@ -86,6 +86,35 @@ class LLMAborted(InterruptedError):
     """
 
 
+def _any_predicate(
+    own: Callable[[], bool] | None,
+    attached: Callable[[], bool] | None,
+) -> Callable[[], bool] | None:
+    """Combine two abort predicates: either one saying yes is a yes.
+
+    `own` is what the caller passed to this `chat`; `attached` is what the
+    owner of the run hung on the client (`LLMClient.abort_check`).
+
+    They are combined rather than one winning, because the two answer
+    different questions and both are binding. An inner loop -- a verification
+    probe agent, say -- asks "has *my* channel got something for me?", and the
+    honest answer there is no. The run that spawned it asks "has the operator
+    said anything to anyone?", and during a forge that answer is yes. If the
+    inner predicate simply won, the probe would sit through the operator's
+    message with the client-level predicate switched off, which is the exact
+    two-minute block the attached predicate exists to close.
+
+    `None` means "nobody is watching", not "do not watch": it drops out, it
+    does not override.
+    """
+    live = [p for p in (own, attached) if p is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+    return lambda: any(p() for p in live)
+
+
 def _post_watchable(
     endpoint: str,
     headers: dict[str, str],
@@ -232,6 +261,24 @@ class LLMClient:
     """Minimal protocol: turn messages (+tool schemas) into an LLMResponse."""
 
     name: str = "llm"
+
+    #: A predicate attached to the *client* rather than to each call.
+    #:
+    #: Some model calls are not made by the loop the operator is talking to. A
+    #: forge round fans out -- the generator, the adversary and its victim, and
+    #: two probe agents that run the candidate tool -- and every one of them
+    #: calls `chat` on a client that ultimately belongs to the run the operator
+    #: is watching. Not one of them knows the operator exists.
+    #:
+    #: Threading `should_abort` through each of those call sites is a list that
+    #: has to be kept complete by hand, and the stage somebody forgets is a
+    #: two-minute block with the operator on the other side of it -- which is
+    #: what happened: the sandbox's children yielded to them and the model calls
+    #: did not. So the owner of the run attaches the predicate here, once, for
+    #: the duration of the step (see `ForgePipeline.forge`), and every call
+    #: beneath it inherits it. A call that also got one of its own is bound by
+    #: both -- see `_any_predicate`.
+    abort_check: Callable[[], bool] | None = None
 
     def chat(
         self,
@@ -415,7 +462,13 @@ class OpenAICompatClient(LLMClient):
         # Popped before the payload is built, or they would be sent to the
         # endpoint as unknown body fields -- a 400 at best, silently ignored at
         # worst. They are addressed to *this* client, not to the provider.
-        should_abort = kwargs.pop("should_abort", None)
+        #
+        # `should_abort` is merged with whatever the run attached to the client
+        # rather than replacing it: a stage that asked its own channel and got
+        # silence must still yield to the operator talking to the run above it.
+        should_abort = _any_predicate(
+            kwargs.pop("should_abort", None), self.abort_check,
+        )
         on_wait = kwargs.pop("on_wait", None)
 
         payload: dict[str, Any] = {

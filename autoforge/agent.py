@@ -636,6 +636,10 @@ class ForgeAgent:
             on_event=self._on_forge_event,
         )
         self.router = BehaviourRouter(self.registry)
+        # Needs whose forge the operator interrupted, normalised. Read by
+        # `forge_tool` -- see the note there for why the second attempt at an
+        # interrupted need is the wrong move rather than the right one.
+        self._interrupted_needs: set[str] = set()
 
         # MCP: servers named in the config file, plus -- when the config asks
         # for it -- the ones the other agents on this machine already have.
@@ -1056,6 +1060,23 @@ class ForgeAgent:
         def forge_tool(need: str) -> str:
             if not self.policy.may_forge_tools:
                 return "Denied by autonomy policy: may_forge_tools is off."
+            # One interruption, one re-ask -- and the re-ask is answered, not
+            # repeated. When the operator's line lands inside a forge, the round
+            # is abandoned mid-flight; the model reads an abandoned call as a
+            # call that failed, and its very next act was this same tool with
+            # this same need. That is the "it did the same thing twice" in the
+            # transcript. The mark is consumed by the refusal it earns, so a
+            # model that answers the operator is not blocked from the work --
+            # only from doing it again with the person still waiting.
+            key = " ".join(need.lower().split())
+            if key in self._interrupted_needs:
+                self._interrupted_needs.discard(key)
+                return (
+                    "You were stopped in the middle of exactly this forge and "
+                    "have not answered the operator yet. Do not start it again "
+                    "unchanged: read what they said and act on that, or reply "
+                    "to them in plain text if they asked for nothing."
+                )
             # Budget check before the forge, not after. Every tool's schema rides
             # in the prompt on every turn, so a forge is not a free act: it is a
             # permanent per-turn cost. Without this the library only grows, and
@@ -1079,13 +1100,17 @@ class ForgeAgent:
             )
             self._record("forge", {"need": need, "ok": res.ok})
             if res.aborted:
+                self._interrupted_needs.add(" ".join(need.lower().split()))
                 # Deliberately not "the forge failed". Nothing was judged, so
                 # the model must not conclude the need is unservable and go on
                 # to forge something worse to compensate.
                 return (
                     "Stopped at the operator's request before this tool was "
                     "verified. Nothing was registered and nothing was ruled "
-                    "out — read their message and continue from there."
+                    "out — read their message and continue from there: "
+                    "answer them, or change the need to match what they asked "
+                    "for. Do not call forge_tool again with this same need "
+                    "unchanged."
                 )
             if not res.ok:
                 return f"Could not forge a working tool for: {need} ({res.rounds} rounds)."

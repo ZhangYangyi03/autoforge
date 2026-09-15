@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from ..autonomy.policy import AutonomyPolicy
-from ..core.llm import LLMClient
+from ..core.llm import LLMAborted, LLMClient
 from ..tools.registry import ToolRegistry
 from ..tools.spec import ToolSpec, ToolState
 from .generator import GeneratedTool, TemplateGenerator, UnrecoverableGeneration
@@ -159,6 +159,18 @@ class ForgePipeline:
         # gone operator abort somebody else's forge.
         previous_check = self.sandbox.abort_check
         self.sandbox.abort_check = should_abort
+        # And to the model clients, for the same reason and with the same
+        # restore. The sandbox only covers the tool under test: the calls that
+        # write it, attack it and probe it are made by clients owned by the
+        # verifier and the generator, and each of those is a place a round can
+        # spend two minutes deaf to the operator. `_model_clients` collects
+        # them rather than listing them, so a stage added later is covered by
+        # construction instead of by remembering.
+        previous_model_checks = [
+            (client, client.abort_check) for client in self._model_clients()
+        ]
+        for client, _ in previous_model_checks:
+            client.abort_check = should_abort
         try:
             for round_no in range(1, self.config.max_rounds + 1):
                 if should_abort is not None and should_abort():
@@ -209,6 +221,17 @@ class ForgePipeline:
                     else:
                         spec.state = ToolState.DRAFT
                         feedback = self._feedback(report)
+                except LLMAborted:
+                    # The operator's line, arriving inside a model call. Not a
+                    # failure and not a round: nothing about the candidate was
+                    # judged, so there is no verdict to record and no error to
+                    # feed the next round's prompt -- retrying here would ask
+                    # the model to repair a tool that was never found wanting,
+                    # which is how one interruption turned into a second run of
+                    # the same forge. The attempt is not appended either, so
+                    # `result.rounds` counts rounds that produced something.
+                    result.aborted = True
+                    break
                 except UnrecoverableGeneration as exc:
                     # Nothing about this failure is round-specific: the model, not
                     # the attempt, cannot produce an answer. Record it and stop.
@@ -236,12 +259,17 @@ class ForgePipeline:
                 self._emit("forge_attempt", {
                     "need": need, "round": round_no, "accepted": attempt.accepted,
                     "error": attempt.error,
+                    # How long the round took. A reader cannot tell "the need is
+                    # hard" from "one round took eleven minutes" without it.
+                    "duration_ms": round(attempt.duration_ms, 1),
                     "report": attempt.report.to_dict() if attempt.report else None,
                 })
                 if attempt.accepted or futile:
                     break
         finally:
             self.sandbox.abort_check = previous_check
+            for client, previous in previous_model_checks:
+                client.abort_check = previous
 
         if result.aborted:
             # Not `forge_done` with ok=False. Nothing was judged, so there is no
@@ -260,6 +288,23 @@ class ForgePipeline:
         return result
 
     # -- helpers ---------------------------------------------------------
+    def _model_clients(self) -> list[LLMClient]:
+        """Every model client this pipeline can reach, deduplicated.
+
+        Asked of the parts rather than handed in: a stage that holds a client
+        is a stage that makes calls, and a stage added later will be collected
+        here without anyone updating a list. The verifier's probe agents and
+        the adversary's attacker are built from `verifier.llm`, so the same
+        instance covers them.
+        """
+        found: list[LLMClient] = []
+        owners = (self.generator, self.verifier, getattr(self.verifier, "adversary", None))
+        for owner in owners:
+            client = getattr(owner, "llm", None)
+            if client is not None and all(client is not seen for seen in found):
+                found.append(client)
+        return found
+
     def _to_spec(self, g: GeneratedTool) -> ToolSpec:
         """Wrap a generated tool as a spec whose execution goes through the sandbox.
 
