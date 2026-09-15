@@ -14,7 +14,7 @@ Global flags (also settable via environment, and persisted by `auto setup`):
     --base-url URL      AUTOFORGE_BASE_URL    default https://aiping.cn/api/v1
     --api-key KEY       AUTOFORGE_API_KEY     falls back to AIPING_API_KEY
     --fast              AUTOFORGE_FAST=1      drop the LLM-driven checks
-    --max-tokens N      AUTOFORGE_MAX_TOKENS  default 3000
+    --max-tokens N      AUTOFORGE_MAX_TOKENS  default 32768
     --no-proxy          AUTOFORGE_PROXY=0     for local endpoints
 
 Resolution order is flag > environment > ~/.autoforge/config.json > default.
@@ -43,7 +43,7 @@ from . import __version__, configfile, setup_wizard
 from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
-from .core.llm import OpenAICompatClient
+from .core.llm import DEFAULT_MAX_TOKENS, OpenAICompatClient
 from .core.steering import Steering
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
@@ -161,7 +161,8 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
     if args.max_tokens:
         max_tokens, src["max_tokens"] = args.max_tokens, "flag"
     else:
-        max_tokens = int(pick("max_tokens", None, "AUTOFORGE_MAX_TOKENS", default=3000))
+        max_tokens = int(pick("max_tokens", None, "AUTOFORGE_MAX_TOKENS",
+                              default=DEFAULT_MAX_TOKENS))
 
     policy_name, policy_src = _resolve_policy(args, saved, src)
     return ({"base": base, "model": model, "key": key, "proxy": use_proxy,
@@ -323,8 +324,15 @@ def _build_mode(cfg: dict, mode: str = "standard"):
     try:
         agent.store = ToolStore(os.environ.get("AUTOFORGE_DB") or None)
     except Exception as exc:                                   # noqa: BLE001
-        print(f"{_c(_Y, 'note:')} tool store unavailable ({exc}); sealed tools "
+        # A silent fallback here is indistinguishable from "this agent has no
+        # memory", which is exactly how it reads from the inside. Print the
+        # traceback so the next failure names its own cause instead of leaving
+        # the operator to guess at a path.
+        import traceback
+
+        print(f"{_c(_Y, 'note:')} tool store unavailable ({exc!r}); sealed tools "
               f"live for this session only")
+        traceback.print_exc()
     return agent
 
 
@@ -407,6 +415,22 @@ class _LiveRun:
 
     WIDTH = 72
 
+    #: How often the beat thread wakes to look at the clock. The report below
+    #: is exact only to this granularity, so the two travel together: the
+    #: silence guarantee is `REPORT_EVERY + BEAT_SECONDS`, worst case.
+    BEAT_SECONDS = 1.0
+
+    #: The longest the operator may go without seeing a line. Their number, and
+    #: it is the *cadence* they asked for -- "every 30 seconds, one line per
+    #: step, like you do" -- not merely the 100s they will tolerate. Set against
+    #: the tolerance it left holes: a 41s forge round and a 58s model wait both
+    #: sat under a 60s ceiling and so reported nothing, which reads exactly like
+    #: a hung process. The ceiling has to sit *below* the pauses a real run
+    #: produces, or it never fires when it matters.
+    #: It is a ceiling on silence, not a period -- a run that is already
+    #: narrating itself never emits one.
+    REPORT_EVERY = 30.0
+
     def __init__(self, stream=None, editor=None) -> None:
         self.stream = stream or sys.stdout
         self.editor = editor if editor is not None and editor.available else None
@@ -417,6 +441,15 @@ class _LiveRun:
         self._waiting_since: float | None = None
         self._ticks = 0
         self._thread: threading.Thread | None = None
+        #: Whether a run is in progress. Tracked explicitly because "is a run
+        #: happening" is not the same question as "is it waiting on the model":
+        #: a sandbox call or a forge round is neither, and those are exactly the
+        #: stretches that used to go silent.
+        self._running = False
+        #: When the operator last saw a line. Every narrated event resets it, so
+        #: what the heartbeat enforces is a bound on *silence* -- there is never
+        #: a `REPORT_EVERY`-long stretch in which nothing is said.
+        self._last_report = time.time()
         # Where the run is, for `/status`: published as the loop moves, read by
         # whoever asks. Kept here rather than in the steering channel because
         # this object already sees every event.
@@ -479,19 +512,52 @@ class _LiveRun:
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> "_LiveRun":
-        if self.live:
-            self._thread = threading.Thread(target=self._beat, daemon=True)
-            self._thread.start()
+        # Started even when nobody is at a terminal. A piped run -- the one
+        # being teed into a log -- has exactly the same long silences, and the
+        # report line is precisely what its log is missing. Only the every-
+        # second tick is gated on a live terminal, below.
+        self._thread = threading.Thread(target=self._beat, daemon=True)
+        self._thread.start()
         return self
 
     def _beat(self) -> None:
-        while not self._stop.wait(1.0):
-            if self._waiting_since is None:
+        while not self._stop.wait(self.BEAT_SECONDS):
+            if self._running and time.time() - self._last_report >= self.REPORT_EVERY:
+                self._report()
+            # The tick is a rewrite in place, so it is only meaningful where
+            # something can be rewritten. Piped to a file it would append one
+            # line per second, all of them saying the same thing.
+            if not self.live or self._waiting_since is None:
                 continue
             secs = int(time.time() - self._waiting_since)
             if secs >= 1 and secs != self._ticks:
                 self._ticks = secs
                 self._tickline(f"      … waiting on model ({secs}s)")
+
+    def _report(self) -> None:
+        """Say where the run is, on a line that stays put.
+
+        The tick line is rewritten in place every second, which makes it a
+        picture of *now* and not a record: scroll back and the ticks are gone.
+        So a run could be alive, ticking, and still read as silence -- which is
+        the complaint this answers. Every `REPORT_EVERY` seconds of quiet also
+        gets a real line, in the same shape as the event lines above it, so the
+        transcript shows the work continuing instead of a gap.
+        """
+        self._clear()
+        if self._forging:
+            doing = f"still forging {self._forging}"
+        elif self._waiting_since is not None:
+            doing = (f"still waiting on the model "
+                     f"({int(time.time() - self._waiting_since)}s)")
+        else:
+            doing = "still working"
+        bits = [f"turn {self._turn or '-'}"]
+        if self._last_tool:
+            bits.append(f"last tool: {self._last_tool}")
+        self._write(f"  [{self._stamp()}] +{self._elapsed()}  {doing}"
+                    f"  ·  {'  ·  '.join(bits)}\n")
+        self._last_report = time.time()
 
     def stop(self) -> None:
         self._stop.set()
@@ -501,6 +567,11 @@ class _LiveRun:
 
     # -- the callback handed to ForgeAgent.run -------------------------
     def __call__(self, kind: str, payload: dict) -> None:
+        # Every narrated event is the operator seeing something, so it restarts
+        # the silence clock: the heartbeat has nothing to add while a run is
+        # already talking, and a line it does add is a line they did not need.
+        self._running = True
+        self._last_report = time.time()
         if kind == "request":
             self._clear()
             self._turn = payload.get("turn") or self._turn
@@ -560,6 +631,17 @@ class _LiveRun:
             verdict = "sealed" if ok else "forge failed"
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
                         f"{verdict} {name} ({rounds} round(s))\n")
+        elif kind == "forge_aborted":
+            # Its own branch, not a `forge_done` with ok=False: the reader has
+            # to be able to tell "the tool was judged and failed" from "you
+            # interrupted before it was judged", and only one of those means
+            # the need is hard.
+            self._clear()
+            self._waiting_since = None
+            self._forging = None
+            why = str(payload.get("reason", "interrupted"))
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"forge stopped before a verdict — {why}\n")
         elif kind == "auto_quarantine":
             self._clear()
             self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
@@ -614,6 +696,7 @@ class _LiveRun:
     # end-of-task summary never repeats what the reader just watched scroll by.
     STREAMED = ("request", "turn", "call", "result", "finish",
                 "forge_start", "forge_attempt", "forge_done", "forge_error",
+                "forge_aborted",
                 "auto_quarantine", "amendment", "evolve", "spawn",
                 "design_team", "retire", "promote_withheld",
                 "gpu_compile", "gpu_bench", "evaluate")
@@ -642,6 +725,7 @@ class _LiveRun:
         return "  ·  ".join(bits)
 
     def done(self, result) -> None:
+        self._running = False
         self._clear()
         n_calls = len(result.tool_calls) if isinstance(result.tool_calls, list) else result.tool_calls
         self._write(f"  [{self._stamp()}] +{self._elapsed()}  done — "
@@ -668,7 +752,14 @@ LIVE_HINT = (f"{_c(_D, 'it does not lock the keyboard: while it runs, type to ad
 
 def cmd_chat(args: argparse.Namespace) -> int:
     cfg = _config(args)
-    agent = _build(cfg)
+    # `standard`, not a bare `_build`: a chat session is the surface a person
+    # actually lives in, so it is the last place that should quietly lose the
+    # tool ledger. Built without a store the agent answers "No store attached
+    # this session" to `recall` and `my_history` — which reads from the inside
+    # as a broken agent rather than as a missing mount, and is how a one-line
+    # wiring gap grew a workaround skill. `run` and the web harness already
+    # come through here.
+    agent = _build_mode(cfg, "standard")
     _describe(cfg, agent)
     print(BANNER)
     print(LIVE_HINT)
@@ -931,6 +1022,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bus(args: argparse.Namespace) -> int:
+    """`auto bus ...` -- a mail channel to another session in this repo.
+
+    Two `auto` processes cannot see each other, and the expensive failure is
+    not that they disagree but that they never notice: both edit the same file
+    and the second write wins. The bus is the notice.
+
+    The bus declares its own subcommands (register/send/read/tail/boards/who)
+    and its own directory flag. Re-declaring them here would be a second copy
+    of that grammar to keep in step with the first, and the copy that drifts is
+    always the one a person is reading -- so the rest of the line is handed
+    over verbatim. The import lives inside the function so the dependency stays
+    one-way: the bus imports nothing from this module, and should stay free to.
+    """
+    from autoforge.bus import build_parser, cmd_bus as run_bus
+
+    rest = list(getattr(args, "rest", None) or [])
+    if not rest:
+        # Bare `auto bus` explains itself, the way bare `auto` does.
+        build_parser().print_help()
+        return 0
+    return run_bus(rest)
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     """Attend to whatever the schedule says is due, then exit.
 
@@ -1079,6 +1194,14 @@ def build_parser() -> argparse.ArgumentParser:
                                    "$AUTOFORGE_HOME/schedule.jsonl)")
     tk.add_argument("--mode", choices=list(MODES), default="standard",
                     help="which agent runs the due tasks")
+
+    b = sub.add_parser(
+        "bus", help="talk to another session working in this repo "
+                    "(register/send/read/tail/boards/who)")
+    # REMAINDER, not a second copy of the bus grammar: the bus owns its own
+    # subcommands, and this parser's only job is to get out of their way.
+    b.add_argument("rest", nargs=argparse.REMAINDER,
+                   help="a bus subcommand and its arguments")
     return p
 
 
@@ -1099,6 +1222,7 @@ def command_table() -> dict[str, Any]:
         "run": cmd_run,
         "modes": cmd_modes,
         "tick": cmd_tick,
+        "bus": cmd_bus,
     }
 
 

@@ -387,10 +387,17 @@ def test_the_note_reports_the_real_number_of_dropped_messages():
     assert claimed == ev.dropped > 0
 
 
-def test_a_stall_is_latched_instead_of_retried_forever():
-    """A summary bigger than what it replaced leaves the context exactly as
-    oversized as before. Retrying pays for a summarizer call on every turn for
-    the same nothing."""
+def test_ineffective_compaction_backs_off_after_two_strikes():
+    """A cut that cannot shrink the context is retried once, then dropped.
+
+    Ported from Hermes' anti-thrash rule (`_MAX_INEFFECTIVE_COMPRESSIONS`).
+    One ineffective pass is not a verdict: the summarizer can be transiently
+    bad, and the flag this replaces was latched on the first failure — which
+    meant one oversized message disabled compaction for the whole run while the
+    transcript kept growing. Two consecutive passes with no reduction is where
+    retrying is provably pointless, because the next turn asks the same
+    question of the same list.
+    """
     class Huge:
         name = "huge"
 
@@ -402,9 +409,80 @@ def test_a_stall_is_latched_instead_of_retried_forever():
     ev = c.maybe_compact(msgs, 1)
     assert ev is not None and not ev.acted
     assert "did not reduce" in ev.error
-    assert c.stalled is True
-    assert c.maybe_compact(msgs, 2) is None      # latched
+    assert "Strike 1 of 2" in ev.error
+    assert c.stalled is False                # one pass is not yet a verdict
+    assert c.report()["stalled"] is False
+
+    c.maybe_compact(msgs, 2)
+    assert c.stalled is True                 # the second one makes it one
     assert c.report()["stalled"] is True
+    assert c.report()["ineffective"] == 2
+    assert c.maybe_compact(msgs, 3) is None  # and now it stops paying
+
+
+def test_strikes_clear_when_the_context_is_under_the_line_again():
+    """The ledger tracks a condition, not a history of failures.
+
+    A strike earned while the context was over the threshold must not go on
+    suppressing compaction after the context is back under it: that is the bug
+    the latch had, and the reason Hermes resets the count on any reading that
+    clears the line.
+    """
+    msgs = long_history(turns=20)
+    c = Compactor(tiny_policy(max_context_tokens=10_000_000))
+    c.ineffective = 2
+    assert c.stalled is True                 # blocked, as if from two bad cuts
+    assert c.maybe_compact(msgs, 1) is None
+    assert c.ineffective == 0 and c.stalled is False
+
+
+def test_a_grown_transcript_earns_one_probe():
+    """Blocked is not sealed: growth past the blocked size buys one more look.
+
+    Hermes allows its probe after 300 seconds of continuous block
+    (`_ANTI_THRASH_RECOVERY_SECONDS`) on the reasoning that the transcript has
+    changed underneath the decision. Growth is the same signal without a clock,
+    and exactly one strike is granted, so a transcript that still cannot be
+    compacted re-trips on the next pass instead of looping.
+    """
+    class Huge:
+        name = "huge"
+
+        def summarize(self, msgs):
+            return "y" * 200_000
+
+    msgs = long_history(turns=20)
+    c = Compactor(tiny_policy(), summarizer=Huge(), fallback=None)
+    c.maybe_compact(msgs, 1)
+    c.maybe_compact(msgs, 2)
+    assert c.stalled is True
+    blocked_at = c.blocked_at_tokens
+
+    # Barely grown is not grown enough: still blocked, no summarizer call.
+    assert c.maybe_compact(msgs, 3) is None
+
+    msgs.extend(long_history(turns=60)[2:])
+    assert estimate_tokens(msgs) > blocked_at * 1.5
+    ev = c.maybe_compact(msgs, 4)            # the probe is allowed through
+    assert ev is not None and not ev.acted
+    assert c.stalled is True                 # it was ineffective, so it re-trips
+
+
+def test_an_uncuttable_pass_moves_the_counter():
+    """No cut is a strike, same as no reduction.
+
+    A transcript that is over the threshold with nothing safe to cut answers
+    every future turn identically. Counting that as ineffective is what stops
+    the loop from paying a fresh planning pass on every turn — Hermes counts its
+    too-few-messages case for the same reason.
+    """
+    msgs = [Message.system("sys"), Message.user("task"),
+            Message.tool("z" * 400_000, "c0", "read_file")]
+    c = Compactor(tiny_policy())
+    ev = c.maybe_compact(msgs, 1)
+    assert ev is not None and not ev.acted
+    assert "too short to cut" in ev.error
+    assert c.ineffective == 1
 
 
 def test_persistence_appends_and_reports_the_failure_instead_of_raising(tmp_path):

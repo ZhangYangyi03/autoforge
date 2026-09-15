@@ -30,8 +30,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from .llm import LLMClient
+from .llm import LLMAborted, LLMClient
 from .message import Message
+from .compaction import OUTPUT_MAX_CHARS, bound_output
 
 DEFAULT_SYSTEM = (
     "You are a capable agent. Call a tool when it genuinely helps; answer "
@@ -85,6 +86,25 @@ def _notify(hook: Callable[..., None] | None, *args: Any) -> None:
     try:
         hook(*args)
     except Exception:  # noqa: BLE001 — reporting is never load-bearing
+        pass
+
+
+def _mark_run(steer: Any, live: bool) -> None:
+    """Tell the channel whether a run is live, when it tracks that at all.
+
+    The channel's reply to the operator promises that "the step in progress
+    will yield to it". Only this loop can make that a fact rather than a hope,
+    so the loop holds the flag -- and the guard is for the duck-typed channels
+    (tests, embedders) that are usable without it: a missing marker must never
+    be the thing that kills a run, exactly as a broken channel reads as "no"
+    in `_operator_wants_the_floor`.
+    """
+    fn = getattr(steer, "begin_run" if live else "end_run", None)
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 — see docstring
         pass
 
 
@@ -142,6 +162,25 @@ class Agent:
         self._terminated: _TerminateSignal | None = None
         if allow_self_terminate:
             self._register_terminate_tool()
+
+    def _bounded(self, output: str, tool: str) -> str:
+        """`output` cut down to the cap before it enters the context.
+
+        Ported from Hermes' per-message truncation limits (`_CONTENT_MAX` with a
+        head and a tail). Hermes applies them when it hands messages to the
+        summarizer; this loop applies them at *ingest*, because the damage is
+        already done by the time a summary runs: an unbounded `dir /s` or a whole
+        file read is one message, and one 60k-token message can walk a transcript
+        from under the threshold to three times over it in a single turn — past
+        anything a cut of the *middle* can fix.
+
+        The cap comes from the compactor's policy when a compactor is present, so
+        whoever sized the window sized this too; with no compactor there is no
+        threshold to protect and the module default stands.
+        """
+        cap = getattr(getattr(self.compactor, "policy", None),
+                      "max_output_chars", OUTPUT_MAX_CHARS)
+        return bound_output(output, max_chars=cap or 0, name=tool)
 
     def _register_terminate_tool(self) -> None:
         from ..tools.spec import ToolSpec, ToolState
@@ -202,7 +241,47 @@ class Agent:
             stopped_by_operator=True, termination_reason="stopped by the operator",
         )
 
+    def _operator_wants_the_floor(self) -> bool:
+        """Whether the operator has said something the loop has not consumed.
+
+        Asked by *long steps* about themselves -- an in-flight model call, a
+        running sandbox child -- so their line lands inside the step rather than
+        after it. `_absorb` at the loop boundaries is the same question asked at
+        the cheap moments; this is the one asked at the expensive ones, and the
+        difference is minutes.
+
+        A stop counts as well as a note. A `/stop` that can only be honoured at
+        the next boundary is not a stop, it is a note that the current step is
+        still going -- and the step it is ignored by is the longest one.
+
+        A failure here reads as "no". This is polled from inside a request; if
+        the steering channel is somehow unusable, the right outcome is a run
+        that finishes, not a run that dies investigating its own intercom.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+        except Exception:                     # noqa: BLE001 - see docstring
+            return False
+
     def run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
+        """Run to a result, telling the channel that a run is live throughout.
+
+        The channel's reply to the operator promises that the step in progress
+        will yield to them. This is the loop that has a step in progress, so
+        this is the place that makes the sentence true. The `finally` carries
+        as much of it as the entry: a run that raises, or that self-terminates
+        through the terminate tool, must not leave the channel promising a
+        yield from a loop that is no longer there.
+        """
+        _mark_run(self.steer, True)
+        try:
+            return self._run(task, history)
+        finally:
+            _mark_run(self.steer, False)
+
+    def _run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
         msgs = list(history or [])
         if not msgs or msgs[0].role != "system":
             msgs.insert(0, Message.system(self.system_prompt))
@@ -241,7 +320,21 @@ class Agent:
                     _notify(self.on_compact, event)
 
             _notify(self.on_request, turn)
-            resp = self.llm.chat(msgs, tools=self.registry.schemas())
+            try:
+                resp = self.llm.chat(
+                    msgs, tools=self.registry.schemas(),
+                    should_abort=self._operator_wants_the_floor,
+                )
+            except LLMAborted:
+                # They spoke while the answer was in flight. Nothing has been
+                # decided yet -- no tool ran, no message was appended -- so the
+                # only correct move is to go round again, where `_absorb` folds
+                # their line into the list and the same question is asked, now
+                # informed. The turn is given back: a turn that produced no
+                # answer is not a turn spent, and counting it would let an
+                # operator's own corrections race the turn cap.
+                turn -= 1
+                continue
             msgs.append(Message.assistant(resp.content, resp.tool_calls))
             _notify(self.on_turn, turn, msgs[-1])
 
@@ -260,7 +353,8 @@ class Agent:
                         self_terminated=True, termination_reason=sig.reason,
                     )
                 _notify(self.on_tool_result, tc.name, result)
-                msgs.append(Message.tool(result.output, tc.id, tc.name))
+                msgs.append(Message.tool(self._bounded(result.output, tc.name),
+                                         tc.id, tc.name))
                 # A note typed while that tool ran lands here, before the model
                 # is asked again — a forge can take minutes, and waiting until
                 # the task ended would make the correction useless.

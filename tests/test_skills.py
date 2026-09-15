@@ -185,6 +185,73 @@ class TestFilesAreTheTruth:
 
 
 # ======================================================================
+# a scan that sees fewer skills is not proof that they were deleted
+# ======================================================================
+class TestScanIsNotEvidenceOfDeletion:
+    """A scan may drop a row only when it has evidence the file is gone.
+
+    `scan()` read "known but not seen this time" as "the file was deleted" and
+    dropped the row -- every row, whenever the scan happened to look somewhere
+    that did not hold them. Another `dirs`, a cwd without a `skills/`, or a
+    `home` that is not the one the rows were written under all produce that,
+    and the cost is every `loads` count in the table, which is the ranking
+    input and cannot be recovered. Deleting a row is unrecoverable; keeping a
+    stale one costs a ranking nudge the next real scan corrects.
+    """
+
+    def _elsewhere(self, tmp_path):
+        d = tmp_path / "elsewhere"
+        d.mkdir()
+        return d
+
+    def test_a_scan_of_somewhere_else_keeps_the_rows(self, home, store, tmp_path):
+        _write_raw(home / "skills", "kept", "---\ndescription: d\n---\nb\n")
+        _lib(home, store).scan()
+        assert [r["name"] for r in store.skill_rows()] == ["kept"]
+        # A second library over the same store, pointed at an empty directory.
+        # It has never seen "kept"; it must not conclude that it is gone.
+        SkillLibrary(store=store, dirs=[("user", str(self._elsewhere(tmp_path)))]).scan()
+        assert [r["name"] for r in store.skill_rows()] == ["kept"]
+
+    def test_the_load_counts_survive_it(self, home, store, tmp_path):
+        _write_raw(home / "skills", "used", "---\ndescription: d\n---\nb\n")
+        lib = _lib(home, store)
+        lib.scan()
+        lib.load("used")
+        lib.load("used")
+        SkillLibrary(store=store, dirs=[("user", str(self._elsewhere(tmp_path)))]).scan()
+        assert [r["loads"] for r in store.skill_rows()] == [2]
+
+    def test_a_directory_that_is_absent_is_not_a_deletion_either(
+            self, home, store, tmp_path):
+        _write_raw(home / "skills", "kept", "---\ndescription: d\n---\nb\n")
+        _lib(home, store).scan()
+        absent = tmp_path / "no-such-dir"          # never created, never walked
+        SkillLibrary(store=store, dirs=[("user", str(absent))]).scan()
+        assert [r["name"] for r in store.skill_rows()] == ["kept"]
+
+    def test_a_deletion_in_a_directory_this_scan_never_read_is_not_its_call(
+            self, home, store, tmp_path):
+        # The file really is gone, but not in a place this scan looked, so the
+        # scan has no standing to say the skill left the library.
+        p = _write_raw(home / "skills", "gone", "---\ndescription: d\n---\nb\n")
+        _lib(home, store).scan()
+        os.unlink(p)
+        SkillLibrary(store=store, dirs=[("user", str(self._elsewhere(tmp_path)))]).scan()
+        assert [r["name"] for r in store.skill_rows()] == ["gone"]
+
+    def test_a_real_deletion_still_drops_the_row(self, home, store):
+        # The guard must not make deletions invisible: here the file is gone
+        # *and* the directory that held it was walked. That is evidence.
+        p = _write_raw(home / "skills", "gone", "---\ndescription: d\n---\nb\n")
+        lib = _lib(home, store)
+        lib.scan()
+        os.unlink(p)
+        assert lib.scan() == []
+        assert store.skill_rows() == []
+
+
+# ======================================================================
 # a broken file must not take the library down, or hide
 # ======================================================================
 class TestBrokenFilesAreReported:
@@ -376,8 +443,29 @@ class TestTheMenuIsAnIndex:
         lib.scan()
         lib.load("used")
         text = "\n".join(lib.menu())
-        assert "used (used 1x)" in text
+        # A tier, not a count: "used 1x" would move this line — and every
+        # message behind it in the prompt — on every single load.
+        assert "used (used before)" in text
         assert "unused (never used)" in text
+
+    def test_the_menu_text_does_not_move_inside_a_tier(self, home, store):
+        """Only a change of kind is worth a change of prompt.
+
+        The exact count is what made this line churn; the claim it was carrying
+        survives at two transitions instead of at every load.
+        """
+        _write_raw(home / "skills", "one", "---\ndescription: d\n---\nb\n")
+        lib = _lib(home, store)
+        lib.scan()
+        lib.load("one")
+        once = "\n".join(lib.menu())
+        lib.load("one")
+        lib.load("one")
+        assert "\n".join(lib.menu()) == once
+
+        for _ in range(3):                     # crosses into the top tier
+            lib.load("one")
+        assert "one (well proven)" in "\n".join(lib.menu())
 
     def test_the_menu_truncates_and_says_so(self, home, store):
         for i in range(40):
@@ -565,7 +653,11 @@ class TestItReachesTheModel:
         a.run("go")
         text = a.llm.calls[0][0][0].content
         assert "1 procedure(s) on disk" in text
-        assert "1 load(s) across them" in text
+        # The load counter is deliberately NOT in the prompt: it moves every time
+        # a body is loaded, and the prompt is the prefix of every request, so a
+        # changing integer there re-bills the whole conversation uncached. The
+        # count is still available from the library — see test_prompt_stability.
+        assert a.skills.report()["loads_total"] == 1
 
     def test_no_store_still_offers_skills_from_disk(self, home):
         # Skills do not need the database to exist — the files are the truth,

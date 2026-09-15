@@ -91,6 +91,13 @@ class Steering:
         self.editor = editor if editor is not None else LineEditor(stream=self.stream)
         self._pending: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
+        # Whether a run is live right now. Held by the loop that owns the
+        # steps -- ``Agent.run`` -- and not by whoever happens to be printing:
+        # the reply to the operator promises that the *step in progress* will
+        # yield, and only the loop can know whether there is one. Read by
+        # ``_queue``; see ``running``.
+        self._run_lock = threading.Lock()
+        self._run_depth = 0
         self._closed = threading.Event()
         self._eof = threading.Event()
         self._thread: threading.Thread | None = None
@@ -106,6 +113,28 @@ class Steering:
     def editing(self) -> bool:
         """True once the terminal is under the editor's control."""
         return bool(self.editor.available)
+
+    @property
+    def running(self) -> bool:
+        """True while a run is live, i.e. while there is a step to yield."""
+        with self._run_lock:
+            return self._run_depth > 0
+
+    def begin_run(self) -> None:
+        """Mark a run as live. Called by the loop, cancelled by `end_run`.
+
+        Counted rather than a flag so a nested run (a mode that drives an
+        agent, which drives another) cannot end the outer one's life by
+        finishing first.
+        """
+        with self._run_lock:
+            self._run_depth += 1
+
+    def end_run(self) -> None:
+        """Mark a run as over. Idempotent, so an exit path may call it twice."""
+        with self._run_lock:
+            if self._run_depth:
+                self._run_depth -= 1
 
     def start(self) -> "Steering":
         """Start reading the stream, if there is a person on the other end."""
@@ -203,7 +232,25 @@ class Steering:
 
     def _queue(self, text: str) -> None:
         self._pending.put(text)
-        self._say(f"will reach the agent at the next step: {text[:60]}")
+        # "At the next step" was the truth when the step boundary was the only
+        # way in, and it read as a brush-off: the next step was minutes away, so
+        # the honest-sounding line was the one the operator heard as being
+        # ignored. Now the loop also asks this queue from inside its long steps
+        # (`Agent._operator_wants_the_floor`) and a running tool does too, so
+        # the step in progress is cut short instead of being waited out. The
+        # reply says that, because it is the difference the operator is
+        # watching for.
+        #
+        # But that is only true when there *is* a step. A line typed between
+        # runs -- or into a second process, or after the loop already returned
+        # -- used to get the same sentence, promising a yield that nothing
+        # could perform. Whether it is true is decidable, because the loop says
+        # so when it starts and when it stops, so ask rather than assume.
+        if self.running:
+            self._say(f"✓ heard, and the step in progress will yield to it: {text[:60]}")
+        else:
+            self._say("✓ heard — nothing is running right now, so this goes in "
+                      f"with your next request: {text[:60]}")
 
     def _say(self, text: str) -> None:
         try:
@@ -236,6 +283,21 @@ class Steering:
 
     def stop_requested(self) -> bool:
         return self._stop.is_set()
+
+    def has_pending(self) -> bool:
+        """Whether the operator has said anything the loop has not consumed.
+
+        This is the question a *long-running* step has to ask about itself. The
+        loop already drains the queue at its boundaries, but a forge is minutes
+        long and the boundaries can be minutes apart, so a step that can be cut
+        short needs to be able to ask mid-step: "did they just say something?"
+        A yes there means the answer being computed is answering a question
+        that has already changed.
+
+        Cheap and side-effect free by design -- it is polled, so it must not
+        consume, print, or move a counter.
+        """
+        return not self._pending.empty()
 
     # -- the next prompt ------------------------------------------------
     def take_line(self, prompt: str) -> str:

@@ -44,6 +44,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+try:
+    from wcwidth import wcwidth as _wcwidth
+except Exception:
+    def _wcwidth(ch):
+        return 2 if ord(ch) > 0x2E7F else 1
+
 
 __all__ = [
     "LineEditor",
@@ -104,6 +110,24 @@ _CTRL_L = "\x0c"   # redraw
 _CTRL_D = "\x04"   # EOF when the buffer is empty
 _BACKSPACE = ("\x7f", "\x08")
 
+#: Windows scan codes -> the escape sequence the rest of this module decodes.
+#:
+#: `msvcrt.getwch()` reports a special key as two code units: a lead byte
+#: (`\x00` for F-keys, `\xe0` for the navigation cluster) followed by a scan
+#: code. The scan code is the key's only identity on Windows — there is no
+#: escape sequence to read — so it has to be translated here or the key is
+#: lost. These are the codes for the navigation cluster, which is the set a
+#: line editor needs: the arrows, Home, End and Delete.
+_WIN_SCAN = {
+    "H": "\x1b[A",   # up
+    "P": "\x1b[B",   # down
+    "M": "\x1b[C",   # right
+    "K": "\x1b[D",   # left
+    "G": "\x1b[H",   # home
+    "O": "\x1b[F",   # end
+    "S": "\x1b[3~",  # delete
+}
+
 
 def paste_dir() -> Path:
     """Where collapsed pastes live. `AUTOFORGE_HOME` wins, else `~/.autoforge`."""
@@ -150,6 +174,12 @@ def collapse_paste(text: str, *, lines: int = PASTE_LINES, chars: int = PASTE_CH
     """
     if not isinstance(text, str) or not text:
         return text or ""
+    # Normalise line endings first. A Windows terminal sends a pasted block's
+    # breaks as a bare CR (an old Mac terminal as CR only), so counting
+    # "\n" alone sees a sixty-line paste as one line: neither threshold
+    # is met and the block is inserted verbatim instead of collapsed. The
+    # counter has to see the same breaks the detector did.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     count = text.count("\n") + 1
     if count < lines and len(text) < chars:
         return text
@@ -184,8 +214,19 @@ def expand_paste_refs(text: str) -> str:
 
 
 def _visible_len(text: str) -> int:
-    """Length as the terminal counts it — colour codes take no columns."""
-    return len(_ANSI.sub("", text))
+    """Length as the terminal counts it — colour codes take no columns.
+
+    Neither do control characters. A break inside a prompt is a row of its own,
+    which the layout deals with separately; counting it here as well would put
+    the cursor one column past where it actually is.
+    """
+    total = 0
+    for ch in _ANSI.sub("", text):
+        if ch < " ":
+            continue
+        w = _wcwidth(ch)
+        total += w if w and w > 0 else 0
+    return total
 
 
 class _RawTerminal:
@@ -256,7 +297,15 @@ class _RawTerminal:
             self._saved_out = out_mode.value
             # ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x4): without it the escape
             # sequences below print as literal `^[[J` noise in cmd.exe.
-            kernel32.SetConsoleMode(self._out_handle, out_mode.value | 0x0004)
+            #
+            # DISABLE_NEWLINE_AUTO_RETURN (0x8) is not optional here. With VT
+            # on, the console translates a bare newline into CRLF on its own;
+            # the editor already writes CRLF in _draw, so every row it drew
+            # advanced the cursor two rows while _rows/_cur_row counted one.
+            # _erase then climbed back over half the rows it had drawn, and
+            # the input line walked down the screen one row per character
+            # typed. 0x000C is both flags.
+            kernel32.SetConsoleMode(self._out_handle, out_mode.value | 0x000C)
         self.ok = True
 
     def close(self) -> None:
@@ -298,12 +347,20 @@ class _RawTerminal:
             except (EOFError, KeyboardInterrupt):
                 return None
             if ch in ("\x00", "\xe0"):
-                # A function key: two code units, and we want neither.
+                # A function key: two code units. The second is a scan code,
+                # and on Windows it is the *only* place the key's identity
+                # exists — msvcrt never produces the ANSI escape sequence the
+                # rest of this module decodes. Discarding it, which is what
+                # this did, silently killed left/right/home/end/delete: the
+                # editor's `_apply_key` was correct and simply never called,
+                # so the cursor could not move and a mid-line typo could not
+                # be deleted. Translate instead, so the Windows path feeds the
+                # same `_KEYS` table the POSIX path already feeds.
                 try:
-                    msvcrt.getwch()
-                except Exception:
-                    pass
-                return b""
+                    code = msvcrt.getwch()
+                except (EOFError, KeyboardInterrupt):
+                    return None
+                return _WIN_SCAN.get(code, "").encode("ascii")
             return ch.encode("utf-8", "replace")
         try:
             data = os.read(self.fd, 65536)
@@ -605,34 +662,46 @@ class LineEditor:
         small block pasted on a terminal without bracketed-paste support keeps
         its own lines, and laying those out as if they were ordinary
         characters would put the cursor on the wrong row.
+
+        A break inside the *prompt* is a row the prompt occupies, and the
+        buffer starts on the prompt's last row — `chat`'s prompt opens with a
+        newline, so the input line sits one row below it. Those rows are part
+        of the area the editor owns, and `row` is counted from the prompt's
+        first row rather than from the buffer's: erasing then climbs back over
+        them. Counted from the buffer instead, each keystroke re-emitted the
+        prompt's own break, and the input line walked down the screen one row
+        per character typed.
         """
         columns = max(20, int(getattr(self._term, "columns", 80) or 80))
-        indent = " " * _visible_len(self._prompt)
+        prompt_lines = self._prompt.split("\n")
+        head, last = prompt_lines[:-1], prompt_lines[-1]
+        indent = " " * _visible_len(last)
         # One column is held back so the cursor never comes to rest on the
         # right margin: a terminal that wraps at that column would push a
         # blank row under the input area every time the buffer filled a line.
         width = max(1, columns - len(indent) - 1)
 
-        rows: list[str] = []
-        starts: list[int] = []          # where in the buffer each row's text begins
+        rows: list[str] = list(head)     # the prompt's own earlier rows
+        starts: list[int] = [0] * len(head)
+        leading = len(rows)              # rows above the one the buffer starts on
         first = True
         offset = 0
         for segment in "".join(self._buf).split("\n"):
             at = offset
             for i in range(0, len(segment), width) or [0]:
                 chunk = segment[i:i + width]
-                rows.append((self._prompt if first else indent) + chunk)
+                rows.append((last if first else indent) + chunk)
                 starts.append(at)
                 at += len(chunk)
                 first = False
             offset += len(segment) + 1  # the break that `split` consumed
 
         at = min(self._cursor, offset - 1)
-        row = 0
+        row = leading
         for n, start in enumerate(starts):
             if at >= start:
                 row = n
-        col = _visible_len(self._prompt if row == 0 else indent)
+        col = _visible_len(last if row == leading else indent)
         col += min(at - starts[row], len(rows[row]) - col)
         return rows, row, col
 
@@ -676,3 +745,24 @@ def _looks_like_paste(text: str) -> bool:
     if breaks == 0:
         return False
     return breaks > 1 or not normalized.endswith("\n")
+
+
+def _visible_len(s):
+    n = 0
+    i = 0
+    L = len(s)
+    while i < L:
+        c = s[i]
+        if c == "\x1b":
+            m = re.match(r"\x1b\[[0-9;?]*[A-Za-z]", s[i:])
+            if m:
+                i += m.end()
+                continue
+        o = ord(c)
+        if o < 32 or o == 127:
+            i += 1
+            continue
+        w = _wcwidth(c)
+        n += w if w and w > 0 else 0
+        i += 1
+    return n

@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..core.llm import LLMClient
+from ..core.llm import DEFAULT_MAX_TOKENS, LLMClient
 from ..core.message import Message
 from .sandbox import Sandbox
 from ..tools.spec import ToolSpec, ToolState, TriggerProbe, normalise_parameters
@@ -428,11 +428,17 @@ class LLMToolGenerator:
     llm: LLMClient
     system_prompt: str = GENERATOR_SYSTEM
     model: str | None = None
-    # A tool envelope is ~40 lines of code plus metadata. Leaving the cap unset
-    # fails two different ways: a local runtime truncates mid-JSON, and the
-    # AIPING gateway routes the un-capped request to a provider pool that is
-    # currently down (HTTP 503 "暂无可用服务商"). An explicit budget fixes both.
-    max_tokens: int = 3000
+    # A tool envelope is ~40 lines of code plus metadata, and the model that
+    # writes it is a reasoning one: it produces a trace before it produces the
+    # envelope, and that trace is paid for out of this cap first. So the cap has
+    # to clear the trace, not the envelope. At 3000 the entire budget went to
+    # `reasoning_content` and the reply carried nothing usable -- which is the
+    # wall `UnrecoverableGeneration` reports instead of retrying. The default is
+    # therefore the client's (`DEFAULT_MAX_TOKENS`), sized above a plausible trace
+    # rather than around a non-reasoning answer; providers with a lower ceiling
+    # answer 400 and `_clamp_cap_after_rejection` resends smaller, so a generous
+    # number is not a trap on the stricter endpoints.
+    max_tokens: int = DEFAULT_MAX_TOKENS
 
     def generate(self, need: str, context: str = "") -> GeneratedTool:
         prompt = f"Recurring need:\n{need}\n"

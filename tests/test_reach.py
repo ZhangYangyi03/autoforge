@@ -170,3 +170,43 @@ class TestSchemasCarryTheClaim:
         sp = _agent().system_prompt
         assert "real filesystem" in sp
         assert "forge it" in sp
+
+    def test_the_prompt_forbids_answering_from_ignorance(self):
+        """The observed failure: asked what hermes' skills were, it read the
+        question as about itself, found nothing in my_capabilities, and answered
+        "I cannot read them — paste them and I will compare".
+
+        Every premise was false. Its own prompt says forge_tool IS file access,
+        and hermes' skills are directories on this same filesystem. What was
+        missing was a rule covering the *world* the way the old rule covered the
+        self: before claiming a limit, check what you have; before claiming
+        ignorance, look.
+
+        Nothing here is testable without a model, so the rules are pinned as
+        text — the same way the reach paragraph above is pinned, and for the same
+        reason: deleting them would silently restore the lazy answer.
+        """
+        sp = _agent().system_prompt
+
+        assert "Before reporting ignorance, look" in sp
+        assert "an answer you\n  could have fetched" in sp
+        # The specific conflict that produced the answer: the comparison section
+        # used to say "answer from the measured self-report", which contains
+        # nothing about another agent, so the honest-looking move was to say it
+        # could not see one. It now says to go and look first.
+        assert "Find out what the other thing is before you say anything" in sp
+        assert "is fiction, and it reads as modesty while being laziness" in sp
+        # And the shape the answer took: handing the lookup back to the user.
+        assert "Asking the user to paste what you could go and read" in sp
+        assert "If the block is your own\n  ignorance of something on this machine" in sp
+        # The third conflict, and probably the strongest: the recurrence
+        # principle read as a veto on ever forging a disposable look-tool — so
+        # the one thing the request needed was the one thing the prompt talked
+        # it out of. It governs the library, not the lookup.
+        assert "That rule governs what you KEEP, not what you may do" in sp
+        assert "not a reason to answer from ignorance instead" in sp
+        # And the line the lazy answer actually leaned on: "prefer the simplest
+        # path that works" reads as licence to say "I cannot" and stop, because
+        # saying it costs one sentence. The path has to work.
+        assert "Declaring ignorance is not a simple path" in sp
+        assert "cheapest thing to say rather than" in sp

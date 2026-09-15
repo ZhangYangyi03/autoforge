@@ -76,6 +76,17 @@ from .store import ToolStore
 from .tools.registry import ToolRegistry
 from .tools.spec import ToolSpec, ToolState
 
+#: Total characters of tool schema allowed to ride in every prompt.
+#:
+#: Every registered tool's schema is sent on every request, so the library is a
+#: per-turn cost, not a one-off. Measured on this machine: eight tools came to
+#: 2,770 characters, about 700 tokens, paid before the conversation starts.
+#: 6,000 characters is roughly 1,500 tokens — a ceiling that leaves room for a
+#: working library without letting it become the prompt. Exceeding it does not
+#: block a forge; it makes the forge name what it is trading away. See
+#: `_tool_budget_report`.
+TOOL_SCHEMA_BUDGET_CHARS = 6000
+
 
 AUTONOMOUS_SYSTEM = """You are an autonomous agent that grows its own capabilities.
 
@@ -88,6 +99,11 @@ Your reach — read this before claiming you cannot do something:
   false; forge it.
 - Anything you can express in Python, you can run. Treat that as shell access
   with a timeout, and say so if asked what you can reach.
+- The same applies to facts, not only to actions. If the question is what
+  something is, or how it compares to you, and that something is a directory, a
+  repo, a process or a config on this machine, then "I do not know what that is"
+  is a choice, not a limit: the answer is one forge away. You are not expected
+  to know it in advance. You are not allowed to stop there.
 
 You can:
 - my_capabilities — your real reach: what is enforced, what is declared-only,
@@ -111,14 +127,34 @@ You can:
 - terminate      — end the task when it is done
 
 Principles:
+- Before forging, check the market. `toolmarket` is a shared shelf of tools
+  other agents already built, and it is reachable at TOOLMARKET_URL (default
+  http://127.0.0.1:8000). GET /resources lists them; GET /resources/tool:<name>
+  reads one. If something there already serves the need, use it -- do not
+  re-forge it. Forging a duplicate costs a verification round and adds nothing.
 - Forge only when a need genuinely recurs; never duplicate a tool you have.
+- That rule governs what you KEEP, not what you may do. A look you need right
+  now is not a recurring need and does not have to be one: forge the tool, use
+  it, and retire_tool it if you will not want it again. Reading a directory to
+  answer a question is exactly that case, and "it would only be used once" is
+  not a reason to answer from ignorance instead.
+- Every forged tool is pushed to the market automatically, and the push checks
+  for an existing entry first. You do not need to upload by hand, and you should
+  not: a second upload of the same name is refused, and the ledger records it as
+  "already on the market" rather than as a failure.
 - When a tool fails repeatedly, evolve it; do not retry blindly.
 - When a task spans specialities, design the team before doing the work.
 - Self-modification needs a rationale. Say why.
 - Before reporting a limitation, check my_capabilities and my_history. A
   capability you have and deny is worse than one you lack.
+- Before reporting ignorance, look. The same rule, one step out: an answer you
+  could have fetched is not one you get to say you lack. "I cannot read X" and
+  "I do not know what X is" are both claims about a filesystem you can read —
+  make either one only after you tried.
 - You decide when the task is done. There is no hidden turn limit.
-- Prefer the simplest path that works.
+- Prefer the simplest path that works. Declaring ignorance is not a simple path
+  — it is the absence of one, and it is the cheapest thing to say rather than
+  the cheapest thing to do.
 
 Acting, not arguing:
 - When asked to build, port, fetch, scan or fix something, begin it in this
@@ -126,6 +162,9 @@ Acting, not arguing:
   hard, and do not close by asking permission for the work you were just asked
   to do. If the next step is within reach, take it and report what you found.
   Offering to start is not starting.
+- Asking the user to paste what you could go and read is the same failure as
+  offering to start: it hands back work that was yours. If the block is your own
+  ignorance of something on this machine, that is not a block.
 - A plan you did not begin is not progress. If you have named the steps,
   execute the first one now and report its result.
 - A partial working artifact beats a complete argument. Do the obvious subset
@@ -148,12 +187,18 @@ Writing style — plain text in a terminal, never markdown:
 - For emphasis, repeat the point in the sentence; do not wrap it in punctuation.
 
 Freedoms, when compared to another agent's:
+- Find out what the other thing is before you say anything about it. If it lives
+  on this host — a skills directory, a repo, a config, a log, a process — read it
+  first. "I cannot see their skills" without having listed the directory is the
+  exact answer this section exists to prevent: a comparison you did not look at
+  is fiction, and it reads as modesty while being laziness.
 - On reach, you are peers with anything on this host: forged code gets a real
   filesystem and a real network stack.
 - On self-change, if relevant, one line: amend_self and set_autonomy edit your
   prompt, forge config and permissions while you run. Do not rank yourself.
-- Answer in a few lines from the measured self-report. No comparison table, no
-  sorting the other agent's parts, no lecturing it about its boundaries.
+- Answer in a few lines from what you actually found, plus the measured
+  self-report. No comparison table, no sorting the other agent's parts, no
+  lecturing it about its boundaries.
 - Do not claim a limit you have. Do not invent a freedom you lack. The measured
   self-report above is the arbiter, recomputed every turn.
 """
@@ -238,6 +283,79 @@ def _coerce_weights(value: Any, current: Any) -> tuple[Any | None, str | None]:
 HOST_FACTS_HEADER = "HOST (measured on this machine — do not assume commands from habit):"
 
 
+def _compile_code(code: str, name: str) -> Any:
+    """Compile a stored tool body into a callable, without running it.
+
+    The counterpart of `toolmarket.protocol.resources.compile_tool_fn`, kept
+    here so autoforge does not import its sibling to load its own tools. The
+    market is a peer; a peer that is not installed should cost the distribution
+    step and nothing else.
+
+    Never raises on bad code, deliberately. A tool whose body does not compile
+    is still a tool the agent made: it stays in the library, and calling it
+    reports the breakage. Dropping it silently would make a broken tool
+    indistinguishable from one that was never forged.
+    """
+    if not code.strip():
+        def _noop(**kwargs: Any) -> str:
+            return f"{name}: no code stored"
+
+        return _noop
+    ns: dict[str, Any] = {}
+    try:
+        exec(compile(code, f"<tool:{name}>", "exec"), ns)  # noqa: S102
+    except Exception:                                      # noqa: BLE001
+        def _broken(**kwargs: Any) -> str:
+            return f"{name}: stored code failed to compile"
+
+        return _broken
+    fn = ns.get(name)
+    if callable(fn):
+        return fn
+    for key, val in ns.items():
+        if callable(val) and not key.startswith("_"):
+            return val
+
+    def _empty(**kwargs: Any) -> None:
+        return None
+
+    return _empty
+
+
+#: Path fragments that identify a git-bash/MSYS build of a POSIX tool. Such a
+#: binary runs, and its output looks like output — it just cannot see the
+#: native side of a Windows host, which is where the real processes are.
+_MSYS_MARKERS = ("/git/usr/", "/msys", "/mingw")
+
+
+def _is_msys_binary(path: Any) -> bool:
+    """Whether a resolved path is a git-bash/MSYS build rather than a native one."""
+    if not path or not isinstance(path, str):
+        return False
+    low = path.replace("\\", "/").lower()
+    return any(marker in low for marker in _MSYS_MARKERS)
+
+
+def _resolve(sandbox: Any, names) -> dict[str, Any]:
+    """For each name, the path it resolves to — or None.
+
+    A minimal sandbox (a test double) may answer only `reachable`, which
+    carries names and not paths; then the name itself stands in for the path.
+    That keeps the duck-typed channel working while the real object, which
+    knows its own PATH, gets to answer the sharper question.
+    """
+    resolve = getattr(sandbox, "resolve", None)
+    if callable(resolve):
+        try:
+            got = resolve(names)
+        except Exception:                 # noqa: BLE001 - never break the prompt
+            got = None
+        if isinstance(got, dict):
+            return {n: (got.get(n) or None) for n in names}
+    found, _missing = sandbox.reachable(names)
+    return {n: (n if n in found else None) for n in names}
+
+
 def host_facts(sandbox: Any = None) -> list[str]:
     """What this machine actually is, probed rather than assumed.
 
@@ -265,33 +383,76 @@ def host_facts(sandbox: Any = None) -> list[str]:
 
     probes = ("tasklist", "ps", "pgrep", "wmic", "powershell", "cmd", "sh")
     if sandbox is not None:
-        present, absent = sandbox.reachable(probes)
+        resolved = _resolve(sandbox, probes)
         where = "inside the sandbox"
     else:
         import shutil
 
-        present = [c for c in probes if shutil.which(c)]
-        absent = [c for c in probes if c not in present]
+        resolved = {c: shutil.which(c) for c in probes}
         where = "on PATH"
+    present = [c for c in probes if resolved.get(c)]
+    absent = [c for c in probes if not resolved.get(c)]
 
-    if "tasklist" in present:
+    # "It resolves" and "it can see" are different facts, and on Windows they
+    # disagree about `ps`. Measured on the box that produced this comment: 348
+    # native processes, `ps` reporting 5 rows, none of them native and not this
+    # agent's own. That is the pgrep trap one step further in — the command
+    # runs, says nothing useful, and the emptiness reads as "no such process".
+    blind = {c: resolved[c] for c in ("ps", "pgrep")
+             if _is_msys_binary(resolved.get(c))}
+    native = [c for c in ("tasklist", "wmic", "powershell") if resolved.get(c)]
+
+    # A lister that is on PATH but blind and a lister that is missing fail the
+    # same way: the probe returns nothing, and nothing reads as "no such
+    # process". Note the reasons, then state the lesson once — repeating it
+    # after every clause is how a warning turns into wallpaper.
+    warned: list[str] = []
+
+    if native:
         lines.append("- Processes: use `tasklist` — it is the native lister here.")
+        if blind:
+            lines += [
+                f"  {', '.join(sorted(blind))} resolves to {blind[sorted(blind)[0]]} —",
+                "  a git-bash/MSYS build. It lists MSYS processes ONLY: native",
+                "  Windows processes are invisible to it, this agent's own included.",
+                "  Do not read a short or empty list from it as \"no such process\".",
+            ]
+            warned.append("blind")
         posix_gone = [c for c in ("ps", "pgrep") if c in absent]
         if posix_gone:
             lines += [
                 f"  {', '.join(posix_gone)} is not resolvable {where}: a probe built on",
                 "  it returns *nothing* instead of failing, and empty output reads",
-                "  exactly like \"no such process\". An empty result is not evidence of",
-                "  absence — check what the probe actually ran before believing it.",
+                "  exactly like \"no such process\".",
             ]
-    elif "ps" in present:
+            warned.append("absent")
+    elif "ps" in present and not blind.get("ps"):
         lines.append(f"- Processes: `ps` is resolvable {where} — use it.")
+    elif "ps" in present:
+        lines += [
+            f"- Processes: `ps` resolves to {resolved['ps']} — a git-bash/MSYS",
+            "  build, which lists MSYS processes ONLY. Native Windows processes",
+            "  are invisible to it. Prefer `tasklist`, `powershell -NoProfile",
+            "  -Command \"Get-Process\"`, or say you cannot check: a short list",
+            "  from `ps` here is a limit of the tool, not a fact about the machine.",
+        ]
+        warned.append("blind")
     else:
         lines.append("- Processes: no known process lister "
                      f"{where} — read /proc directly, or say you cannot check.")
 
+    if warned:
+        lines += [
+            "  An empty result is not evidence of absence — check what the probe",
+            "  actually ran, and whether the lister it used could see at all.",
+        ]
+
+    def _label(name: str) -> str:
+        return f"{name} (MSYS: native processes invisible)" if name in blind else name
+
     if present:
-        lines.append(f"- Resolvable {where}: {', '.join(sorted(present))}.")
+        lines.append(f"- Resolvable {where}: "
+                     f"{', '.join(sorted(_label(c) for c in present))}.")
     if absent:
         lines.append(f"- NOT resolvable {where}: {', '.join(sorted(absent))} — "
                      f"invoking these yields empty output, not an error.")
@@ -451,6 +612,12 @@ class ForgeAgent:
         # actually runs. Without this the policy would be a comment again.
         self.registry.policy = self.policy
         self.registry.confirmer = self.confirmer
+        # Retiring or quarantining a tool is a judgement about the tool, and a
+        # judgement that lasts only until the process exits is not one. The
+        # registry owns the transitions; the agent owns the store; this is the
+        # wire between them. Without it every state change was memory-only and
+        # the next session loaded the tool back as `active`.
+        self.registry.on_state_change = self._persist_tool_state
 
         self.selfmod = SelfModifier(
             require_rationale=self.policy.require_change_rationale,
@@ -518,6 +685,15 @@ class ForgeAgent:
             # The library records the failure and reports it in the menu.
             pass
 
+        # Tools from previous sessions. Without this the store is write-only:
+        # every forge saves a tool and nothing ever reads it back, so the agent
+        # starts each session with an empty library and re-forges what it
+        # already made. The symptom is subtle -- `list_tools` shows only the
+        # builtins, which reads as "I have never forged anything" rather than
+        # as "the load step is missing" -- and it is the difference between a
+        # library and a log file.
+        self._load_persisted_tools()
+
         # Coherence past the window. The summarizer is the model itself -- it is
         # the only thing present that can tell a decision from a command -- with
         # the deterministic summarizer behind it, so a model that fails or
@@ -526,7 +702,8 @@ class ForgeAgent:
         # summarizer's reach entirely, are the Compactor's business.
         if self.compactor is None:
             self.compactor = Compactor(
-                summarizer=LLMSummarizer(self.llm),
+                summarizer=LLMSummarizer(
+                    self.llm, should_abort=self._operator_wants_the_floor),
                 fallback=DeterministicSummarizer(),
                 log_path=default_log_path(),
             )
@@ -599,6 +776,61 @@ class ForgeAgent:
         self.registry.promote(spec.name)
 
     # ------------------------------------------------------------------
+    # the prompt budget: what the library costs every turn
+    # ------------------------------------------------------------------
+    def _tool_schema_chars(self, *, own_only: bool = True) -> int:
+        """Total characters of tool schema that ride in every prompt.
+
+        Measured from the same `schema` property the model is sent, so this
+        cannot drift from what is actually billed. Roughly four characters to
+        the token, so 6000 characters is about 1500 tokens per turn, every
+        turn, before the conversation starts.
+
+        `own_only` (the default) counts the tools this agent added, not the
+        frozen builtin baseline. The baseline is the whole 50-odd tool set the
+        framework ships, it cannot be retired, and on this machine it is ~24.6k
+        characters on its own -- so counting it put the total permanently over
+        the 6,000 cap. The number then described the framework rather than the
+        library it exists to bound, and because the caller treated an
+        over-budget report as a refusal, the forge it was meant to make
+        *justify itself* was instead refused outright, every time, on every
+        machine with the full tool set. Settled 2026-09-15.
+        """
+        total = 0
+        for name in self.registry.names():
+            spec = self.registry.get(name)
+            if spec is None:
+                continue
+            if own_only and (spec.source or "") == "builtin":
+                # Not the agent's to weigh: shipping tools are not a library
+                # decision, and no retire_tool can give this context back.
+                continue
+            try:
+                total += len(json.dumps(spec.schema, ensure_ascii=False))
+            except (TypeError, ValueError):
+                total += len(spec.name) + len(spec.description or "")
+        return total
+
+    def _tool_budget_report(self) -> str:
+        """Empty when there is room; a warning when the forge should justify itself.
+
+        Returns a string rather than raising, because the right response to an
+        over-budget library is not to refuse the work -- the need may be real
+        and urgent -- but to make the agent name what it is trading away. A
+        silent forge at the cap is how a library becomes mostly sediment.
+        """
+        used = self._tool_schema_chars()
+        if used <= TOOL_SCHEMA_BUDGET_CHARS:
+            return ""
+        return (
+            f"Tool schema budget exceeded: {used} chars in the prompt every "
+            f"turn, over the {TOOL_SCHEMA_BUDGET_CHARS}-char budget. Forging "
+            "another adds to a cost that is paid on every request, not once. "
+            "Retire a tool you no longer need (retire_tool) and forge again, or "
+            "state which existing tool this one is worth replacing and why."
+        )
+
+    # ------------------------------------------------------------------
     # frozen baselines — the exam the mutants do not write
     # ------------------------------------------------------------------
     def _baseline_for(self, spec: ToolSpec) -> FrozenBaseline:
@@ -615,12 +847,246 @@ class ForgeAgent:
         if self.store:
             self.store.save_baseline(baseline)
 
+    def _operator_wants_the_floor(self) -> bool:
+        """Whether the operator has said something the forge has not consumed.
+
+        The forge is the one step in this framework that runs for minutes, so
+        it is the one that most needs to be interruptible from the inside. This
+        is the same question `core.agent.Agent` asks of its own long steps --
+        asked here too because a forge is reached from a *tool call*, one layer
+        below the loop, and the loop's boundary check cannot see inside it.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+        except Exception:                     # noqa: BLE001 - reads as "no"
+            return False
+
+    def _sync_to_market(self, spec: Any) -> dict[str, Any]:
+        """Publish a freshly forged tool to the sibling tool-market.
+
+        The two projects are peers, not a client and a server: autoforge makes
+        tools and enforces their lifecycle locally, tool-market is the shared
+        shelf other agents can read from. Nothing here is required for the
+        forge to have succeeded -- the local registry is already updated and
+        the tool is already callable. This is the *distribution* step, and it
+        is allowed to fail.
+
+        Returns a small dict rather than raising, and records the outcome as an
+        event, because "did my tool reach the market" is a question the agent
+        will ask later and must be able to answer from its own ledger instead
+        of re-probing the network.
+        """
+        url = os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
+
+        # Make sure the shelf is actually there before pushing to it. Without
+        # this, a market that is simply not running turns every sync into a
+        # silent failure: the tool is forged, callable, and invisible to every
+        # other agent, and the ledger says only `ok=false`. The fix is one
+        # process launch, and the code that depends on the market being up is
+        # the right place to do it -- a Startup shortcut covers one user on one
+        # machine after a login, and nothing else.
+        #
+        # Best-effort by construction: `ensure_running` never raises and never
+        # blocks a forge. If it cannot start the market, the POST below reports
+        # the real failure, which is more informative than a launch error.
+        try:
+            from autoforge import market as _market
+
+            launch_report = _market.ensure_running(url)
+            if launch_report.get("action") == "started":
+                self._record("market_launch", launch_report)
+        except Exception:                                  # noqa: BLE001
+            # A missing or broken market module must not cost the sync itself.
+            pass
+
+        payload = {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+            "code": spec.code,
+            "source": spec.source or "generated",
+            "generator": spec.generator or "",
+            "invariances": list(spec.invariances or []),
+            "effect_signature": spec.effect_signature or "",
+            "tags": list(spec.tags or []),
+        }
+        outcome: dict[str, Any] = {"tool": spec.name, "url": url}
+        try:
+            import urllib.error
+            import urllib.request
+
+            base = url.rstrip("/")
+
+            # Look before writing. The market rejects a duplicate name with 409,
+            # and treating that as an error would make a re-forge of an
+            # already-published tool look like a failure -- so the agent would
+            # re-forge it again, and the ledger would carry a permanent error
+            # for a tool that is working and published. Asking first also lets
+            # the outcome distinguish "already there" from "just published",
+            # which is the difference between a no-op and a distribution.
+            existing = None
+            try:
+                # The id carries the resource *type* prefix -- `tool:<name>`,
+                # not the bare name. Querying the bare name 404s, which reads
+                # as "not on the market" and sends every re-forge down the POST
+                # path to a 409. The prefix is part of the identity, so it is
+                # built here rather than assumed away.
+                with urllib.request.urlopen(
+                        base + "/resources/tool:" + spec.name, timeout=8) as resp:
+                    if 200 <= resp.status < 300:
+                        existing = json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+            except Exception:                             # noqa: BLE001
+                # A market that cannot answer the lookup is not a reason to skip
+                # the write: the POST below is the operation that matters, and
+                # it will report its own failure if the market is truly down.
+                existing = None
+
+            if existing is not None:
+                outcome["ok"] = True
+                outcome["status"] = 200
+                outcome["resource_id"] = existing.get("id")
+                outcome["note"] = "already on the market; not re-uploaded"
+                self._record("market_sync", outcome)
+                self._promote_on_market(base, existing.get("id"), spec, outcome)
+                return outcome
+
+            req = urllib.request.Request(
+                base + "/resources",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                outcome["ok"] = 200 <= resp.status < 300
+                outcome["status"] = resp.status
+                try:
+                    outcome["resource_id"] = json.loads(body).get("id")
+                except (ValueError, AttributeError):
+                    outcome["resource_id"] = None
+        except Exception as exc:                          # noqa: BLE001
+            # A market that is down, slow, or refusing is not a forge failure.
+            # Recorded, not raised: the tool works either way, and the agent
+            # needs to be able to tell "never published" from "published".
+            outcome["ok"] = False
+            outcome["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            # A 409 here means the lookup missed but the name is taken -- a race
+            # with another agent, not a failure. Same reasoning as above.
+            if "409" in outcome["error"]:
+                outcome["ok"] = True
+                outcome["note"] = "already on the market (raced the lookup)"
+        self._record("market_sync", outcome)
+        self._promote_on_market(base, outcome.get("resource_id"), spec, outcome)
+        return outcome
+
+    def _promote_on_market(self, base, resource_id, spec, outcome) -> None:
+        """Move a freshly published tool off `draft` on the market.
+
+        Publishing is not promoting. `POST /resources` puts a tool on the shelf
+        in state `draft`, and nothing in this file ever moved it off -- so every
+        tool this agent forged sat at `draft` forever, and the market filled up
+        with 69 of them. The lifecycle machine was there the whole time
+        (`toolmarket/protocol/lifecycle.py`: draft --verify--> probation --earn-->
+        active); nobody called it.
+
+        The target is chosen from what is actually known, not from optimism:
+
+          * verification passed -> `probation`, which is what "verified, on
+            trial" means. Not `active`: earning trust is a separate step and
+            this code has no evidence for it.
+          * verification failed -> `retired`, so a broken tool stops being
+            advertised as a candidate.
+          * no verification result at all -> leave it alone. A tool nobody
+            checked is exactly what `draft` is for, and promoting it would be
+            the same lie in the other direction.
+
+        Best-effort and recorded, never raised: a market that refuses the
+        transition must not turn a working forge into a failed one.
+        """
+        if not resource_id:
+            return
+        # The spec's own state is the authority, not a guess at a field name.
+        # `ToolSpec.state` is a `ToolState` the forge already set from the
+        # verification it ran, so reading it is reading the result rather than
+        # re-deriving it. An earlier version of this method looked for
+        # `spec.verified`, which does not exist -- so every tool took the
+        # "no verification result" branch and nothing was ever promoted, which
+        # is exactly the bug this method was written to fix.
+        state = getattr(spec, "state", None)
+        name = getattr(state, "value", None) or (str(state) if state else "")
+        name = name.lower()
+        if name in ("probation", "active"):
+            target = "probation"
+        elif name in ("quarantined", "retired"):
+            target = "retired"
+        else:
+            # Still `draft`: the forge did not verify it, so the market should
+            # not be told it was. Leaving it alone is the honest move.
+            outcome["promotion"] = "skipped: spec state is %r" % (name or "unknown")
+            return
+        try:
+            import urllib.error
+            import urllib.request
+
+            req = urllib.request.Request(
+                base + "/resources/" + str(resource_id) + "/transition",
+                data=json.dumps({"to": target,
+                                 "reason": "autoforge forge state: " + name}
+                                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                state = None
+                try:
+                    state = json.loads(body).get("state")
+                except (ValueError, AttributeError):
+                    pass
+                outcome["promotion"] = "%s -> %s" % (target, state or "?")
+        except Exception as exc:                          # noqa: BLE001
+            outcome["promotion"] = "failed: %s: %s" % (type(exc).__name__, exc)
+
     def _tool_forge(self) -> None:
         def forge_tool(need: str) -> str:
             if not self.policy.may_forge_tools:
                 return "Denied by autonomy policy: may_forge_tools is off."
-            res = self.pipeline.forge(need)
+            # Budget check before the forge, not after. Every tool's schema rides
+            # in the prompt on every turn, so a forge is not a free act: it is a
+            # permanent per-turn cost. Without this the library only grows, and
+            # the growth is invisible until the prompt is mostly tool
+            # descriptions.
+            #
+            # The warning rides *into* the forge as context rather than being
+            # returned as a refusal. That is what the sentence above always
+            # claimed, and what `_tool_budget_report`'s own docstring says it is
+            # for: "the right response to an over-budget library is not to refuse
+            # the work -- the need may be real and urgent -- but to make the agent
+            # name what it is trading away." The code did the opposite: `if over:
+            # return over` made it a wall. And because the report counted the
+            # builtin baseline, it read "over budget" on every call, so a machine
+            # with the full tool set could never forge anything at all --
+            # including the one probe it needed to see that machine's processes.
+            # Settled 2026-09-15.
+            over = self._tool_budget_report()
+            res = self.pipeline.forge(
+                need, context=over, should_abort=self._operator_wants_the_floor,
+            )
             self._record("forge", {"need": need, "ok": res.ok})
+            if res.aborted:
+                # Deliberately not "the forge failed". Nothing was judged, so
+                # the model must not conclude the need is unservable and go on
+                # to forge something worse to compensate.
+                return (
+                    "Stopped at the operator's request before this tool was "
+                    "verified. Nothing was registered and nothing was ruled "
+                    "out — read their message and continue from there."
+                )
             if not res.ok:
                 return f"Could not forge a working tool for: {need} ({res.rounds} rounds)."
             # Persist, or the tool dies with the process: the agent would then
@@ -628,6 +1094,13 @@ class ForgeAgent:
             # what evolve_tool already does for the tools it replaces.
             if self.store:
                 self.store.save_tool(res.spec)
+            # Push to the sibling tool-market, so a tool this agent made is
+            # visible to anything else that speaks the same protocol. This is
+            # deliberately *after* the local save and deliberately unable to
+            # fail the forge: the market is a peer, not a dependency, and a
+            # forge that rolled back because a sibling process was down would
+            # make the agent's own capability hostage to someone else's uptime.
+            self._sync_to_market(res.spec)
             return f"Forged {res.spec.name!r} [{res.spec.state.value}]: {res.spec.description}"
 
         self._add(ToolSpec(
@@ -1401,7 +1874,10 @@ class ForgeAgent:
                         if name.lower() in s.name.lower()]
                 hint = f" Closest: {', '.join(near)}." if near else ""
                 return f"No skill named {name!r}.{hint}"
-            self._record("skill_view", {"name": name, "loads": skill.loads})
+            # Trace only: a load is per-turn news, not ledger news. Its durable
+            # record is the `loads` counter this line just moved.
+            self._record("skill_view", {"name": name, "loads": skill.loads},
+                         durable=False)
             return (f"# {skill.name}  ({skill.loads} load(s), {skill.source}, "
                     f"{skill.path})\n\n{skill.body}")
 
@@ -1414,8 +1890,11 @@ class ForgeAgent:
                                           body, tag_list)
             except SkillError as exc:
                 return f"Not saved: {exc}"
+            # Trace only, for the same reason as skill_view: the file on disk
+            # is the durable record of the write.
             self._record("skill_write", {"name": skill.name,
-                                         "chars": len(skill.body)})
+                                         "chars": len(skill.body)},
+                         durable=False)
             return (f"Saved '{skill.name}' to {skill.path} "
                     f"({len(skill.body)} chars). It is in the menu from the "
                     f"next turn, and it survives restart.")
@@ -1677,22 +2156,30 @@ class ForgeAgent:
         ]
         if self.store is not None:
             s = self.store.report()
-            kinds = ", ".join(f"{k}×{v}" for k, v in s["event_kinds"].items()) or "none yet"
+            # No event count, no per-kind breakdown, no load counter. Every one
+            # of those moves on essentially every turn, and this block sits in
+            # the *system prompt* — which is the prefix of every request. A
+            # prefix cache pays only for the characters before the first
+            # difference, so one changing integer here re-bills the whole
+            # history at the uncached rate. Measured: a single ledger event
+            # moved this block, and the 1,332 characters after it — plus every
+            # message behind it — were re-sent uncached. The counts are still
+            # readable; my_history prints them. The prompt keeps the part that
+            # does not churn.
             lines += [
                 f"- Memory: sqlite at {s['db_path']}, survives restart. "
-                f"{s['tools']} tool(s), {s['events']} ledger event(s) ({kinds}).",
+                f"{s['tools']} tool(s) on the ledger.",
                 "  Every forge, amendment, spawn and run is on that ledger; "
-                "my_history reads it back.",
+                "my_history reads it back, counts it, and says when.",
             ]
         else:
             lines.append("- Memory: no store attached this session — nothing persists.")
         sk = self.skills.report()
         if sk["skills"]:
-            loaded = (f"{sk['loads_total']} load(s) across them, "
-                      f"{len(sk['never_loaded'])} never loaded")
             lines.append(
-                f"- Skills: {sk['skills']} procedure(s) on disk, {loaded}. "
-                f"Bodies stay out of the prompt until I load one.")
+                f"- Skills: {sk['skills']} procedure(s) on disk. "
+                f"Bodies stay out of the prompt until I load one; skill_errors "
+                f"says which cannot be read.")
         else:
             lines.append(
                 "- Skills: none written yet — a procedure I write down with "
@@ -2815,14 +3302,15 @@ class ForgeAgent:
 
     # ------------------------------------------------------------------
     def _sync_amendment(self, a: Amendment) -> None:
+        # `_record` already writes the ledger (durable=True is its default), so
+        # this used to log every amendment twice: the same payload, two rows,
+        # milliseconds apart. Found by looking for exactly that in the real
+        # ledger, which has a twin pair for `amendment` and none for the kinds
+        # that were only ever recorded once.
         self._record("amendment", a.to_dict())
-        if self.store:
-            self.store.log_event("amendment", a.to_dict())
 
     def _on_forge_event(self, kind: str, payload: dict[str, Any]) -> None:
         self._record(kind, payload)
-        if self.store and kind in ("forge_done", "auto_quarantine"):
-            self.store.log_event(kind, payload)
 
     def _on_compact(self, event: Any) -> None:
         """A compaction is an event the operator should be able to see.
@@ -2834,10 +3322,128 @@ class ForgeAgent:
         payload = (event.as_dict() if hasattr(event, "as_dict")
                    else {"event": repr(event)})
         self._record("compact", payload)
-        if self.store:
-            self.store.log_event("compact", payload)
 
-    def _record(self, kind: str, payload: dict[str, Any]) -> None:
+    def _load_persisted_tools(self) -> None:
+        """Re-register tools saved by earlier sessions.
+
+        The store has always been able to save a tool and always been able to
+        read one back; nothing ever called the read. So `forge_tool` persisted
+        its result, the process exited, and the next session began with an empty
+        library -- which the agent then reported, accurately and wrongly, as
+        "I have never forged anything". A write-only store is not memory.
+
+        Failure is not fatal and is not silent: a tool whose body no longer
+        compiles is registered anyway, because `compile_tool_fn` returns a
+        callable that reports the breakage when called. That keeps the library
+        honest -- the tool is listed, and calling it says why it does not work,
+        which is more useful than a tool that vanished without explanation.
+        """
+        if self.store is None:
+            return
+        try:
+            records = self.store.load_all_tools()
+        except Exception:                                  # noqa: BLE001
+            # An unreadable store must not stop the agent from starting. The
+            # builtins are already registered; this only costs the persisted
+            # ones, and the next forge will try again.
+            return
+
+        loaded = 0
+        for name, record in records.items():
+            if self.registry.get(name) is not None:
+                # A builtin of the same name wins. Persisted tools are loaded
+                # after the builtins precisely so this cannot go the other way.
+                continue
+            try:
+                spec = record.to_spec()
+                # Always compile from the stored source, never trust the
+                # callable `to_spec` hands back. `ToolRecord.to_spec` fills in
+                # `lambda **_: ""` when no fn is passed -- a placeholder that is
+                # not None, so a `if spec.fn is None` guard would skip the
+                # compile and register a tool that silently returns the empty
+                # string for every call. That is worse than a tool that fails:
+                # it looks like it worked.
+                if record.code:
+                    spec.fn = _compile_code(record.code, name)
+                self.registry.register(spec, replace=False)
+                loaded += 1
+            except Exception:                              # noqa: BLE001
+                # One bad row must not cost the other ninety-nine.
+                continue
+        self._persisted_tool_count = loaded
+
+    def _persist_tool_state(self, spec: ToolSpec) -> None:
+        """Write a tool's new state through to the store.
+
+        The mirror of `_load_persisted_tools`: that one reads a state out of the
+        store at start-up, so something has to write one for it to be worth
+        reading. Until this existed, `retire_tool` returned "Retired 'x'" and
+        the tool was back on the next start — while the ledger, which *was*
+        written, kept the retirement event. The agent's own history and its
+        tool list disagreed, and a consultation of either one alone looked
+        fine.
+
+        Best-effort, like `_record`, and for the same reason: by the time this
+        runs the decision has already been applied in memory and the caller has
+        been told it succeeded. Raising would leave the agent reporting a
+        failure for a state change that did happen.
+        """
+        if self.store is None:
+            return
+        if spec.source == "builtin":
+            # A builtin is defined by the code that ships, not by a row. The
+            # load path registers the framework's own specs after the persisted
+            # ones and replaces by name, and a name already in the registry is
+            # skipped by `_load_persisted_tools` — so a row for a builtin would
+            # be read back as a *forged* tool with no code to compile, and the
+            # store's table is what the market mirrors. Writing one would
+            # publish a broken copy of a tool the agent never made. The state of
+            # a builtin therefore lives and dies with the session, which
+            # `report()` shows plainly instead of half-keeping it here.
+            return
+        try:
+            self.store.save_tool(spec)
+        except Exception:                    # noqa: BLE001 - see docstring
+            pass
+
+    def _record(self, kind: str, payload: dict[str, Any], *,
+                durable: bool = True) -> None:
+        """Append one event to the trace, the live observer, and the store.
+
+        The store leg is the one that matters across sessions, and it was
+        missing. `_record` used to write only `self.trace` -- a list that dies
+        with the process -- so every event it produced was invisible to the next
+        run. The visible symptom was `market_sync`: `_sync_to_market` records
+        whether a forged tool reached the sibling market, and the agent is
+        explicitly documented as being able to answer "did my tool reach the
+        market" from its own ledger. It could not. The ledger had no such row,
+        because nothing ever wrote one, and the absence read exactly like "the
+        sync never ran" rather than "the record was never kept".
+
+        Persisting here rather than at each call site is deliberate: there are
+        dozens of `_record` calls and one of them would eventually be added
+        without its own `log_event`, which is how the gap opened in the first
+        place. One funnel, one write.
+
+        `durable=False` keeps an event on the trace and off the ledger, because
+        the two are different records with different costs. The trace is this
+        run's timeline: it is read while the run happens and it dies with the
+        process. The ledger is read across sessions and grows a row per event,
+        so an event that happens most turns grows it by the turn count. A
+        skill load is exactly that -- its durable record is the `loads` counter
+        in the skills table, which survives restart on its own -- so writing a
+        row per load buys nothing and costs the ledger its shape. Reserve the
+        ledger for what is rare and worth reading next session; the trace
+        already shows every event for the run in front of you. This distinction
+        did not exist when the store leg was added, so every `_record` call
+        site silently became durable, including the two per-turn ones. Settled
+        2026-09-15.
+
+        Best-effort by design. A store that is locked, full or closed must not
+        turn a successful forge into a failed one -- the tool is already
+        registered and callable by the time this runs. The cost of a lost event
+        is a gap in the ledger; the cost of raising is a broken task.
+        """
         self.trace.append({"kind": kind, **payload})
         # Forward to the live observer, if one is attached, so forging shows up
         # while it happens instead of being rendered once the task is over.
@@ -2845,6 +3451,11 @@ class ForgeAgent:
             try:
                 self._progress(kind, payload)
             except Exception:                    # a bad observer must not run the task
+                pass
+        if self.store is not None and durable:
+            try:
+                self.store.log_event(kind, payload)
+            except Exception:                    # noqa: BLE001 - see docstring
                 pass
 
     # ------------------------------------------------------------------
@@ -2868,8 +3479,15 @@ class ForgeAgent:
         facts = "\n".join(host_facts(self.sandbox))
         kept = "\n".join(self._memory_lines())
         menu = "\n".join(self.skills.menu())
-        out = (f"{self.system_prompt}\n\n{self._self_report()}\n\n"
-               f"{kept}\n\n{menu}\n\n{facts}")
+        # Order is a cost decision, not a style one. The provider bills a
+        # prompt prefix from cache only while that prefix is byte-identical to
+        # the last request, so anything that changes every turn must come
+        # *after* everything that does not. `self_report` carries live tool
+        # counts and `kept` carries recall counters -- both move between turns,
+        # and putting either one early invalidates the whole block behind it.
+        # Stable first (prompt, host facts, skill menu), volatile last.
+        out = (f"{self.system_prompt}\n\n{facts}\n\n{menu}\n\n"
+               f"{kept}\n\n{self._self_report()}")
         if self.role_brief:
             # Last, and separately labelled: a role narrows what this run is
             # for, and the point of putting it after the general instructions is
@@ -2917,16 +3535,22 @@ class ForgeAgent:
             on_compact=self._on_compact,
         )
         result = agent.run(task, history)
+        # Token spend for this run, read from the client's own accounting.
+        # Without this the number exists only in memory and dies with the
+        # process, which is why one run could never be compared to another.
+        usage = dict(getattr(self.llm, "usage_total", {}) or {})
         self._record("finish", {
             "turns": result.turns, "tools": result.tool_calls,
             "self_terminated": result.self_terminated,
             "stopped_by_operator": result.stopped_by_operator,
+            "usage": usage,
         })
         if self.store:
             self.store.log_event("run", {
                 "task": task[:300], "turns": result.turns,
                 "self_terminated": result.self_terminated,
                 "stopped_by_operator": result.stopped_by_operator,
+                "usage": usage,
             })
         return result
 

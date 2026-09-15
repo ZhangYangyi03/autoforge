@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 
 from . import configfile
-from .core.llm import OpenAICompatClient
+from .core.llm import DEFAULT_MAX_TOKENS, OpenAICompatClient
 from .core.message import Message
 
 # label, base_url, model, needs_key
@@ -133,7 +133,8 @@ def run(args) -> int:
     base = args.base_url or existing.get("base_url") or PRESETS[0][1]
     model = args.model or existing.get("model") or PRESETS[0][2]
     key = args.api_key or existing.get("api_key") or ""
-    max_tokens = args.max_tokens or int(existing.get("max_tokens") or 3000)
+    max_tokens = args.max_tokens or int(existing.get("max_tokens")
+                                        or DEFAULT_MAX_TOKENS)
     proxy_default = bool(existing.get("proxy", not any(
         h in base for h in ("127.0.0.1", "localhost"))))
     # An explicit flag must survive into a non-interactive run too, where there

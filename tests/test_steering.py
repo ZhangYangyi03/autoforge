@@ -47,7 +47,44 @@ class TestTheChannel:
         s.submit("actually, use csv not parquet")
         assert s.take_supplements() == [
             operator_message("actually, use csv not parquet")]
-        assert any("will reach the agent" in p for p in printed)
+        assert any("heard" in p for p in printed)
+
+    def test_the_reply_does_not_promise_a_yield_that_cannot_happen(self):
+        # The reply used to be unconditional: "the step in progress will yield
+        # to it". With no run in progress there is no step, so it promised a
+        # yield nothing could perform -- and a reply that is only sometimes
+        # true is the one the operator learns to disbelieve, including on the
+        # occasions when it is telling them the truth.
+        s, printed = _steering()
+        s.submit("a note with no run behind it")
+        ack = " ".join(printed)
+        assert "heard" in ack
+        assert "nothing is running" in ack
+        assert "yield" not in ack
+
+    def test_the_reply_promises_a_yield_while_a_run_is_live(self):
+        s, printed = _steering()
+        s.begin_run()
+        s.submit("a note with a run behind it")
+        assert any("heard" in p and "yield" in p for p in printed)
+
+        # And stops promising it the moment the run is over: the gap between
+        # runs is exactly when a stale sentence would be read as a live one.
+        printed.clear()
+        s.end_run()
+        s.submit("a note after the run")
+        assert not any("yield" in p for p in printed)
+
+    def test_a_nested_run_does_not_end_the_outer_one(self):
+        s, _ = _steering()
+        s.begin_run()
+        s.begin_run()
+        s.end_run()
+        assert s.running is True
+        s.end_run()
+        assert s.running is False
+        s.end_run()                       # idempotent, for exit paths
+        assert s.running is False
 
     def test_a_supplement_says_it_came_mid_run(self):
         # Without the marker the model reads a correction as a new task and
@@ -204,7 +241,7 @@ class TestTheReaderThread:
         s.watch(live)
         s.submit("a note")
         s.submit("/status")
-        assert any("will reach the agent" in t for t in live.said)
+        assert any("heard" in t for t in live.said)
         assert "turn 2" in live.said
         assert printed == []           # replies moved to the live run
 

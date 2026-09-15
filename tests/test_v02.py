@@ -294,6 +294,168 @@ class TestStore:
 
 
 # ======================================================================
+# a judgement about a tool outlives the process that made it
+# ======================================================================
+class TestToolStateSurvivesRestart:
+    """Retiring a tool has to reach the store, or it lasts one session.
+
+    `registry.retire` and its siblings moved `spec.state` in memory and logged
+    the event; nothing wrote the state. The store, meanwhile, reads a state
+    back on the next load — so a tool retired as harmful returned `active` on
+    the next start and ran again, while the ledger kept insisting it had been
+    retired. The registry is the one place a tool is taken out of service, so
+    the two records of the same decision disagreeing is the whole failure.
+    """
+
+    def _db_with(self, tmp_path, spec) -> str:
+        db = str(tmp_path / "agent.db")
+        store = ToolStore(db)
+        store.save_tool(spec)
+        store.close()
+        return db
+
+    def _agent(self, db):
+        from autoforge.agent import ForgeAgent
+        return ForgeAgent(MockLLMClient(), store=ToolStore(db), policy=FULL_FREEDOM)
+
+    def _live_spec(self):
+        spec = spec_for(good_code(), name="rev")
+        spec.state = ToolState.ACTIVE
+        return spec
+
+    def test_a_retirement_reaches_the_store_immediately(self, tmp_path):
+        db = self._db_with(tmp_path, self._live_spec())
+        agent = self._agent(db)
+        agent.registry.call("retire_tool", {"name": "rev", "rationale": "superseded"})
+        assert agent.registry.get("rev").state == ToolState.RETIRED
+        assert ToolStore(db).load_all_tools()["rev"].state == ToolState.RETIRED
+
+    def test_and_is_still_there_after_a_restart(self, tmp_path):
+        db = self._db_with(tmp_path, self._live_spec())
+        agent = self._agent(db)
+        agent.registry.call("retire_tool", {"name": "rev", "rationale": "superseded"})
+        agent.store.close()
+
+        reborn = self._agent(db)
+        assert reborn.registry.get("rev").state == ToolState.RETIRED
+        r = reborn.registry.call("rev", {"s": "abc"})
+        assert r.ok is False and "retired" in r.error
+        assert "rev" not in [t["function"]["name"] for t in reborn.registry.schemas()]
+
+    def test_the_ledger_and_the_registry_no_longer_contradict(self, tmp_path):
+        db = self._db_with(tmp_path, self._live_spec())
+        agent = self._agent(db)
+        agent.registry.call("retire_tool", {"name": "rev", "rationale": "superseded"})
+        agent.store.close()
+
+        reborn = self._agent(db)
+        retired = reborn.registry.get("rev").state == ToolState.RETIRED
+        logged = any(e["kind"] == "retire" for e in reborn.store.get_events())
+        assert retired and logged
+
+    def test_an_auto_quarantine_survives_too(self, tmp_path):
+        # The safety valve: a tool that fails in the wild is taken out of
+        # service, and a valve that re-opens on restart is not a valve.
+        # The failure has to be in the *code*, not in a patched `fn`: the load
+        # rebuilds the callable by compiling the stored source, so a tool that
+        # only fails because of an in-memory stub would come back working and
+        # the test would pass for the wrong reason.
+        spec = spec_for(brittle_code(), name="rev")   # IndexError on ''
+        spec.state = ToolState.ACTIVE
+        db = self._db_with(tmp_path, spec)
+        agent = self._agent(db)
+        agent.registry.min_calls_for_judgement = 3
+        for _ in range(3):
+            assert agent.registry.call("rev", {}).ok is False
+        assert agent.registry.get("rev").state == ToolState.QUARANTINED
+        agent.store.close()
+
+        assert self._agent(db).registry.get("rev").state == ToolState.QUARANTINED
+
+    def test_nothing_is_written_when_there_is_no_store(self, tmp_path):
+        # A bare registry must keep working exactly as before: no store, no
+        # hook, no callback that expects one.
+        reg = ToolRegistry()
+        spec = self._live_spec()
+        reg.register(spec)
+        reg.retire("rev")
+        assert reg.get("rev").state == ToolState.RETIRED
+
+    def test_a_builtin_is_not_written_into_the_store(self, tmp_path):
+        # A builtin is defined by the code that ships and carries no source for
+        # a row to rebuild it from: `_load_persisted_tools` skips a name the
+        # registry already holds and the framework's own specs are registered
+        # after it, so a row would come back as a *forged* tool with a broken
+        # body. The store's table is also what the market mirrors, so writing
+        # one would publish a copy of a tool the agent never made. The state of
+        # a builtin is therefore session-scoped by design, not by omission.
+        db = str(tmp_path / "a.db")
+        agent = self._agent(db)
+        assert agent.registry.get("retire_tool").source == "builtin"
+        agent.registry.quarantine("retire_tool", reason="test")
+        assert agent.registry.get("retire_tool").state == ToolState.QUARANTINED
+        assert "retire_tool" not in ToolStore(db).load_all_tools()
+
+    def test_but_a_forged_tool_in_the_same_session_is_written(self, tmp_path):
+        # The guard is about builtins, not about writes having quietly stopped:
+        # the same call on a tool the agent forged goes straight through.
+        db = str(tmp_path / "a.db")
+        agent = self._agent(db)
+        forged = self._live_spec()
+        agent.registry.register(forged)
+        agent.registry.quarantine("rev", reason="test")
+        assert ToolStore(db).load_all_tools()["rev"].state == ToolState.QUARANTINED
+
+
+# ======================================================================
+# one funnel, one row
+# ======================================================================
+class TestTheLedgerGetsOneRowPerEvent:
+    """`_record` writes the ledger, so its callers must not write it again.
+
+    It grew its store leg late (`durable=True` became the default), and three
+    call sites kept the explicit `store.log_event` they had needed before it —
+    so amendments, forge completions and compactions were each recorded twice,
+    as twins milliseconds apart that nothing downstream could tell from two
+    real events. One twin pair was sitting in the real ledger.
+    """
+
+    def _agent(self, tmp_path):
+        from autoforge.agent import ForgeAgent
+        # A policy of its own, not the FULL_FREEDOM singleton: `set_autonomy`
+        # below writes the amendment onto whatever policy object it is handed,
+        # and the presets are module-level — handing it the singleton tightened
+        # FULL_FREEDOM for every test that ran afterwards.
+        return ForgeAgent(MockLLMClient(), store=ToolStore(str(tmp_path / "a.db")),
+                          policy=AutonomyPolicy())
+
+    def test_an_amendment_is_recorded_once(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.registry.call("set_autonomy", {
+            "freedom": "may_forge_tools", "enabled": False, "rationale": "test",
+        })
+        kinds = [e["kind"] for e in agent.store.get_events()]
+        assert kinds.count("amendment") == 1
+
+    def test_a_forge_event_is_recorded_once(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent._on_forge_event("forge_done", {"tool": "x", "ok": True})
+        kinds = [e["kind"] for e in agent.store.get_events()]
+        assert kinds.count("forge_done") == 1
+
+    def test_a_compaction_is_recorded_once(self, tmp_path):
+        agent = self._agent(tmp_path)
+
+        class Compaction:
+            def as_dict(self):
+                return {"summary": "s", "tokens_before": 10, "tokens_after": 4}
+
+        agent._on_compact(Compaction())
+        kinds = [e["kind"] for e in agent.store.get_events()]
+        assert kinds.count("compact") == 1
+
+
+# ======================================================================
 # autonomy — policy
 # ======================================================================
 class TestPolicy:

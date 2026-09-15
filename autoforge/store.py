@@ -178,8 +178,18 @@ class ToolRecord:
     def to_spec(self, fn=None, runner=None) -> ToolSpec:
         st = ToolStats()
         for k, v in self.stats.items():
-            if hasattr(st, k):
-                setattr(st, k, v)
+            # `hasattr` is not enough: `success_rate` and `trigger_rate` are
+            # read-only properties, so `hasattr` says yes and `setattr` raises
+            # "property has no setter". `to_dict` writes them (they are useful
+            # in a report) and the constructor cannot take them back, so the
+            # round trip is asymmetric -- and the failure lands here, on load,
+            # where it silently costs every persisted tool. Check that the
+            # attribute is actually assignable.
+            if not hasattr(st, k):
+                continue
+            if isinstance(getattr(type(st), k, None), property):
+                continue
+            setattr(st, k, v)
         spec = ToolSpec(
             name=self.name,
             description=self.description,

@@ -161,14 +161,31 @@ answer arrives. On a forge-shaped prompt — long system message, a need that
 deserves real design thought — **the trace consumes the entire `max_tokens`
 budget and `content` comes back empty with `finish_reason='length'`.**
 
-### Why raising the cap is not the fix
+### Why raising the cap *looked* like it was not the fix
 
-The trace is not truncated by the cap, it *scales to fill it*: 10767 characters
-at a cap of 3000, 27092 at 8000. Whatever number you choose, the model spends it
-thinking and the answer still never starts. This is the shape of the earlier
-`200/leng` readings in `probe_maxtokens` — those were not near-misses of a
-complete answer, they were reasoning-only replies, and reading them as
-"truncation just past the end" sent this investigation the wrong way for a while.
+**Corrected: the cap was the fix, and it now ships.** The reading here was that the
+trace "scales to fill" whatever cap it is given, which would make any cap
+unusable, since the model would spend it thinking and never start the answer.
+
+It was inferred from the two rows above -- 10767 characters at a cap of 3000, 27092
+at 8000 -- and two samples taken below a value's natural size cannot separate
+"unbounded growth" from "naturally larger than both of these". The second reading
+is the true one, and the number needed to settle it was available throughout: this
+same gateway, same model, same key has been answering requests carrying
+65536-128000 from the author's own agent profile (202 request dumps, every one of
+them this model). 3000 and 8000 were below the trace, which is not the same as the
+budget being unusable.
+
+Settled by `python probes/probe_cap_default.py`, which runs the *generator* at the
+shipped default and grades what arrives, and pinned by `tests/test_cap_ceiling.py`.
+The default is `DEFAULT_MAX_TOKENS` (32768), defined once, and a provider whose own
+ceiling is below it answers 400 and is sent back the number that error names.
+
+What survives here, and is worth reading: the trace is long, the budget is where it
+goes, and `finish_reason='length'` with an empty `content` means the budget was the
+constraint -- not the model, and not the parser. The earlier `200/leng` readings in
+`probe_maxtokens` were reasoning-only replies rather than near-misses of a complete
+answer, which remains true. What does not survive is the conclusion drawn from it.
 
 ### Why the suppression flags are not the fix either
 
@@ -259,3 +276,88 @@ unambiguous.
 
 Verified: all 9 keys recovered, `code` compiles, 4 probes intact, 17/17 parser
 tests and 275/275 suite tests pass.
+
+## The cap is the lever after all -- and on aiping it has a ceiling
+
+**Reproduce:** `AIPING_API_KEY=... python probes/probe_cap_big_prompt.py 6` (add
+`caps=32768,3000,128000` to reverse the order), and `python probes/probe_cap_default.py`
+for the two routes end to end.
+
+### What was wrong with the 3000 default
+
+Raising the cap *is* the fix. The reading recorded earlier in this file -- "the trace
+scales to fill whatever cap it is given, so a bigger cap cannot help" -- was inferred
+from two samples (3000, 8000) both taken below the trace's natural size, and two
+points under a value cannot tell "unbounded" from "larger than both". `DEFAULT_MAX_TOKENS`
+is now 32768, one constant read by the generator, the CLI and the wizard, and
+`tests/test_cap_ceiling.py` pins the requirement.
+
+End to end on the route that has to work (`api.deepseek.com`, `deepseek-chat` -- the
+default profile):
+
+```
+generator cap = 32768    PARSED in 3s   name=list_py_files   code=888c   probes=3
+```
+
+The same default on a stricter provider is survivable by design: a 400 that names
+`max_tokens` is answered at the number it names (`_clamp_cap_after_rejection`), so a
+generous default is not a trap on endpoints with a lower ceiling.
+
+### What aiping does with a big cap: measured with a control in the same minute
+
+A first attempt failed 6/6 at 32768 with `503 暂无可用服务商`, while a short prompt at
+32768 answered in 1s in the same minute -- leaving prompt size and cap entangled.
+Requests are therefore interleaved one cap per cycle (so drift cannot land on one
+cap) and the order is reversed in the second run (so "the first request of a burst is
+served" cannot be mistaken for "the small cap is served"):
+
+| run | order | 3000 | 32768 | 128000 |
+| --- | --- | --- | --- | --- |
+| 1 | 3000, 32768, 128000 | 3/6 | 0/6 | 0/6 |
+| 2 | 32768, 3000, 128000 | 3/6 | 0/6 | 0/6 |
+
+Cycles 2, 3 and 5 of run 2 are the rows that decide it: 32768 503s, and seconds later
+3000 -- the *second* request in the cycle, same prompt, same model, same key --
+answers 200. Order cannot explain that, so the cap does. Pooled over both runs: 3000
+answered 6/13, and every cap at 32768 or above answered 0/18.
+
+The cliff, with 3000 riding along as a control inside each cycle:
+
+| cap | 200s |
+| --- | --- |
+| 3000 | 2/6 |
+| 4096 | 0/6 |
+| 8192 | 0/6 |
+| 16000 | 0/6 |
+
+(Cycles 1 and 3 are again paired contrasts: 3000 answers, all three larger caps 503
+in the same minute. An earlier control-free run at 4096/8192/16000 was 0/12 with no
+small-cap row, and is uninformative on its own -- that is what the control is for.)
+
+So on aiping, `DeepSeek-V4.1-Flash` is served only at a small cap -- and a small cap is
+precisely what this model cannot finish in. Every 200 above read
+`finish_reason=length`, with 724-2762 chars of content against 8790-11515 chars of
+`reasoning_content`: the envelope is cut off mid-JSON every time. **aiping +
+this reasoning model cannot serve the forge**, which is also why the 4000 in an older
+config never produced a tool: under the ceiling, and still far below the trace.
+
+One contradiction is kept rather than smoothed over: sweep 2 above has 4096 answering
+3/3 with this same prompt and model, so the refusal threshold is not a constant of the
+account -- it moves with what the gateway has routed. Which is exactly why the code
+does **not** silently downgrade the cap on a 503. A downgrade buys a truncated
+envelope, and a truncated envelope is worse than a loud failure here: `entry`,
+`parameters` and `probes` default to empty, so the pipeline would accept a tool with
+no probes and skip checking it (see the stray-closer section above).
+
+### What does work on aiping
+
+A model whose trace leaves room inside the cap the gateway serves: `Qwen3.5-Flash` at
+4000 answered `finish_reason=stop` with a complete 2326-char envelope. Or skip the
+gateway entirely: `api.deepseek.com` takes 32768 and answers in 3s. Neither needs the
+wizard -- `AUTOFORGE_MAX_TOKENS=4000 auto --model Qwen3.5-Flash` is the whole change.
+
+Worth remembering when reading a lone 503: 3000 itself answered only 44% of the time
+(8/18) while being the cap the gateway prefers, so a single 503 identifies nothing.
+The probe prints one row per cycle on purpose -- a refusal looks like 503 for the big
+caps while the small cap answers *in the same cycle*, whereas a bad window looks like
+everything failing at once (cycles 2, 4, 5, 6 of the last run).

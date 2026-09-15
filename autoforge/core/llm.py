@@ -11,6 +11,8 @@ agent loop. Two implementations ship in-tree:
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -19,10 +21,47 @@ import requests
 
 from .message import Message, ToolCall
 
+#: How often a watched call hands control back to its caller. Small enough that
+#: a typed correction is acted on well inside the operator's patience, large
+#: enough that the polling itself is invisible.
+_POLL_SECONDS = 0.25
+
 
 def _sleep(seconds: float) -> None:
     """Indirection so tests can make retry backoff instant."""
     time.sleep(seconds)
+
+
+def _as_int(value: Any) -> int:
+    """`value` as an int, with anything unparseable reading as zero.
+
+    Usage is a report from the provider about work already done, so a gateway
+    that sends `"usage": {"prompt_tokens": "1234"}` or sends no usage at all
+    must not raise here: a failed parse would lose the reply to report a number.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def new_usage_totals() -> dict[str, int]:
+    """A fresh accumulator for one client's token accounting."""
+    return {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0,
+            "completion_tokens": 0}
+
+
+def account_usage(totals: dict[str, int], resp: LLMResponse) -> dict[str, int]:
+    """Fold one response's usage into `totals`, and return the totals.
+
+    The provider only reports per call, so the cache-hit share of a whole
+    session exists nowhere unless something adds it up. This is that something.
+    """
+    totals["calls"] += 1
+    totals["prompt_tokens"] += resp.prompt_tokens
+    totals["cached_tokens"] += resp.cached_tokens
+    totals["completion_tokens"] += resp.completion_tokens
+    return totals
 
 
 class LLMResponseError(RuntimeError):
@@ -36,6 +75,76 @@ class LLMResponseError(RuntimeError):
     """
 
 
+class LLMAborted(InterruptedError):
+    """A call in flight was abandoned because the operator spoke.
+
+    Not an error to report: the request was well-formed and would have
+    answered. It means the run's instructions just changed, so the answer on
+    its way is no longer the answer being asked for. The caller is expected to
+    fold the operator's line into the conversation and ask again -- which is
+    why this carries no partial content.
+    """
+
+
+def _post_watchable(
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    proxies: dict[str, str] | None,
+    should_abort: Callable[[], bool] | None,
+    on_wait: Callable[[float], None] | None,
+) -> Any:
+    """POST, but hand control back to the caller on every tick.
+
+    A plain ``requests.post`` parks the calling thread for the whole read
+    timeout -- two minutes here -- and nothing can happen inside that window:
+    not a ``/stop``, not a correction the operator just typed. The agent's
+    promise of "talk to me while I work" then only holds *between* calls, which
+    is precisely the gap the person at the terminal experiences as being
+    ignored. That gap is the bug this function exists to close.
+
+    So when a watcher is supplied the request moves to a worker thread and the
+    caller polls. ``should_abort`` is consulted every tick; the moment it goes
+    true the request is abandoned and ``LLMAborted`` is raised. ``on_wait`` is
+    fed the elapsed seconds so a progress line can be kept honest.
+
+    Abandoning is safe here in a way it would not be for an arbitrary request:
+    a completion has no side effect to undo. The POST does stay in flight until
+    it finishes on its own, and the worker is a daemon so a process exit never
+    blocks on it.
+    """
+    if should_abort is None and on_wait is None:
+        return requests.post(endpoint, headers=headers, json=payload,
+                             timeout=timeout, proxies=proxies)
+
+    done = threading.Event()
+    box: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            box["resp"] = requests.post(endpoint, headers=headers, json=payload,
+                                        timeout=timeout, proxies=proxies)
+        except BaseException as exc:      # noqa: BLE001 - re-raised on the caller
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    started = time.time()
+    while not done.wait(_POLL_SECONDS):
+        if on_wait is not None:
+            on_wait(time.time() - started)
+        if should_abort is not None and should_abort():
+            raise LLMAborted(
+                f"abandoned a model call in flight after {time.time() - started:.1f}s "
+                "because the operator said something"
+            )
+    if "exc" in box:
+        raise box["exc"]
+    return box["resp"]
+
+
 @dataclass
 class LLMResponse:
     content: str = ""
@@ -47,6 +156,33 @@ class LLMResponse:
     #: is not noise either: it is where the `max_tokens` budget goes when a
     #: reply comes back empty, so diagnostics that count it can say *why*.
     reasoning: str = ""
+
+    #: The provider's token accounting for this call, verbatim.
+    #:
+    #: Kept because the interesting number is not the total but the split:
+    #: `prompt_tokens_details.cached_tokens` (DeepSeek, OpenAI) or
+    #: `prompt_cache_hit_tokens` (some gateways) is what says whether the
+    #: conversation is being served from the prefix cache or re-billed from
+    #: scratch. That share is invisible from the outside — a cached call and an
+    #: uncached one look identical in the reply — so without reading it here
+    #: there is no way to tell a cheap session from an expensive one.
+    usage: dict[str, Any] = field(default_factory=dict)
+
+    #: Prompt tokens the provider served from its cache.
+    @property
+    def cached_tokens(self) -> int:
+        details = self.usage.get("prompt_tokens_details")
+        if isinstance(details, dict) and details.get("cached_tokens") is not None:
+            return _as_int(details.get("cached_tokens"))
+        return _as_int(self.usage.get("prompt_cache_hit_tokens"))
+
+    @property
+    def prompt_tokens(self) -> int:
+        return _as_int(self.usage.get("prompt_tokens"))
+
+    @property
+    def completion_tokens(self) -> int:
+        return _as_int(self.usage.get("completion_tokens"))
 
     @property
     def wants_tools(self) -> bool:
@@ -112,12 +248,22 @@ class OpenAICompatClient(LLMClient):
     #: Sent when the caller does not pass `max_tokens` of its own.
     #:
     #: Not cosmetic: aiping.cn returns 503 for a completion body with no
-    #: `max_tokens` while the identical body carrying a modest cap returns 200
+    #: `max_tokens` while the identical body carrying a cap returns 200
     #: (12 requests, cleanly separated -- see probes/probe_gateway_max_tokens.py).
     #: Omitting the field is therefore a provider-specific landmine, and the
     #: safe place to defuse it is here, once, rather than at every call site.
     #: Pass `default_max_tokens=None` for providers that reject the field.
-    DEFAULT_MAX_TOKENS: int | None = 2048
+    #:
+    #: The *size* matters as much as the presence. A reasoning model spends the
+    #: budget on its trace before it writes anything, and a cap drawn for a
+    #: non-reasoning model is spent entirely on thinking: against aiping.cn, this
+    #: generator's prompt at a cap of 3000 came back `finish_reason='length'` with
+    #: 0 chars of content and 10901 chars of `reasoning_content` -- an empty
+    #: answer that looked like a provider fault. Sizing the cap above what a
+    #: trace plausibly consumes fixes it, and 32768 is chosen against a measured
+    #: bound rather than a guess: the agent that this repo's author actually runs
+    #: sends 128000 to this same gateway, from the same profile, and gets answers.
+    DEFAULT_MAX_TOKENS: int | None = 32768
 
     #: Statuses worth sending again: the request was well-formed and the answer
     #: is "later", not "no". Any other 4xx means the payload or the credentials
@@ -128,6 +274,11 @@ class OpenAICompatClient(LLMClient):
     #: tool. Retrying belongs here, one layer under the round, where a hiccup is
     #: invisible instead of expensive.
     RETRY_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+    #: The smallest cap worth sending after a provider rejects ours. Below this
+    #: the reply cannot hold a tool envelope anyway, so the honest outcome is to
+    #: let the provider's own error through instead of hunting for a number.
+    MIN_MAX_TOKENS = 512
 
     def __init__(
         self,
@@ -160,7 +311,19 @@ class OpenAICompatClient(LLMClient):
         self.max_attempts = max(1, max_attempts)
         self.retry_backoff = retry_backoff
         self.retry_max_delay = retry_max_delay
+        #: Token accounting for this client's lifetime. `cached_tokens` against
+        #: `prompt_tokens` is the one number that says whether the prompt prefix
+        #: is stable enough to be served from cache -- which is the difference
+        #: between a long conversation costing a tenth of what it looks like and
+        #: costing exactly what it looks like.
+        self.usage_total = new_usage_totals()
         self.name = f"openai-compat:{model}"
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Share of prompt tokens the provider served from its cache, 0..1."""
+        prompt = self.usage_total["prompt_tokens"]
+        return self.usage_total["cached_tokens"] / prompt if prompt else 0.0
 
     def _wait_before_retry(self, attempt: int, resp: Any) -> None:
         """Exponential backoff, but never earlier than the server asked for."""
@@ -173,6 +336,46 @@ class OpenAICompatClient(LLMClient):
                 except ValueError:
                     pass
         _sleep(delay)
+
+    def _clamp_cap_after_rejection(self, payload: dict, resp: Any) -> int | None:
+        """The cap to resend with after a 400 that blames ``max_tokens``.
+
+        Providers disagree about the ceiling, and the disagreement is fatal
+        rather than cosmetic: aiping.cn accepts 128000, api.deepseek.com stops at
+        8192, a local runtime stops at whatever its context allows. The cap has
+        to be generous enough that a reasoning trace cannot eat the whole budget
+        before the answer starts (that is why it is not small), and a number
+        that generous is a 400 on the stricter providers. Since a whole tool dies
+        otherwise, this answers that one 4xx with a smaller number instead of
+        rethrowing it.
+
+        Every other 400 returns None: a bad payload or a bad key is not going to
+        be fixed by our improving the number.
+        """
+        if getattr(resp, "status_code", None) != 400:
+            return None
+        current = payload.get("max_tokens")
+        if not isinstance(current, int):
+            return None
+        body = getattr(resp, "text", "") or ""
+        if "max_tokens" not in body:
+            return None
+        # Providers state the ceiling in prose ("max_tokens is in [1, 8192]",
+        # "must be <= 16384"), so the largest number in the message below ours is
+        # a better guess than blind halving -- that is the ceiling they are
+        # naming. Halving is the fallback for a message that names none.
+        named = [int(n) for n in re.findall(r"\d{3,7}", body)]
+        below = [n for n in named if n < current]
+        if below:
+            target = max(below)
+            # They named their ceiling and it is too low to hold an envelope.
+            # Sending it anyway would trade one clear error for a cryptic one.
+            return target if target >= self.MIN_MAX_TOKENS else None
+        if named:
+            # A number was named, but none of them is below what we sent: the
+            # complaint is not about the size, so halving would be guessing.
+            return None
+        return current // 2 if current // 2 >= self.MIN_MAX_TOKENS else None
 
     def _to_response(self, data: Any) -> LLMResponse:
         if not isinstance(data, dict):
@@ -200,6 +403,7 @@ class OpenAICompatClient(LLMClient):
             tool_calls=[ToolCall.from_api(tc) for tc in (msg.get("tool_calls") or [])],
             raw=data,
             reasoning=msg.get("reasoning_content") or "",
+            usage=data.get("usage") if isinstance(data.get("usage"), dict) else {},
         )
 
     def chat(
@@ -208,6 +412,12 @@ class OpenAICompatClient(LLMClient):
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        # Popped before the payload is built, or they would be sent to the
+        # endpoint as unknown body fields -- a 400 at best, silently ignored at
+        # worst. They are addressed to *this* client, not to the provider.
+        should_abort = kwargs.pop("should_abort", None)
+        on_wait = kwargs.pop("on_wait", None)
+
         payload: dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
             "messages": [m.to_api() for m in messages],
@@ -227,16 +437,26 @@ class OpenAICompatClient(LLMClient):
         }
         endpoint = f"{self.base_url}/chat/completions"
 
-        for attempt in range(1, self.max_attempts + 1):
-            final = attempt == self.max_attempts
+        # `allowed`, not `self.max_attempts`, is what the loop counts to: one
+        # extra attempt is granted when the provider objects to the cap itself,
+        # because that attempt carries a *different* payload rather than
+        # repeating one already known to fail.
+        allowed = self.max_attempts
+        cap_clamped = False
+        attempt = 0
+        while attempt < allowed:
+            attempt += 1
+            final = attempt >= allowed
             try:
-                resp = requests.post(
-                    endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                    proxies=self.proxies,
+                resp = _post_watchable(
+                    endpoint, headers, payload, self.timeout, self.proxies,
+                    should_abort, on_wait,
                 )
+            except LLMAborted:
+                # Not a transport failure, so it must not be retried: retrying
+                # would re-ask the question the operator just changed. Let it
+                # out to the loop, which folds their line in and asks again.
+                raise
             except requests.RequestException:
                 if final:
                     raise
@@ -246,6 +466,19 @@ class OpenAICompatClient(LLMClient):
             if resp.status_code in self.RETRY_STATUSES and not final:
                 self._wait_before_retry(attempt, resp)
                 continue
+
+            # A 400 that blames the cap is the one 4xx here that gets a second
+            # look, because the request is fine and only its number is wrong.
+            # The replacement attempt must not come out of the retry budget:
+            # nothing has been learned about the endpoint yet, only about a
+            # ceiling that is lower than the one we assumed.
+            if not cap_clamped:
+                clamped = self._clamp_cap_after_rejection(payload, resp)
+                if clamped is not None:
+                    payload["max_tokens"] = clamped
+                    cap_clamped = True
+                    allowed += 1
+                    continue
 
             resp.raise_for_status()
             try:
@@ -259,6 +492,7 @@ class OpenAICompatClient(LLMClient):
                     f"(HTTP {resp.status_code}): {(resp.text or '')[:200]!r}"
                 ) from exc
             parsed = self._to_response(body)
+            account_usage(self.usage_total, parsed)
 
             # An empty completion is usually a provider hiccup, and hiccups are
             # worth a second send. One exception: if the whole budget went to a
@@ -272,6 +506,12 @@ class OpenAICompatClient(LLMClient):
 
         raise AssertionError("unreachable: the loop returns or raises")
 
+
+#: The same number, for callers that carry a cap of their own instead of
+#: relying on the client default: the forge generator, the CLI, the wizard. One
+#: value read from one place, because three independent copies is exactly how the
+#: original 3000 outlived the failure that condemned it.
+DEFAULT_MAX_TOKENS: int | None = OpenAICompatClient.DEFAULT_MAX_TOKENS
 
 class MockLLMClient(LLMClient):
     """Deterministic client for tests and offline demos.
@@ -293,6 +533,14 @@ class MockLLMClient(LLMClient):
         self.handler = handler
         self.name = name
         self.calls: list[tuple[list[Message], list[dict[str, Any]] | None]] = []
+        # Same accounting as the real client, so a test can assert on cache
+        # behaviour without a network.
+        self.usage_total = new_usage_totals()
+
+    @property
+    def cache_hit_rate(self) -> float:
+        prompt = self.usage_total["prompt_tokens"]
+        return self.usage_total["cached_tokens"] / prompt if prompt else 0.0
 
     def chat(
         self,
@@ -302,10 +550,13 @@ class MockLLMClient(LLMClient):
     ) -> LLMResponse:
         self.calls.append((list(messages), tools))
         if self.handler is not None:
-            return self.handler(messages, tools, **kwargs)
-        if self.script:
-            return self.script.pop(0)
-        return LLMResponse(content="(mock: script exhausted)")
+            resp = self.handler(messages, tools, **kwargs)
+        elif self.script:
+            resp = self.script.pop(0)
+        else:
+            resp = LLMResponse(content="(mock: script exhausted)")
+        account_usage(self.usage_total, resp)
+        return resp
 
 
 def tool_call(name: str, arguments: dict[str, Any] | None = None, call_id: str | None = None) -> ToolCall:
@@ -315,10 +566,14 @@ def tool_call(name: str, arguments: dict[str, Any] | None = None, call_id: str |
 
 __all__ = [
     "LLMClient",
+    "LLMAborted",
     "LLMResponse",
     "LLMResponseError",
     "OpenAICompatClient",
     "MockLLMClient",
+    "account_usage",
+    "new_usage_totals",
     "tool_call",
     "json",
+    "DEFAULT_MAX_TOKENS",
 ]

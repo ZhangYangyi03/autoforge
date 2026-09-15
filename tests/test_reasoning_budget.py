@@ -8,9 +8,17 @@ cause was invisible until the raw body was inspected (`probes/probe_gateway_empt
     cap 3000   finish='length'  content=0c  reasoning_content=10767c
     cap 8000   finish='length'  content=0c  reasoning_content=27092c
 
-The reasoning trace grows to fill whatever cap it is given, so the answer never
-starts. Raising the cap is not a fix, and none of six documented suppression
-flags changed it (`probes/probe_gateway_thinking.py`).
+Both samples sit below the trace's natural length, which at the time was read as
+"the trace grows to fill whatever cap it is given" and therefore as proof that the
+cap could not be the lever. It could: this same gateway answers requests carrying
+65536-128000 for this same model (202 request dumps), so 3000 and 8000 were simply
+too small. The default is now sized above a trace -- `tests/test_cap_ceiling.py`.
+
+What follows is kept, and is why this file is otherwise unchanged: the detection.
+A reply that truly does spend a whole budget thinking has to be *recognised* rather
+than retried, because retrying that one buys the same nothing again. That guard now
+applies only when the budget really is spent; it is a safety net for the wall, not
+the explanation of the 3000 failure.
 
 Four things must therefore hold, and each is a test below:
 

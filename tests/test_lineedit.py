@@ -59,6 +59,42 @@ def test_a_long_line_wraps_instead_of_running_off_the_screen():
     assert editor._rows == 3
 
 
+def test_a_prompt_that_opens_with_a_break_does_not_drift():
+    """`chat`'s prompt starts with a newline, so the input sits one row down.
+
+    Charged as a column instead of as a row, every keystroke re-emitted that
+    break and the input line walked down the screen one row per character
+    typed: three keystrokes, three rows of drift.
+    """
+    editor, _, out = build([], columns=40)
+    editor.set_prompt("\nyou> ")
+    typed = ""
+    for ch in "abc":
+        typed += ch
+        editor._consume(ch)
+        assert out.screen().lines() == ["", "you> " + typed], out.getvalue()
+    assert editor._rows == 2 and editor._cur_row == 1
+
+
+def test_the_prompt_may_carry_colour_and_a_break_at_once():
+    """The real prompt is both, and the cursor still lands after the input."""
+    editor, _, out = build([], columns=40)
+    editor.set_prompt("\n\x1b[36myou>\x1b[0m ")
+    editor._consume("hi")
+    assert out.screen().lines() == ["", "you> hi"]
+    assert out.getvalue().rstrip().endswith("\x1b[7C")   # 5 prompt + 2 typed
+
+
+def test_a_break_in_the_prompt_survives_the_heartbeat():
+    """The prompt's own rows are part of the area a tick has to climb over."""
+    editor, _, out = build([], columns=40)
+    editor.set_prompt("\nyou> ")
+    editor._consume("hi")
+    editor.tick("  ~ turn 1")
+    editor.tick("  ~ turn 2")
+    assert out.screen().lines() == ["  ~ turn 2", "", "you> hi"]
+
+
 def test_the_cursor_is_never_placed_left_of_the_area():
     """A negative row move would be printed as a literal `[-1A`."""
     for width in (21, 40, 80):
@@ -209,6 +245,18 @@ def test_a_big_paste_becomes_a_placeholder_and_a_file(tmp_path):
     assert ref.startswith("[Pasted text #1: 9 lines → ")
     assert str(tmp_path) in ref
     assert expand_paste_refs(ref) == body
+
+
+def test_a_windows_paste_counts_its_cr_breaks(tmp_path):
+    # A Windows terminal sends a pasted block's breaks as a bare CR, so the
+    # counter has to normalise before it counts: reading "\n" alone saw
+    # this as one line, missed both thresholds, and inserted the block
+    # verbatim instead of collapsing it.
+    body = "\r".join(f"line {i}" for i in range(9))
+    ref = collapse_paste(body, directory=tmp_path)
+    assert ref.startswith("[Pasted text #1: 9 lines → ")
+    # What lands on disk is normalised too, so the agent reads real lines.
+    assert expand_paste_refs(ref) == body.replace("\r", "\n")
 
 
 def test_a_deleted_paste_file_leaves_the_placeholder_alone(tmp_path):

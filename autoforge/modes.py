@@ -261,13 +261,31 @@ class MinimalAgent:
         # would make the comparison a comparison of scaffolding *and* memory.
         if self.compactor is None:
             self.compactor = Compactor(
-                summarizer=LLMSummarizer(self.llm),
+                summarizer=LLMSummarizer(
+                    self.llm, should_abort=self._operator_wants_the_floor),
                 fallback=DeterministicSummarizer(),
                 log_path=default_log_path(),
             )
 
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
+
+    def _operator_wants_the_floor(self) -> bool:
+        """Whether the operator has said something this run has not consumed.
+
+        The same question `core.agent.Agent` asks of its own long steps, asked
+        here because the compactor is built in `__post_init__` -- before the
+        Agent it belongs to exists. It needs an answer for the same reason that
+        loop does: the summarizer is a model call that can run for minutes, and
+        it fires at a turn boundary, so without this the one long step that
+        could not yield was the one the operator was most likely waiting on.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+        except Exception:                     # noqa: BLE001 - reads as "no"
+            return False
 
     def run(self, task: str, history: list | None = None) -> AgentResult:
         agent = Agent(

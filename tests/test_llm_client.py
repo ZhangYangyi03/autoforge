@@ -1,7 +1,7 @@
 """The outgoing request body, asserted on the wire.
 
 These exist because of a concrete failure: aiping.cn answers 503 to a
-completion body that omits `max_tokens`, while the same body with a modest cap
+completion body that omits `max_tokens`, while the same body with a cap set
 returns 200. The client used to forward whatever the caller passed and nothing
 else, so every call path that did not think about `max_tokens` -- the agent
 loop, the demos -- silently carried a landmine. The fix belongs at the client,
@@ -74,10 +74,18 @@ class TestMaxTokensAlwaysSent:
         _client(default_max_tokens=None).chat(MSGS)
         assert "max_tokens" not in captured["body"]
 
-    def test_default_sits_below_the_known_bad_ceiling(self):
-        """4096 was flaky and 8192 failed outright in the probe."""
+    def test_default_clears_a_reasoning_trace(self):
+        """The rule here used to be "keep it under 4096", from probes that read a
+        gateway outage as a cap limit. The live failure that replaced it: at a cap
+        of 3000 the reasoning trace consumed the entire budget and the answer never
+        began (`finish_reason='length'`, 0 chars of content, 10901 of
+        `reasoning_content`), against a gateway that answers requests carrying
+        65536-128000. The default is therefore generous; `tests/test_cap_ceiling.py`
+        pins the size and covers what keeps a generous number safe on a stricter
+        provider.
+        """
         assert OpenAICompatClient.DEFAULT_MAX_TOKENS is not None
-        assert OpenAICompatClient.DEFAULT_MAX_TOKENS < 4096
+        assert OpenAICompatClient.DEFAULT_MAX_TOKENS >= 16384
 
 
 # ======================================================================

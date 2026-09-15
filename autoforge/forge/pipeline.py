@@ -53,6 +53,10 @@ class ForgeResult:
     need: str
     spec: ToolSpec | None
     attempts: list[ForgeAttempt] = field(default_factory=list)
+    #: Ended early because the operator spoke. Distinct from a failed forge: the
+    #: tool was not judged, so nothing about it is known -- which is why this
+    #: must never be reported as "the forge failed".
+    aborted: bool = False
 
     @property
     def ok(self) -> bool:
@@ -127,7 +131,18 @@ class ForgePipeline:
         return self.policy is None or self.policy.may_promote_tools
 
     # -- the loop --------------------------------------------------------
-    def forge(self, need: str, context: str = "") -> ForgeResult:
+    def forge(self, need: str, context: str = "",
+              should_abort: Callable[[], bool] | None = None) -> ForgeResult:
+        """Run the loop until a tool is sealed, the rounds run out, or the
+        operator says something.
+
+        `should_abort` is the operator's line reaching into the middle of a
+        round. A forge is the longest thing this framework does -- a model call
+        per round, then a stack of sandbox samples -- and without this the only
+        chance to hear them was at a round boundary, minutes away. It is asked
+        at each boundary *and* by the sandbox itself while a child is running,
+        so a correction lands mid-sample rather than after it.
+        """
         result = ForgeResult(need, None)
         feedback = ""
         existing = ", ".join(self.registry.names()) or "(none)"
@@ -138,76 +153,105 @@ class ForgePipeline:
             "need": need, "max_rounds": self.config.max_rounds,
         })
 
-        for round_no in range(1, self.config.max_rounds + 1):
-            started = time.perf_counter()
-            attempt = ForgeAttempt(need, round_no)
-            # Set when retrying cannot possibly change the outcome, so the loop
-            # stops after recording the attempt instead of spending another
-            # round's budget to observe the same wall.
-            futile = False
-            try:
-                prompt_need = need if not feedback else self._repair_prompt(need, feedback)
-                generated = self.generator.generate(prompt_need, context or existing)
-                attempt.generated = generated
-                spec = self._to_spec(generated)
+        # The sandbox outlives this call -- the verifier owns it and hands the
+        # same instance to the adversary and the fuzzer -- so the predicate is
+        # restored rather than just dropped. A stale one here would let a long
+        # gone operator abort somebody else's forge.
+        previous_check = self.sandbox.abort_check
+        self.sandbox.abort_check = should_abort
+        try:
+            for round_no in range(1, self.config.max_rounds + 1):
+                if should_abort is not None and should_abort():
+                    result.aborted = True
+                    break
+                started = time.perf_counter()
+                attempt = ForgeAttempt(need, round_no)
+                # Set when retrying cannot possibly change the outcome, so the loop
+                # stops after recording the attempt instead of spending another
+                # round's budget to observe the same wall.
+                futile = False
+                try:
+                    prompt_need = need if not feedback else self._repair_prompt(need, feedback)
+                    generated = self.generator.generate(prompt_need, context or existing)
+                    attempt.generated = generated
+                    # Between the model call and the sandbox: the answer just
+                    # arrived, and if the operator spoke during it, verifying it
+                    # spends sandbox time proving a tool that is about to be
+                    # replaced.
+                    if should_abort is not None and should_abort():
+                        result.aborted = True
+                        break
+                    spec = self._to_spec(generated)
 
-                report = self.verifier.verify(spec, self.config.sample_args)
-                attempt.report = report
-                spec.verification = report.to_dict()
+                    report = self.verifier.verify(spec, self.config.sample_args)
+                    attempt.report = report
+                    spec.verification = report.to_dict()
 
-                if report.passed:
-                    if self._may_promote():
-                        spec.state = ToolState.ACTIVE
+                    if report.passed:
+                        if self._may_promote():
+                            spec.state = ToolState.ACTIVE
+                        else:
+                            # PROBATION tools are already visible to the model, so
+                            # nothing is lost but the seal. Record why, so a tool
+                            # sitting on probation is never a mystery.
+                            spec.state = ToolState.PROBATION
+                            self._emit("promote_withheld", {
+                                "tool": spec.name,
+                                "reason": (
+                                    "may_promote_tools is off"
+                                    if self.policy is not None and not self.policy.may_promote_tools
+                                    else "promote_on_pass is off"
+                                ),
+                            })
+                        self.registry.register(spec)
+                        attempt.accepted = True
+                        result.spec = spec
                     else:
-                        # PROBATION tools are already visible to the model, so
-                        # nothing is lost but the seal. Record why, so a tool
-                        # sitting on probation is never a mystery.
-                        spec.state = ToolState.PROBATION
-                        self._emit("promote_withheld", {
-                            "tool": spec.name,
-                            "reason": (
-                                "may_promote_tools is off"
-                                if self.policy is not None and not self.policy.may_promote_tools
-                                else "promote_on_pass is off"
-                            ),
-                        })
-                    self.registry.register(spec)
-                    attempt.accepted = True
-                    result.spec = spec
-                else:
-                    spec.state = ToolState.DRAFT
-                    feedback = self._feedback(report)
-            except UnrecoverableGeneration as exc:
-                # Nothing about this failure is round-specific: the model, not
-                # the attempt, cannot produce an answer. Record it and stop.
-                futile = True
-                attempt.error = f"{type(exc).__name__}: {exc}"
-                self._emit("forge_error", {
-                    "round": round_no,
-                    "error": attempt.error,
-                    "futile": True,
-                    "traceback": traceback.format_exc(),
-                })
-            except Exception as exc:  # noqa: BLE001
-                attempt.error = f"{type(exc).__name__}: {exc}"
-                # A framework whose whole point is judging generated code cannot
-                # afford to swallow its own tracebacks. Keep them in the log.
-                self._emit("forge_error", {
-                    "round": round_no,
-                    "error": attempt.error,
-                    "traceback": traceback.format_exc(),
-                })
-                feedback = attempt.error
+                        spec.state = ToolState.DRAFT
+                        feedback = self._feedback(report)
+                except UnrecoverableGeneration as exc:
+                    # Nothing about this failure is round-specific: the model, not
+                    # the attempt, cannot produce an answer. Record it and stop.
+                    futile = True
+                    attempt.error = f"{type(exc).__name__}: {exc}"
+                    self._emit("forge_error", {
+                        "round": round_no,
+                        "error": attempt.error,
+                        "futile": True,
+                        "traceback": traceback.format_exc(),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    attempt.error = f"{type(exc).__name__}: {exc}"
+                    # A framework whose whole point is judging generated code cannot
+                    # afford to swallow its own tracebacks. Keep them in the log.
+                    self._emit("forge_error", {
+                        "round": round_no,
+                        "error": attempt.error,
+                        "traceback": traceback.format_exc(),
+                    })
+                    feedback = attempt.error
 
-            attempt.duration_ms = (time.perf_counter() - started) * 1000
-            result.attempts.append(attempt)
-            self._emit("forge_attempt", {
-                "need": need, "round": round_no, "accepted": attempt.accepted,
-                "error": attempt.error,
-                "report": attempt.report.to_dict() if attempt.report else None,
+                attempt.duration_ms = (time.perf_counter() - started) * 1000
+                result.attempts.append(attempt)
+                self._emit("forge_attempt", {
+                    "need": need, "round": round_no, "accepted": attempt.accepted,
+                    "error": attempt.error,
+                    "report": attempt.report.to_dict() if attempt.report else None,
+                })
+                if attempt.accepted or futile:
+                    break
+        finally:
+            self.sandbox.abort_check = previous_check
+
+        if result.aborted:
+            # Not `forge_done` with ok=False. Nothing was judged, so there is no
+            # verdict to report -- and a caller that reads a failed verdict here
+            # would record a tool as bad because a human interrupted.
+            self._emit("forge_aborted", {
+                "need": need, "rounds": result.rounds,
+                "reason": "the operator said something",
             })
-            if attempt.accepted or futile:
-                break
+            return result
 
         self._emit("forge_done", {
             "need": need, "ok": result.ok, "rounds": result.rounds,

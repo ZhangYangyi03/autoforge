@@ -84,8 +84,8 @@ class TestStoreReportIsMeasured:
 class TestForgePersists:
     def test_forged_tool_is_on_the_ledger(self, store, db_path):
         a = _agent(store)
-        res = SimpleNamespace(ok=True, rounds=1, spec=_spec("read_magic"))
-        a.pipeline.forge = lambda need, context="": res   # no LLM needed
+        res = SimpleNamespace(ok=True, rounds=1, aborted=False, spec=_spec("read_magic"))
+        a.pipeline.forge = lambda need, context="", should_abort=None: res   # no LLM needed
 
         out = a.registry.call("forge_tool", {"need": "read a file"}).output
         assert "read_magic" in out
@@ -99,10 +99,54 @@ class TestForgePersists:
 
     def test_failed_forge_persists_nothing(self, store):
         a = _agent(store)
-        a.pipeline.forge = lambda need, context="": SimpleNamespace(
-            ok=False, rounds=2, spec=None)
+        a.pipeline.forge = lambda need, context="", should_abort=None: SimpleNamespace(
+            ok=False, rounds=2, aborted=False, spec=None)
         a.registry.call("forge_tool", {"need": "impossible"})
         assert store.report()["tools"] == 0
+
+    def test_an_over_budget_library_still_forges_and_is_told_the_cost(self, store):
+        """The cap asks the forge to justify itself. It does not refuse it.
+
+        Written as `if over: return over`, the check was a wall, and a refused
+        forge is indistinguishable from an impossible one: the agent reads it
+        as "this need cannot be served" and stops trying. The need does not
+        become unservable because the prompt grew, so the warning has to reach
+        the forge rather than replace it -- the same sentence the comment above
+        the check and `_tool_budget_report`'s docstring both already claimed.
+        """
+        a = _agent(store)
+        res = SimpleNamespace(ok=True, rounds=1, aborted=False, spec=_spec("read_magic"))
+        seen: dict = {}
+
+        def forge(need, context="", should_abort=None):
+            seen["need"], seen["context"] = need, context
+            return res
+
+        a.pipeline.forge = forge
+        a._tool_budget_report = lambda: "Tool schema budget exceeded: 9000 chars."
+
+        out = a.registry.call("forge_tool", {"need": "read a file"}).output
+
+        assert "read_magic" in out, "the forge was refused rather than warned"
+        assert "budget" in seen["context"], "the cost never reached the forge"
+
+    def test_a_fresh_agent_is_not_born_over_budget(self):
+        """The cap weighs the library, not the tools the framework ships.
+
+        Counting the whole registry put every agent with the full tool set
+        permanently over the cap -- the shipping tools alone are ~24.6k
+        characters against a 6,000-character budget -- so the report fired on
+        every call and the forge it was meant to make justify itself was
+        instead refused outright, on every machine, forever.
+        """
+        a = _agent()
+        assert a._tool_schema_chars(own_only=True) == 0, "a fresh agent has forged nothing"
+        assert a._tool_schema_chars(own_only=False) > a._tool_schema_chars(own_only=True), \
+            "the builtin baseline is not being excluded from the budget"
+        assert a._tool_budget_report() == "", (
+            "a fresh agent with no forged tools reports over budget, which is "
+            "how the forge came to be refused on every call"
+        )
 
 
 # ======================================================================

@@ -97,7 +97,12 @@ class TestTheLoopConsultsIt:
 
         compacts = [e for e in a.trace if e.get("kind") == "compact"]
         assert compacts, [e.get("kind") for e in a.trace]
-        assert compacts[0]["dropped"] > 0
+        # A pass that declines — nothing safe to cut yet — is recorded too, on
+        # purpose: a wedged run used to leave no trace at all. What this asserts
+        # is that a run with room to compact does compact.
+        acted = [e for e in compacts if e.get("dropped")]
+        assert acted, compacts
+        assert acted[0]["dropped"] > 0
 
     def test_minimal_agent_records_one_too(self):
         m = MinimalAgent(llm=bulky_llm(), compactor=tiny(), max_turns=12)

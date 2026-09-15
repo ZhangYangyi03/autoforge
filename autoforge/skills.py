@@ -59,12 +59,37 @@ EXCLUDED_SKILL_DIRS = frozenset({
 #: legitimate category called `scripts/` or `templates/` would vanish.
 SKILL_SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
 
-MENU_LINE_CHARS = 160      # per-entry cap in the prompt menu
+MENU_LINE_CHARS = 160      # per-entry cap for a skill that has been used
+MENU_COLD_LINE_CHARS = 80  # per-entry cap for one that never has
 MENU_BUDGET_CHARS = 1400   # whole-menu cap, for the same reason memory has one
+#: Never-loaded skills are collapsed into a single count line once there are
+#: more than this many. Below it they are listed, because a handful of unused
+#: skills is a library being built; above it they are sediment, and listing
+#: them costs every turn to say nothing.
+MENU_COLD_MAX_LISTED = 5
 
 
 class SkillError(ValueError):
     """A skill file that cannot be used as written."""
+
+
+# ---------------------------------------------------------------------------
+# how proven a procedure is, without a counter that churns
+# ---------------------------------------------------------------------------
+#: Loads at which a skill counts as well proven. Not a tuning knob so much as
+#: the point where the claim changes kind: run a few times is "this works here",
+#: run five times is "this is how it is done here". Both render as fixed
+#: strings, so a load that stays inside a tier does not move the menu — which
+#: matters because the menu is prompt *prefix*, and the exact count was,
+#: measurably, re-billing a whole conversation on every load.
+PROVEN_LOADS = 5
+
+
+def provenance(loads: int) -> str:
+    """The one-line claim a menu may make about `loads` previous runs."""
+    if not loads:
+        return "never used"
+    return "well proven" if loads >= PROVEN_LOADS else "used before"
 
 
 # ---------------------------------------------------------------------------
@@ -82,21 +107,32 @@ class Skill:
     loads: int = 0
     last_loaded: float | None = None
 
-    def menu_line(self) -> str:
+    def menu_line(self, cold: bool = False) -> str:
         """One line for the prompt: what it is, when to reach for it, how proven.
 
-        The load count is shown because it is real information the agent can act
-        on: a procedure used twenty times is a different bet from one that has
-        never run. Hiding it would make the menu look like an equal menu.
+        How proven it is, not how many times it ran. A procedure used twenty
+        times is a different bet from one that has never run, and the menu would
+        be lying if it presented them as equals — but `20x` versus `19x` is not a
+        different bet, and the exact number costs far more than it says. This
+        line rides in the system prompt, which is the *prefix* of every request,
+        so a count that moves on every load re-bills the whole conversation
+        uncached, every turn. Measured: one load moved 1,332 characters of a
+        6,457-character prompt, and everything behind them.
+
+        A tier moves the text at most twice in a skill's life, and each move is
+        news the agent can act on: this has run here, or this is well proven.
+
+        `cold` is the never-loaded case, and it gets a shorter line. The menu is
+        an index, and an index should be sized by the chance it gets consulted:
+        a skill that has never been opened is a weaker bet than one that has, so
+        it earns less of the prompt. The full when_to_use is still on disk and
+        still returned by skill_list — this shortens the index, not the skill.
         """
         when = self.when_to_use or self.description
-        if len(when) > MENU_LINE_CHARS:
-            when = when[:MENU_LINE_CHARS].rstrip() + " ..."
-        if self.loads:
-            use = f"used {self.loads}x"
-        else:
-            use = "never used"
-        return f"    {self.name} ({use}) -- {when}"
+        cap = MENU_COLD_LINE_CHARS if cold else MENU_LINE_CHARS
+        if len(when) > cap:
+            when = when[:cap].rstrip() + " ..."
+        return f"    {self.name} ({provenance(self.loads)}) -- {when}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -329,7 +365,25 @@ class SkillLibrary:
                 self.store.upsert_skill(
                     skill.name, skill.path, skill.source, skill.description,
                     skill.when_to_use, skill.tags)
+            # A row is dropped only on evidence that the skill is gone: this
+            # scan walked the directory it lives in, and the file is no longer
+            # there. Absence is not evidence. `self.dirs` is per-instance
+            # configuration, so a scan can legitimately see fewer skills than
+            # the store knows — an `ENV`-overridden directory, a different
+            # `home`, a cwd with no `skills/`, or a test that scans a temp
+            # directory. The first version read every one of those as "the
+            # human deleted the rest of the library" and cleared the table,
+            # taking the `loads` counts with it: the only input the router has
+            # for telling a proven procedure from an unused one, gone, with no
+            # way to reconstruct it. Keeping a stale row costs a ranking nudge
+            # that the next real scan corrects; deleting one is unrecoverable.
+            walked = [os.path.abspath(d) for _, d in self.dirs if os.path.isdir(d)]
             for stale in set(known) - set(found):
+                path = os.path.abspath(known[stale]["path"])
+                if os.path.exists(path):
+                    continue      # still on disk: unreadable, see self.errors
+                if not any(path.startswith(d + os.sep) for d in walked):
+                    continue      # this scan never looked where it lives
                 self.store.forget_skill_row(stale)
         self._skills = found
         return self.all()
@@ -454,22 +508,77 @@ class SkillLibrary:
         Bounded, and it says when it truncated: an agent that cannot see its
         own menu was cut will conclude it has no procedure for a task it does
         have one for, which is the failure this whole module exists to fix.
+
+        Three things the first version got wrong, all of them costing prompt
+        space every turn:
+
+        *The header was not counted.* `budget` was spent on entries while the
+        header line rode free, so the menu was always over its own cap.
+
+        *`if shown and ...` guaranteed at least one entry.* With many short
+        lines the budget never bound at all — nineteen skills rendered in full
+        under a 1400-character cap. The floor is now a floor on *reporting*,
+        not on listing: if nothing fits, the menu says so instead of silently
+        blowing the budget.
+
+        *Never-loaded skills were listed at full width.* They are the majority
+        of any library that has been written to more than it has been read
+        from, and they are the weakest bets in it, so they get the shorter
+        lines and a cap: past MENU_COLD_MAX_LISTED the remainder fold into the
+        count line. Nothing is lost -- the files are on disk, `skill_list` reads
+        them all, and `skill_view` still opens any of them by name -- and what
+        is dropped is the per-turn cost of advertising procedures that have
+        never once been reached for. That cap then over-reached: written as
+        `if len(cold) <= MENU_COLD_MAX_LISTED`, it hid *every* cold skill in
+        any library larger than the cap, so forty never-loaded skills rendered
+        as no names at all. A cap on how much prompt the unread part of a
+        library earns is not a licence to make it invisible -- the count line
+        has to be there either way.
         """
         skills = self.all()
         if not skills:
             return ["- Skills: none yet (skill_write(name, description, body) "
                     "saves one)."]
-        lines = ["- Skills (procedures; skill_view(name) reads one in full):"]
+        header = "- Skills (procedures; skill_view(name) reads one in full):"
+        lines = [header]
+        used = len(header)
+
+        warm = [s for s in skills if s.loads]
+        cold = [s for s in skills if not s.loads]
+
         shown = 0
-        used = 0
-        for skill in skills:
+        for skill in warm:
             line = skill.menu_line()
-            if shown and used + len(line) > budget:
+            if used + len(line) > budget:
                 break
             lines.append(line)
             used += len(line)
             shown += 1
-        rest = len(skills) - shown
+
+        # Cold skills: the weakest bets, so they get the shortest lines, and
+        # only the first MENU_COLD_MAX_LISTED of them are advertised at all.
+        # Past that the remainder fold into the count line below.
+        #
+        # The cap used to be all-or-nothing -- `if len(cold) <= MAX: list all`
+        # -- so a library of 40 never-loaded skills rendered *zero* names and
+        # one count. An agent then looked at its own menu, saw nothing, and
+        # concluded it had no procedure for a task it had written one for. That
+        # is the precise failure this module exists to prevent, reproduced by
+        # the code that prevents it. The cap belongs on how much prompt the
+        # unread part of a library earns, not on whether it is visible at all;
+        # the count line is what keeps a short menu from reading as a short
+        # library. Measured 2026-09-15 with 40 cold skills and a 500-char
+        # budget: 3 listed, "+37 more -- skill_list reads them all".
+        cold_shown = 0
+        for skill in cold[:MENU_COLD_MAX_LISTED]:
+            line = skill.menu_line(cold=True)
+            if used + len(line) > budget:
+                break
+            lines.append(line)
+            used += len(line)
+            cold_shown += 1
+
+        rest = (len(warm) - shown) + (len(cold) - cold_shown)
         if rest:
             lines.append(f"    (+{rest} more -- skill_list reads them all)")
         return lines

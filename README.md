@@ -83,7 +83,7 @@ auto config
   base_url   https://aiping.cn/api/v1  config C:\Users\you\.autoforge\config.json
   model      DeepSeek-V4.1-Flash       config C:\Users\you\.autoforge\config.json
   api_key    QC-5...e262 (len 68)      config C:\Users\you\.autoforge\config.json
-  max_tokens 3000                      config C:\Users\you\.autoforge\config.json
+  max_tokens 32768                     default
   proxy      True                      config C:\Users\you\.autoforge\config.json
 ```
 
@@ -97,6 +97,19 @@ auto --base-url http://127.0.0.1:11434/v1 --model qwen2.5:7b --no-proxy
 auto --policy supervised                    # keep the harness, drop the latitude
 AUTOFORGE_POLICY=supervised auto            # same, this shell only
 ```
+
+`max_tokens` is a budget rather than a limit on the answer: the generator's model
+reasons before it writes, and the trace is spent out of the same budget. At the old
+3000 the trace took the whole of it and the envelope never began, so the default is
+32768. A provider with a lower ceiling is not a problem -- a 400 that names
+`max_tokens` is answered at the number it names. Two things to know before tuning it
+down: an envelope cut off mid-JSON fails to parse, and a truncated one that *does*
+parse arrives with empty `probes`, which the pipeline accepts as a tool that has been
+verified. If a gateway answers `503 暂无可用服务商` for a large cap on a reasoning
+model no matter how long you wait, that is its routing rather than the number you
+sent: the combination measured to work through the aiping gateway is
+`--model Qwen3.5-Flash` with `AUTOFORGE_MAX_TOKENS=4000`, while a direct provider
+endpoint takes the full 32768. Numbers and controls in `probes/FINDINGS.md`.
 
 Why bother with a file when environment variables exist: a variable exported
 *after* a terminal was opened is invisible to that terminal — Windows and POSIX

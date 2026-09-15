@@ -22,6 +22,18 @@ from typing import Any, Callable
 from .spec import ToolSpec, ToolState
 
 
+class ToolAborted(Exception):
+    """A call gave up because the operator asked for the floor.
+
+    Not every `Exception` out of a tool is a tool failure. "The person running
+    this said something and wants the turn" is a decision *about* the call, not
+    evidence about the tool, and the two must not arrive at the ledger wearing
+    the same clothes — that is how three operator interruptions retire a
+    perfectly good tool. A runner that can be cut short raises this; the
+    registry reports it as `aborted=True` and leaves `spec.stats` alone.
+    """
+
+
 @dataclass
 class ToolResult:
     name: str
@@ -31,6 +43,7 @@ class ToolResult:
     duration_ms: float = 0.0
     quarantined: bool = False
     awaiting_confirmation: bool = False   # stopped at the autonomy gate
+    aborted: bool = False                 # the operator asked for the floor
 
     def to_json(self) -> str:
         return json.dumps(
@@ -50,6 +63,7 @@ class ToolRegistry:
         visible_states: set[ToolState] | None = None,
         policy: Any = None,
         confirmer: Any = None,
+        on_state_change: Callable[[ToolSpec], None] | None = None,
     ) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self.min_calls_for_judgement = min_calls_for_judgement
@@ -64,6 +78,16 @@ class ToolRegistry:
         # exactly as it did before this existed.
         self.policy = policy
         self.confirmer = confirmer
+        # Told whenever a tool's *state* moves, so a decision made here can
+        # outlive the process. A registry alone persists nothing: it is a dict
+        # of specs, and retire/quarantine/promote are memory writes. That was
+        # invisible while nothing read the state back — but the store does, as
+        # the first thing the next session does, and it can only read a value
+        # some transition wrote. So a tool retired as harmful came back
+        # `active` on the next start, and the ledger said "retired" while the
+        # registry said "fine": two records of the same decision disagreeing,
+        # with nothing comparing them. `None` leaves a bare registry as it was.
+        self.on_state_change = on_state_change
         # Which states get injected into the LLM's context by default.
         # Trusted-only is the production stance. Verification harnesses widen
         # this to include DRAFT so a tool can be tested before it is trusted.
@@ -238,16 +262,41 @@ class ToolRegistry:
             or st.consecutive_failures >= self.quarantine_consecutive_failures
         )
         if degraded and spec.state in (ToolState.ACTIVE, ToolState.PROBATION):
-            spec.state = ToolState.QUARANTINED
-            self._log(
-                "auto_quarantine",
-                spec.name,
-                {
-                    "success_rate": round(st.success_rate, 3),
-                    "consecutive_failures": st.consecutive_failures,
-                    "calls": st.calls,
-                },
-            )
+            # Through the funnel, not straight to the attribute: this is the
+            # safety valve, and a safety valve that re-opens on restart is not
+            # one. A tool quarantined for failing three calls in a row used to
+            # be back on active duty the next time the agent started, because
+            # the store was never told.
+            self._set_state(spec, ToolState.QUARANTINED, "auto_quarantine",
+                            {
+                                "success_rate": round(st.success_rate, 3),
+                                "consecutive_failures": st.consecutive_failures,
+                                "calls": st.calls,
+                            })
+
+    def _set_state(self, spec: ToolSpec, state: ToolState, kind: str,
+                   extra: dict[str, Any] | None = None) -> None:
+        """The one place a tool's state moves, and the one place it is announced.
+
+        Every transition routes through here for the same reason the agent
+        funnels its events through `_record`: the alternative is a transition
+        that moves the state and forgets to tell anyone, and that is not a
+        hypothetical — retirement and quarantine both moved the state and told
+        only the in-memory event log, which is how a judgement about a harmful
+        tool came to expire with the process that made it.
+        """
+        spec.state = state
+        self._log(kind, spec.name, extra or {})
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change(spec)
+            except Exception:                # noqa: BLE001
+                # The state has already moved in memory; a store that is
+                # locked, full or closed must not turn that into a failed
+                # call. The cost of swallowing this is a decision that does
+                # not survive the restart — visible, and cheaper than a call
+                # that raises after it already took effect.
+                pass
 
     def rehab(self, name: str, *, require_clean: int = 2) -> ToolSpec:
         """Bring a quarantined tool back on trial after it proves itself again."""
@@ -256,24 +305,22 @@ class ToolRegistry:
         spec.stats.calls = 0
         spec.stats.successes = 0
         spec.stats.failures = 0
-        spec.state = ToolState.PROBATION
-        self._log("rehab", name, {"require_clean": require_clean})
+        self._set_state(spec, ToolState.PROBATION, "rehab",
+                        {"require_clean": require_clean})
         return spec
 
     def retire(self, name: str) -> None:
         if name in self._tools:
-            self._tools[name].state = ToolState.RETIRED
-            self._log("retire", name, {})
+            self._set_state(self._tools[name], ToolState.RETIRED, "retire")
 
     def quarantine(self, name: str, reason: str = "manual") -> None:
         if name in self._tools:
-            self._tools[name].state = ToolState.QUARANTINED
-            self._log("quarantine", name, {"reason": reason})
+            self._set_state(self._tools[name], ToolState.QUARANTINED,
+                            "quarantine", {"reason": reason})
 
     def promote(self, name: str) -> ToolSpec:
         spec = self._tools[name]
-        spec.state = ToolState.ACTIVE
-        self._log("promote", name, {})
+        self._set_state(spec, ToolState.ACTIVE, "promote")
         return spec
 
     # -- reporting -------------------------------------------------------

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -84,6 +85,34 @@ _RUNNER = textwrap.dedent('''
 ''').strip()
 
 
+def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill the child *and everything it started*.
+
+    ``proc.kill()`` reaches the direct child only. A forged tool that shells
+    out -- or a verification sample that spawns a worker -- leaves those
+    grandchildren running, holding the pipes we are about to read from and the
+    temp directory we are about to delete. On Windows that is exactly the
+    lock that turns a clean abort into a hang, so the tree is killed by pid.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            proc.kill()
+    except Exception:                     # noqa: BLE001 - killing is best effort
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:                     # noqa: BLE001
+        pass
+
+
 @dataclass
 class SandboxResult:
     ok: bool
@@ -91,6 +120,11 @@ class SandboxResult:
     stdout: str = ""
     error: str | None = None
     timed_out: bool = False
+    #: Killed because the operator spoke, not because the tool was slow or
+    #: wrong. Kept separate from `timed_out` on purpose: a timeout is a verdict
+    #: on the code, and writing it into a tool's failure ledger would punish the
+    #: tool for a decision the *person* made.
+    aborted: bool = False
     duration_ms: float = 0.0
     returncode: int | None = None
     stderr: str = ""
@@ -115,6 +149,13 @@ class Sandbox:
         "HOME", "USERPROFILE", "LANG", "LC_ALL", "PYTHONPATH",
     )
     runner: Callable[[str, str, dict[str, Any]], SandboxResult] | None = None
+    #: Asked while a child is running: ``True`` means kill it now and report
+    #: `aborted`. It lives on the sandbox rather than in `run`'s signature
+    #: because the calls come from deep inside the verifier -- five checks, a
+    #: fuzzer's worth of samples each -- and threading a parameter through all
+    #: of them would mean touching every call site to say the same thing. Set
+    #: it for the span of a run and clear it after.
+    abort_check: Callable[[], bool] | None = None
 
     def effective_env(self) -> dict[str, str]:
         """The environment forged code actually gets — not the agent's own.
@@ -128,14 +169,28 @@ class Sandbox:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
 
-    def reachable(self, names) -> tuple[list[str], list[str]]:
-        """Split `names` into (resolvable, not) from inside the sandbox."""
+    def resolve(self, names) -> dict[str, str | None]:
+        """For each name, the path it resolves to from inside the sandbox.
+
+        `reachable` answers the weaker question — "is this name on PATH". The
+        question that actually matters is the stronger one: can the binary it
+        points at answer the question I am about to ask it? On Windows those
+        two answers disagree about `ps`: git-bash ships an MSYS `ps` that is on
+        PATH and lists MSYS processes only, so a probe built on it reports a
+        nearly empty machine and the emptiness reads as "no such process". The
+        path is what tells a blind lister from a working one, so the path is
+        what this returns.
+        """
         import shutil
 
         path = self.effective_env().get("PATH")
-        found = [n for n in names if shutil.which(n, path=path)]
-        missing = [n for n in names if n not in found]
-        return found, missing
+        return {n: shutil.which(n, path=path) for n in names}
+
+    def reachable(self, names) -> tuple[list[str], list[str]]:
+        """Split `names` into (resolvable, not) from inside the sandbox."""
+        found = self.resolve(names)
+        return ([n for n in names if found.get(n)],
+                [n for n in names if not found.get(n)])
 
     def run(self, code: str, entry: str, args: dict[str, Any] | None = None) -> SandboxResult:
         if self.runner is not None:
@@ -162,26 +217,68 @@ class Sandbox:
 
             started = time.perf_counter()
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     [self.python, "-I", runner_path],
-                    input=payload.encode("utf-8"),
-                    capture_output=True,
-                    timeout=self.timeout,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     env=env,
                     cwd=td,
                 )
-            except subprocess.TimeoutExpired as exc:
+            except OSError as exc:
                 return SandboxResult(
                     ok=False,
-                    error=f"timeout after {self.timeout}s",
-                    timed_out=True,
+                    error=f"could not start the sandbox interpreter: {exc}",
                     duration_ms=(time.perf_counter() - started) * 1000,
-                    stdout=(exc.stdout or b"").decode("utf-8", "replace")[: self.max_output_bytes],
+                )
+
+            # The child is fed and drained on a worker thread; only the *wait*
+            # is polled here. That inversion is the whole point: the wait is the
+            # long part, and it is the only part the person at the terminal is
+            # locked out by. `communicate` is what makes reading both pipes safe
+            # without deadlocking on a full buffer, so it stays -- it just no
+            # longer owns the thread while it does its job.
+            done = threading.Event()
+            box: dict[str, Any] = {}
+
+            def _drain() -> None:
+                try:
+                    box["out"], box["err"] = proc.communicate(
+                        input=payload.encode("utf-8"))
+                except BaseException as exc:      # noqa: BLE001
+                    box["exc"] = exc
+                finally:
+                    done.set()
+
+            threading.Thread(target=_drain, daemon=True).start()
+            deadline = started + self.timeout
+            verdict: str | None = None
+            while not done.wait(0.2):
+                if self.abort_check is not None and self.abort_check():
+                    verdict = "aborted"
+                    break
+                if time.perf_counter() > deadline:
+                    verdict = "timed_out"
+                    break
+
+            if verdict is not None:
+                _kill_tree(proc)
+                done.wait(timeout=10)
+                return SandboxResult(
+                    ok=False,
+                    error=("aborted by the operator" if verdict == "aborted"
+                           else f"timeout after {self.timeout}s"),
+                    timed_out=verdict == "timed_out",
+                    aborted=verdict == "aborted",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    stdout=(box.get("out") or b"").decode(
+                        "utf-8", "replace")[: self.max_output_bytes],
                 )
 
             duration = (time.perf_counter() - started) * 1000
-            stdout = (proc.stdout or b"").decode("utf-8", "replace")
-            stderr = (proc.stderr or b"").decode("utf-8", "replace")[: self.max_output_bytes]
+            stdout = (box.get("out") or b"").decode("utf-8", "replace")
+            stderr = (box.get("err") or b"").decode(
+                "utf-8", "replace")[: self.max_output_bytes]
 
             if not stdout.strip():
                 return SandboxResult(

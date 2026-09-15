@@ -23,15 +23,30 @@ ENVELOPE = b'{"ok": true, "output": "9780306406157", "stdout": ""}'
 
 
 class _Proc:
+    """Stands in for the sandbox child's `Popen`.
+
+    The sandbox no longer uses `subprocess.run`: `run` hides the pid, and the
+    pid is what lets a long child be killed the moment the operator speaks. So
+    the stand-in carries the surface the polled wait actually touches --
+    `communicate` to drain the pipes, `poll` for the exit status.
+    """
+
     def __init__(self, stdout: bytes) -> None:
         self.stdout = stdout
         self.stderr = b""
         self.returncode = 0
+        self.pid = -1
+
+    def communicate(self, input=None):        # noqa: A002 - matches Popen
+        return self.stdout, self.stderr
+
+    def poll(self):
+        return self.returncode
 
 
 def _sandbox_emitting(monkeypatch, stdout: bytes) -> Sandbox:
     monkeypatch.setattr(
-        "autoforge.forge.sandbox.subprocess.run", lambda *a, **kw: _Proc(stdout)
+        "autoforge.forge.sandbox.subprocess.Popen", lambda *a, **kw: _Proc(stdout)
     )
     return Sandbox(timeout=5.0)
 

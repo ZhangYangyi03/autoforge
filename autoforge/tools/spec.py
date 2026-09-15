@@ -179,7 +179,19 @@ class ToolSpec:
     # Optional out-of-process executor. When set, the registry calls
     # `runner(name, args) -> ToolResult-ish` instead of `fn(**args)`. Forged
     # tools set this to a sandbox bridge so untrusted code never runs in-loop.
-    runner: Callable[[str, dict[str, Any]], Any] | None = None
+    runner: Callable[..., Any] | None = None
+    #: Whether a call that is *already running* can be asked to give up.
+    #:
+    #: Declared by the tool rather than inferred from its name, because the
+    #: answer is a fact about its executor and not about what it does. A
+    #: `runner` that shells out to a sandbox can kill the child; an in-process
+    #: `fn` cannot be interrupted at all — Python offers no safe way to stop a
+    #: frame, so pretending otherwise means either a thread left running
+    #: against a history that has moved on, or a `kill` that takes the agent
+    #: with it. The registry only offers the abort question to a tool that said
+    #: yes, and `interruptible=False` is the honest label: the operator's line
+    #: waits for this call to return, and `/status` says so while they wait.
+    interruptible: bool = False
 
     @property
     def schema(self) -> dict[str, Any]:
