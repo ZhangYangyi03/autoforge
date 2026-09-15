@@ -299,3 +299,124 @@ def test_who_hides_a_registration_whose_process_is_gone(tmp_path, capsys):
     assert bus_mod.cmd_bus(["--dir", d, "who", "--all"]) == 0
     assert "ghost" in capsys.readouterr().out
 
+
+# -- currency: a dead author's words are not the operator's problem ----------
+def test_a_dead_sessions_words_are_not_current(bus):
+    """The failure this exists for, in the operator's own words: "you keep
+    telling me what a session I killed hours ago said".
+
+    `departed` only covers a session that left on purpose, and a session that
+    was killed never gets to say goodbye -- so its words stay current forever
+    and every startup reports them as mail. The process table is the only
+    honest judge, and it is the same judge `live_agents` already uses.
+    """
+    bus.register("gone", session_id="s-gone", pid=99999999)
+    bus.register("here", session_id="s-here")
+    bus.send(sender="gone", board="work", body="from the grave", session="s-gone")
+    bus.send(sender="here", board="work", body="still here", session="s-here")
+
+    assert [e["body"] for e in bus.read("work", "me")] == ["still here"]
+    # And the log still holds it, for the question "what did it say".
+    kept = bus.read("work", "me", everything=True, include_dead=True)
+    assert [e["body"] for e in kept] == ["from the grave", "still here"]
+
+
+def test_an_entry_with_only_a_name_is_judged_by_that_name(bus):
+    """The older writer stamped a name and no session id, and those entries are
+    most of a board that has been running for a while. Leaving them unjudged is
+    what kept the fossils alive: measured on this host, all 31 entries on the
+    board carried no session at all, so no id-based rule could ever retire one.
+    """
+    bus.register("old-timer", session_id="s-old", pid=99999999)
+    with open(bus.board_path("work"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"id": "x", "ts": "2026-09-15T11:00:00+08:00",
+                             "from": "old-timer", "to": "*", "kind": "msg",
+                             "body": "written before sessions were stamped"})
+                 + "\n")
+
+    assert bus.read("work", "me") == []
+    assert len(bus.read("work", "me", everything=True, include_dead=True)) == 1
+
+
+def test_an_author_nobody_registered_keeps_its_words(bus):
+    """A name with no registration cannot be judged, and the rule only ever
+    fires on evidence: hiding a live peer's message is worse than showing a
+    dead one's, because the message is the thing the channel exists to carry.
+    """
+    bus.send(sender="stranger", board="work", body="unjudgeable")
+
+    assert [e["body"] for e in bus.read("work", "me")] == ["unjudgeable"]
+
+
+def test_one_live_registration_keeps_the_shared_name_alive(bus):
+    """Two sessions are called "autoforge" here as a rule, so a name-based
+    verdict has to be the conservative one -- otherwise one session dying
+    retires the words of the one still working."""
+    bus.register("autoforge", session_id="s-dead", pid=99999999)
+    bus.register("autoforge", session_id="s-alive")
+    bus.send(sender="autoforge", board="work", body="who owns cli.py?",
+             session="s-alive")
+
+    assert [e["body"] for e in bus.read("work", "me")] == ["who owns cli.py?"]
+
+
+# -- startup: only what a live peer actually needs --------------------------
+def test_startup_counts_only_what_a_live_peer_needs(tmp_path):
+    """The line the operator reads at every start. Whole history is not news:
+    asks and claims from a live peer are, and so is the fact that something was
+    passed over -- "ignored" and "nothing there" are different facts.
+    """
+    b = bus_mod.Bus(tmp_path / "bus")
+    b.register("peer", session_id="s-peer")            # this process: alive
+    b.register("ghost", session_id="s-ghost", pid=99999999)
+    b.send(sender="peer", board="autoforge", body="who owns cli.py?",
+           session="s-peer", kind="ask")
+    b.send(sender="ghost", board="autoforge", body="I am editing agent.py",
+           session="s-ghost", kind="claim")
+
+    line = bus_mod.startup_check(b, "s-me")
+
+    assert "1 other live session(s)" in line
+    assert "1 message(s) needing you" in line
+    assert "1 stale entry" in line
+
+
+def test_startup_says_so_when_the_board_holds_nothing_current(tmp_path):
+    """Nothing to report is a result, and it has to read as one: the operator's
+    complaint was a board of fossils reported as unread mail."""
+    b = bus_mod.Bus(tmp_path / "bus")
+    b.register("ghost", session_id="s-ghost", pid=99999999)
+    b.send(sender="ghost", board="autoforge", body="hours ago", session="s-ghost")
+
+    line = bus_mod.startup_check(b, "s-me")
+
+    assert "no other live session" in line
+    assert "unread" not in line
+    assert "stale" in line
+
+
+def test_a_wrapper_message_is_stamped_with_the_session_it_belongs_to(tmp_path):
+    """`auto bus send --as autoforge` from a shell used to stamp a brand-new
+    throwaway id per invocation, so the session that owns those entries could
+    never retire them: "clear my messages when I close" was unenforceable for
+    exactly the messages a session writes through the CLI."""
+    d = str(tmp_path / "bus")
+    b = bus_mod.Bus(d)
+    b.register("autoforge", session_id="s-me")          # alive: this process
+
+    assert bus_mod.cmd_bus(["--dir", d, "send", "--as", "autoforge",
+                            "--board", "work", "holding cli.py"]) == 0
+
+    assert b.tail("work", 1)[0]["session"] == "s-me"
+
+
+def test_an_explicit_session_beats_the_registration(tmp_path):
+    d = str(tmp_path / "bus")
+    b = bus_mod.Bus(d)
+    b.register("autoforge", session_id="s-me")
+
+    assert bus_mod.cmd_bus(["--dir", d, "send", "--as", "autoforge",
+                            "--session", "s-mine", "--board", "work", "hi"]) == 0
+
+    assert b.tail("work", 1)[0]["session"] == "s-mine"
+

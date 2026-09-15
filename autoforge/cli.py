@@ -598,6 +598,16 @@ class _LiveRun:
         elif kind == "result":
             self._waiting_since = time.time()      # model turn resumes
             self._ticks = 0
+        elif kind == "say":
+            # The run answering the operator mid-flight. It is an event, not a
+            # tick: clearing first keeps it off the status line being rewritten
+            # every second, and the `agent>` label is what makes it readable as
+            # the agent talking rather than the harness narrating.
+            self._clear()
+            self._write(f"  [{self._stamp()}] +{self._elapsed()}  "
+                        f"agent> {payload.get('text', '')}\n")
+            self._waiting_since = time.time()
+            self._ticks = 0
         elif kind == "forge_start":
             # Forging costs a model turn per round — the longest silence in the
             # whole run, so it starts the heartbeat before the first request.

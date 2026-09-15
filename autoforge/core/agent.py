@@ -135,6 +135,7 @@ class Agent:
         on_turn: Callable[[int, Message], None] | None = None,
         on_request: Callable[[int], None] | None = None,
         on_steer: Callable[[str], None] | None = None,
+        on_reply: Callable[[str], None] | None = None,
         steer: Any = None,
         compactor: Any = None,
         on_compact: Callable[[Any], None] | None = None,
@@ -149,6 +150,11 @@ class Agent:
         self.on_turn = on_turn
         self.on_request = on_request
         self.on_steer = on_steer
+        #: `on_reply(text)` -- the run answering the person mid-flight. Separate
+        #: from `on_turn`, which is the loop counting its own turns: this one is
+        #: for the operator, and it is the difference between "it heard me" and
+        #: "it said something back".
+        self.on_reply = on_reply
         # Anything with `take_supplements()` / `stop_requested()`: the channel a
         # person uses to talk to this run while it is happening. Optional, so a
         # run with nobody watching is exactly what it was before.
@@ -160,6 +166,9 @@ class Agent:
         self.compactor = compactor
         self.on_compact = on_compact
         self._terminated: _TerminateSignal | None = None
+        #: How many operator lines the last `_absorb` folded in. Reset there, so
+        #: a run with no steering channel never reads a stale count.
+        self._folded = 0
         if allow_self_terminate:
             self._register_terminate_tool()
 
@@ -226,13 +235,53 @@ class Agent:
         No `try/except` on purpose. The whole point is that a line the operator
         typed is never dropped, so a bug in this channel must be loud rather
         than swallowed into a run that quietly ignored them.
+
+        Returns True when the operator asked the run to stop. How many lines were
+        folded in is *accumulated* in `_folded` rather than reset here: a line
+        can arrive while a tool is running, and it can only be answered at the
+        top of the next turn -- the results of the tool calls already in flight
+        have to be appended before any new assistant message, or the request that
+        follows is malformed. `_answer_the_operator` is the consumer.
         """
         if self.steer is None:
             return False
         for text in self.steer.take_supplements():
             msgs.append(Message.user(text))
             _notify(self.on_steer, text)
+            self._folded += 1
         return bool(self.steer.stop_requested())
+
+    def _answer_the_operator(self, msgs: list[Message]) -> None:
+        """Ask once with the tool list empty, so the answer goes to the person.
+
+        A line folded into the message list is invisible to the person who
+        typed it. The model is free to fold a question into its next tool call
+        and say nothing at all, and that is not a hypothesis: the ledger on this
+        host records the line "what are you doing?" absorbed at 00:00:27,
+        followed by sixty more tool calls and not one word back. Saying "heard"
+        is the harness talking; the reply has to be the *model* talking.
+
+        So a line that arrives mid-run buys one question asked with no tools
+        available, where answering is the only thing that can happen -- and the
+        answer joins the conversation, so the work that resumes knows what the
+        operator has already been told.
+
+        Deliberately quiet on failure: their line is already in the context and
+        the run is still making progress, so a broken reply turn must not cost
+        them the run. The opposite trade -- a run that dies while explaining its
+        own intercom -- is the one this module keeps refusing.
+        """
+        if not self._folded:
+            return
+        self._folded = 0
+        try:
+            resp = self.llm.chat(msgs, tools=[])
+        except Exception:                     # noqa: BLE001 - see docstring
+            return
+        if not resp.content:
+            return
+        msgs.append(Message.assistant(resp.content))
+        _notify(self.on_reply, resp.content)
 
     @staticmethod
     def _stopped(msgs: list[Message], turns: int, used: list[str]) -> AgentResult:
@@ -302,6 +351,10 @@ class Agent:
             # task just changed.
             if self._absorb(msgs):
                 return self._stopped(msgs, turn - 1, used)
+            # And if it changed, they get an answer before the work resumes --
+            # a line absorbed into the context is not a line the person has
+            # heard back about.
+            self._answer_the_operator(msgs)
 
             # After `_absorb`, so anything the operator just typed is part of
             # the list when the cut point is chosen — and therefore protected by
@@ -371,6 +424,13 @@ class Agent:
                 # A note typed while that tool ran lands here, before the model
                 # is asked again — a forge can take minutes, and waiting until
                 # the task ended would make the correction useless.
+                #
+                # No reply turn here: this is inside the loop over the calls the
+                # model just asked for, and an assistant message inserted before
+                # those calls have their results makes the next request
+                # malformed. `_absorb` accumulates the count instead, and the top
+                # of the next turn -- a boundary where the list holds whole
+                # groups -- is where the answer is asked for.
                 if self._absorb(msgs):
                     return self._stopped(msgs, turn, used)
 

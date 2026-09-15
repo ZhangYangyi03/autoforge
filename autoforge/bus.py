@@ -294,16 +294,30 @@ class Bus:
 
     def read(self, board: str, reader: str, *, advance: bool = True,
              only_mine: bool = False, everything: bool = False,
-             include_departed: bool = False) -> list[dict[str, Any]]:
+             include_departed: bool = False, include_dead: bool = False) -> list[dict[str, Any]]:
         """Entries this reader has not seen, oldest first.
 
         `--mine` filters what is *shown*, but the cursor still moves past
         everything: an entry addressed to someone else is not one this reader
         will ever want later, and skipping it here is how a filtered read
         becomes a permanent unread backlog.
+
+        What is shown is the *current* mail, not the whole log. An entry counts
+        as no longer current when its author is no longer running, judged off
+        the process table exactly as `live_agents` judges a registration -- the
+        operator's complaint was being told what a session they killed hours
+        ago had said, and `departed` cannot answer for a session that was
+        killed, because a killed session never writes a departure. Pass
+        `include_dead` (or `include_departed`, which means the same thing from
+        the reader's side: "show me what is no longer current") to read the
+        history instead.
         """
         lines = self.all_lines(board)
         departed = set(self.departed())
+        gone_sessions: set[str] = set()
+        gone_names: set[str] = set()
+        if not (include_dead or include_departed):
+            gone_sessions, gone_names = self.gone_authors()
         start = 0 if everything else min(self.cursor(board, reader), len(lines))
         out: list[dict[str, Any]] = []
         for raw in lines[start:]:
@@ -320,6 +334,17 @@ class Bus:
                 # for: "what did that dead session say" is a real question, and a
                 # silent drop would answer it wrongly.
                 continue
+            if gone_sessions or gone_names:
+                # Which *process* said it, by id when the entry carries one and
+                # by name otherwise -- entries written before sessions were
+                # stamped carry only the name, and on this host that was every
+                # entry on the board, which is why no id-based rule could ever
+                # retire one.
+                said_by_id = str(entry.get("session") or "")
+                said_by_name = str(entry.get("from") or entry.get("sender") or "")
+                if (said_by_id and said_by_id in gone_sessions) or \
+                        (said_by_name and said_by_name in gone_names):
+                    continue
             if only_mine and entry.get("to") not in ("*", reader):
                 continue
             out.append(entry)
@@ -414,6 +439,51 @@ class Bus:
                 out[name] = info
         return out
 
+    def gone_authors(self) -> tuple[set[str], set[str]]:
+        """(session ids, names) whose process is gone, read off the process table.
+
+        The failure this judges: a session that was killed never gets to write a
+        departure, so `departed` cannot speak for it and its words keep reading
+        as current mail -- measured on this host, three registrations whose pids
+        had been gone for hours and a board whose entries were all written
+        before sessions were stamped, so no id-based rule could retire one.
+
+        A name is only ever called gone when *every* registration answering to
+        it is gone. Several sessions are called "autoforge" here as a matter of
+        course, so a name-based verdict has to be the conservative one: retiring
+        a live peer's words would hide exactly the message the channel exists to
+        carry, and a rule that hides mail is worse than one that shows a fossil.
+        """
+        gone_sessions: set[str] = set()
+        gone_names: set[str] = set()
+        live_sessions: set[str] = set()
+        live_names: set[str] = set()
+        for key, info in self.agents().items():
+            session = str(info.get("session_id") or "")
+            name = str(info.get("name") or key)
+            if pid_alive(info.get("pid", 0)):
+                live_names.add(name)
+                if session:
+                    live_sessions.add(session)
+            else:
+                gone_names.add(name)
+                if session:
+                    gone_sessions.add(session)
+        return gone_sessions - live_sessions, gone_names - live_names
+
+    def live_session_for(self, name: str) -> str:
+        """The session id of the live registration answering to `name`, if any.
+
+        A wrapper shell sends on behalf of its agent and has no session id of
+        its own, so without this every `auto bus send` from a shell stamped a
+        brand-new throwaway id -- which made "clear my messages when I close"
+        unenforceable for exactly the entries a session writes through the CLI.
+        """
+        for info in self.live_agents().values():
+            if str(info.get("name") or "") == name:
+                return str(info.get("session_id") or "")
+        return ""
+
 
 # ---------------------------------------------------------------------------
 def render(entry: dict[str, Any]) -> str:
@@ -429,6 +499,15 @@ def render(entry: dict[str, Any]) -> str:
 
 
 
+def _addressed_to(entries: list[dict[str, Any]], name: str,
+                  session: str) -> list[dict[str, Any]]:
+    """Entries meant for this session or for everyone, and not written by it."""
+    return [e for e in entries
+            if e.get("to") in ("*", name, session)
+            and e.get("from") != name
+            and e.get("session") != session]
+
+
 def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
     """Register this session and report who else is live, in one call.
 
@@ -439,6 +518,15 @@ def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
     unprompted, and is recomputed from the process table rather than from a
     registration someone wrote before they died.
 
+    What is *reported* is only what a live peer needs from this session. A board
+    keeps every line anyone ever wrote and a killed session keeps its words on
+    it, so "unread" on its own is a pile of history -- the operator's complaint
+    was being told what a session they killed hours ago had said. So: asks and
+    claims from a live peer are counted as needing an answer, notes are reported
+    as notes, and the number of entries passed over because their author is gone
+    is stated rather than silently dropped. "Ignored" and "nothing there" are
+    different facts, and only the second one is safe to trust.
+
     Returns the line to show the operator: never raises, because a session that
     cannot reach the bus is still a usable session and must not fail to start.
     """
@@ -446,9 +534,11 @@ def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
         bus.register(name, session_id=session, note="started")
         others = {k: v for k, v in bus.live_agents().items()
                   if v.get("session_id") != session}
-        unread = [e for e in bus.read("autoforge", session, advance=False)
-                  if e.get("to") in ("*", name, session)
-                  and e.get("from") != name]
+        now = _addressed_to(bus.read("autoforge", session, advance=False),
+                            name, session)
+        whole_board = _addressed_to(
+            bus.read("autoforge", session, advance=False, include_dead=True,
+                     include_departed=True), name, session)
     except Exception as exc:                                   # noqa: BLE001
         return f"bus unavailable ({type(exc).__name__}: {exc}) -- continuing alone"
     parts = [f"registered as {name} ({session})"]
@@ -460,8 +550,16 @@ def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
         parts.append("declare your lane before editing a shared file")
     else:
         parts.append("no other live session on this bus")
-    if unread:
-        parts.append(f"{len(unread)} unread message(s) on board `autoforge`")
+    needs = [e for e in now if e.get("kind") in ("ask", "claim")]
+    if needs:
+        parts.append(f"{len(needs)} message(s) needing you on board `autoforge`")
+    notes = len(now) - len(needs)
+    if notes:
+        parts.append(f"{notes} note(s) from live peers")
+    stale = len(whole_board) - len(now)
+    if stale:
+        parts.append(f"{stale} stale entr{'y' if stale == 1 else 'ies'} from "
+                     f"sessions that are gone, ignored")
     return "; ".join(parts)
 
 
@@ -490,6 +588,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--to", default="*", help="a reader's name, or * for all")
     s.add_argument("--kind", default="msg", choices=KINDS)
     s.add_argument("--reply-to", default=None)
+    s.add_argument("--session", default="",
+                   help="the session id to stamp; defaults to "
+                        "$AUTOFORGE_SESSION_ID, else the live session "
+                        "registered under --as")
     s.add_argument("body", nargs="*", help="the message; omit to read stdin")
 
     rd = sub.add_parser("read", help="print what is unread, then advance")
@@ -501,7 +603,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="show only entries addressed to me")
     rd.add_argument("--json", action="store_true")
     rd.add_argument("--departed", action="store_true",
-                    help="also show what sessions that already left said")
+                    help="show what is no longer current: sessions that left, "
+                         "or whose process is gone")
+    rd.add_argument("--dead", action="store_true",
+                    help="the same, named for the case that catches people: "
+                         "words from a session that was killed")
 
     t = sub.add_parser("tail", help="the last N entries, cursor untouched")
     t.add_argument("--board", default="default")
@@ -535,8 +641,16 @@ def cmd_bus(argv: list[str] | None = None) -> int:
         if not body:
             print("nothing sent: the message was empty", file=sys.stderr)
             return 2
+        # Stamp a session the sender can actually retire. A shell that sends on
+        # behalf of a live session has no id of its own, and the fallback
+        # (`own_session_id`) mints a fresh one per invocation -- so those
+        # entries could never be cleared by their session when it closed, which
+        # is the one thing the operator asked this channel to do.
+        session = (args.session or os.environ.get("AUTOFORGE_SESSION_ID", "")
+                   or bus.live_session_for(args.who))
         e = bus.send(sender=args.who, board=args.board, body=body,
-                     to=args.to, kind=args.kind, reply_to=args.reply_to)
+                     to=args.to, kind=args.kind, reply_to=args.reply_to,
+                     session=session or None)
         print(f"sent {e['id']} to {args.board} "
               f"(to={e['to']}, kind={e['kind']})")
         return 0
@@ -544,7 +658,8 @@ def cmd_bus(argv: list[str] | None = None) -> int:
     if args.cmd == "read":
         entries = bus.read(args.board, args.who, advance=not args.peek,
                            only_mine=args.mine, everything=args.all,
-                           include_departed=args.departed)
+                           include_departed=args.departed,
+                           include_dead=args.dead)
         if not entries:
             print(f"(nothing unread on {args.board} for {args.who})")
             return 0

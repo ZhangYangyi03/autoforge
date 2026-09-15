@@ -18,9 +18,10 @@ import time
 
 from autoforge.cli import _LiveRun
 from autoforge.core.agent import Agent
-from autoforge.core.llm import LLMAborted, LLMResponse, MockLLMClient
+from autoforge.core.llm import LLMAborted, LLMResponse, MockLLMClient, tool_call
 from autoforge.core.steering import Steering
 from autoforge.tools.registry import ToolRegistry
+from autoforge.tools.spec import ToolSpec
 
 #: Long enough that the old boundary-only behaviour could not possibly pass,
 #: short enough to keep the suite quick.
@@ -64,7 +65,13 @@ def test_a_running_call_yields_to_the_operator_and_reasks_informed():
 
     spoke = time.monotonic()
     steer.submit("actually, do it the other way round")
-    worker.join(timeout=STALL + 10.0)
+    # Two stalls, not one: the line buys a reply turn of its own before the
+    # work resumes (see
+    # `test_a_line_typed_mid_run_buys_a_reply_not_just_a_slot_in_the_context`).
+    # That reply is a request the operator's line costs, and it is the whole
+    # reason they speak -- "it hears me and says nothing" is the complaint this
+    # pair of tests exists to answer.
+    worker.join(timeout=STALL * 2 + 10.0)
 
     assert not worker.is_alive(), "the run never came back for the correction"
     # It was heard, and said so, immediately.
@@ -73,8 +80,51 @@ def test_a_running_call_yields_to_the_operator_and_reasks_informed():
     assert aborted and (aborted[0] - spoke) < DEADLINE
     # And the correction is what the next question carries -- otherwise the
     # interruption bought a retry of the same uninformed question.
-    assert len(sent) > 1 and (sent[1] - spoke) < DEADLINE
-    assert "the other way round" in prompts[1]
+    assert len(sent) > 2 and (sent[1] - spoke) < DEADLINE
+    assert "the other way round" in prompts[2]
+
+
+def test_a_line_typed_mid_run_buys_a_reply_not_just_a_slot_in_the_context():
+    """The operator's complaint in full: it says "heard", then works for
+    fifteen more minutes without answering.
+
+    A line folded into the list is invisible to the person who typed it -- the
+    model is free to fold a question into its next tool call and say nothing,
+    which is exactly what the ledger shows: the line was absorbed at 00:00:27
+    and the run made 60 more tool calls without a word. So a line that arrives
+    mid-run also buys one question asked with the tool list empty, where
+    answering is the only thing that can happen.
+    """
+    seen: list[list[str]] = []
+
+    def handler(messages, tools, **kw):
+        seen.append([t["function"]["name"] for t in (tools or [])])
+        if not tools:
+            return LLMResponse(content="checking the bus; two minutes left")
+        return LLMResponse(tool_calls=[tool_call("poke", {})])
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="poke", description="Do one small piece of the work.",
+        parameters={"type": "object", "properties": {}},
+        fn=lambda **kw: "poked"))
+    registry.promote("poke")                  # draft tools are not exposed
+    replies: list[str] = []
+    steer = Steering(printer=lambda t: None)
+    agent = Agent(MockLLMClient(handler=handler), registry, steer=steer,
+                  max_turns=6, allow_self_terminate=False,
+                  on_reply=replies.append)
+
+    steer.submit("what are you doing?")
+    result = agent.run("poke the bus until it answers")
+
+    # A turn was asked with no tools at all: that is the reply.
+    assert [] in seen, f"no tool-free turn was ever asked: {seen}"
+    assert replies == ["checking the bus; two minutes left"]
+    # ...and it is part of the conversation, so the work that resumes knows
+    # what the operator was already told.
+    assert any(m.role == "assistant" and "checking the bus" in (m.content or "")
+               for m in result.messages)
 
 
 def test_a_stop_also_reaches_inside_a_running_call():

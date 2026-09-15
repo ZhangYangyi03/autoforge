@@ -511,3 +511,23 @@ class TestModesCarrySteering:
         assert result.stopped_by_operator is True
         finish = [e for e in agent.trace if e["kind"] == "finish"]
         assert finish and finish[-1]["stopped_by_operator"] is True
+
+
+# -- the operator's line has to buy an answer --------------------------------
+def test_a_question_from_the_operator_is_told_to_be_answered():
+    """The failure this exists for: the operator types "what are you doing?",
+    the channel says "heard", and the run carries on for fifteen minutes
+    without a word.
+
+    The wrapper said to treat the line as a correction and act on it *within
+    the run* -- which a question is not, so nothing in the instruction made
+    answering it the next thing to do. Measured on this host: 46 steered lines,
+    and the one asking what it was doing was followed by 60 more tool calls.
+    """
+    msg = operator_message("what are you doing?")
+
+    assert msg.startswith(OPERATOR_PREFIX)
+    assert "answer" in msg.lower()
+    # ...and the line is still a correction rather than a fresh task, which is
+    # the other half of what the wrapper is for.
+    assert "not as a new task" in msg

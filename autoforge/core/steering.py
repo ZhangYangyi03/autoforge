@@ -39,9 +39,20 @@ __all__ = ["Steering", "OPERATOR_PREFIX"]
 OPERATOR_PREFIX = "[the person running you said this mid-run]"
 
 #: ...and how to act on it. Terse, because the loop is the wrong place for an
-#: essay, but specific enough that the model does not restart the task.
-OPERATOR_SUFFIX = ("Treat this as a correction to the task in progress, not as a "
-                   "new task: act on it within this run.")
+#: essay, but specific enough that the model does not restart the task -- and
+#: specific that answering comes *first*.
+#:
+#: The answer is the half that was missing. Measured on this host: 46 steered
+#: lines, and the one that asked "what are you doing?" was absorbed and then
+#: followed by sixty more tool calls without a word. The wrapper only said to
+#: act on the line within the run, and a question is not something you act on --
+#: so the instruction left replying as optional, and the run took the option.
+#: The harness saying "heard" is not the agent answering, and from the chair at
+#: the terminal those two are only distinguishable by whether words come back.
+OPERATOR_SUFFIX = ("They are watching this run and waiting to hear from you: "
+                   "answer them in one short line as the very next thing you do, "
+                   "then treat this as a correction to the task in progress, not "
+                   "as a new task -- act on it within this run.")
 
 
 def operator_message(text: str) -> str:

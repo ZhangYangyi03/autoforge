@@ -3639,6 +3639,13 @@ class ForgeAgent:
                 "result", {"tool": n, "ok": getattr(r, "ok", None)}),
             on_turn=lambda turn, msg: _emit("turn", turn=turn),
             on_steer=lambda text: self._record("steer", {"text": text[:300]}),
+            # The answer to the operator, printed and recorded. It goes through
+            # `emit` rather than only the ledger: a reply the person at the
+            # terminal cannot see is the same as no reply, which is what "it
+            # hears me and then says nothing" actually was.
+            on_reply=lambda text: (
+                self._record("reply", {"chars": len(text)}),
+                _emit("say", text=text)),
             steer=self.steer,
             compactor=self.compactor,
             on_compact=self._on_compact,
