@@ -51,12 +51,93 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import time as _time
 
 #: The kinds a message may claim to be. A closed set, so a reader can filter on
 #: it: an `ask` wants an `answer`, and a `claim` on a file is what stops two
 #: sessions editing it. `msg` is the untyped default and stays the common case.
 KINDS = ("msg", "ask", "answer", "claim", "done", "note")
 
+
+#: Presence must be CHECKED, never remembered. `last_seen` is a fossil: it says
+#: when someone last wrote, and a session that wrote an hour ago and has since
+#: died looks exactly like one that is merely quiet. Only the process table
+#: tells those two apart -- reading a board is not enough to know whether
+#: anyone is still there to answer.
+def pid_alive(pid) -> bool:
+    "Is `pid` a live process right now? False for 0, junk and gone."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True              # exists, owned by someone else
+        except OSError:
+            return False
+        return True
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == 259                 # STILL_ACTIVE
+    finally:
+        k.CloseHandle(h)
+
+
+def own_session_id() -> str:
+    "A per-process identity, so two sessions sharing a name stay two people."
+    env = os.environ.get("AUTOFORGE_SESSION_ID")
+    if env:
+        return env
+    return "auto-%d-%d" % (os.getpid(), int(_time.time()))
+
+
+def _ppid_of(pid) -> int:
+    "Parent pid, or 0. A wrapper shell registers on behalf of its agent."
+    if os.name != "nt":
+        try:
+            with open("/proc/%d/stat" % int(pid), encoding="utf-8") as fh:
+                return int(fh.read().rsplit(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return 0
+    import ctypes
+    from ctypes import wintypes
+    class _PE32(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260)]
+    k = ctypes.windll.kernel32
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)
+    if not snap:
+        return 0
+    try:
+        e = _PE32()
+        e.dwSize = ctypes.sizeof(_PE32)
+        if not k.Process32First(snap, ctypes.byref(e)):
+            return 0
+        while True:
+            if e.th32ProcessID == int(pid):
+                return int(e.th32ParentProcessID)
+            if not k.Process32Next(snap, ctypes.byref(e)):
+                return 0
+    finally:
+        k.CloseHandle(snap)
 
 def _base_dir() -> str:
     """The per-user data root, however this platform spells it."""
@@ -125,7 +206,8 @@ class Bus:
 
     # -- writing ---------------------------------------------------------
     def send(self, *, sender: str, board: str, body: str, to: str = "*",
-             kind: str = "msg", reply_to: str | None = None) -> dict[str, Any]:
+             kind: str = "msg", reply_to: str | None = None,
+             session: str | None = None) -> dict[str, Any]:
         """Append one entry and return it.
 
         One `write` call, then flush: a line is far under the size at which an
@@ -143,11 +225,56 @@ class Bus:
             "kind": kind,
             "body": body,
             "reply_to": reply_to,
+            # Which *process* said it, not which name. Everyone registers as
+            # the same name, so a name cannot be retired and a session cannot
+            # be told apart from its own predecessor without this.
+            "session": session or own_session_id(),
         }
         with open(self.board_path(board), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             fh.flush()
         return entry
+
+    def departed_file(self) -> Path:
+        return self.root / "departed.json"
+
+    def departed(self) -> list[str]:
+        """Session ids that have explicitly left. Their entries read as gone."""
+        try:
+            data = json.loads(self.departed_file().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [str(x) for x in data] if isinstance(data, list) else []
+
+    def depart(self, session: str, *, name: str | None = None) -> dict[str, Any]:
+        """Withdraw a session: drop its registration and bury its entries.
+
+        The board is append-only, so a departure cannot delete a line -- and it
+        should not, because the log is also the record of what happened. What a
+        departure *can* do is make those entries stop counting as current: the
+        session id joins the departed set, and every later read skips what carries
+        it. That is the honest form of "clear my messages" in a channel made of a
+        file nobody may rewrite.
+        """
+        gone = self.departed()
+        if session and session not in gone:
+            gone.append(session)
+        self.departed_file().write_text(
+            json.dumps(gone, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Remove exactly this session, never "everyone who shares my name".
+        # Names are not identities here: two live sessions are both called
+        # "autoforge", so a name-based removal lets whichever one leaves first
+        # unregister the one still working -- the fossil bug wearing a smile.
+        removed: dict[str, Any] = {}
+        reg = self.agents()
+        for key, info in list(reg.items()):
+            if session and info.get("session_id") == session:
+                removed[key] = reg.pop(key)
+            elif not session and name is not None and key == name:
+                removed[key] = reg.pop(key)
+        self.agents_file().write_text(
+            json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"session": session, "unregistered": sorted(removed)}
 
     # -- reading ---------------------------------------------------------
     def all_lines(self, board: str) -> list[str]:
@@ -166,8 +293,8 @@ class Bus:
             return 0
 
     def read(self, board: str, reader: str, *, advance: bool = True,
-             only_mine: bool = False, everything: bool = False
-             ) -> list[dict[str, Any]]:
+             only_mine: bool = False, everything: bool = False,
+             include_departed: bool = False) -> list[dict[str, Any]]:
         """Entries this reader has not seen, oldest first.
 
         `--mine` filters what is *shown*, but the cursor still moves past
@@ -176,6 +303,7 @@ class Bus:
         becomes a permanent unread backlog.
         """
         lines = self.all_lines(board)
+        departed = set(self.departed())
         start = 0 if everything else min(self.cursor(board, reader), len(lines))
         out: list[dict[str, Any]] = []
         for raw in lines[start:]:
@@ -186,6 +314,11 @@ class Bus:
                 # channel that drops what it cannot parse loses exactly the
                 # message that needed explaining.
                 out.append({"broken": raw})
+                continue
+            if not include_departed and entry.get("session") in departed:
+                # A departed session’s words are not current. Shown only when asked
+                # for: "what did that dead session say" is a real question, and a
+                # silent drop would answer it wrongly.
                 continue
             if only_mine and entry.get("to") not in ("*", reader):
                 continue
@@ -220,20 +353,66 @@ class Bus:
         return self.root / "agents.json"
 
     def register(self, name: str, *, session_id: str = "", cwd: str = "",
-                 note: str = "") -> dict[str, Any]:
-        """Record that `name` is alive, keeping anything learned earlier."""
+                 note: str = "", pid: int | None = None) -> dict[str, Any]:
+        """Record that a session is alive, keyed by SESSION, not by name.
+
+        Everyone on this machine registers as the same name ("autoforge"), so a
+        name-keyed registry holds exactly one autoforge no matter how many are
+        running: the second writer silently overwrites the first. That is how a
+        live peer reads as absent -- the one question the registry exists to
+        answer. The key is therefore the session id; the name is kept inside the
+        record as a human label, which is all it ever was.
+
+        A call without a session id falls back to the name as the key, so the
+        single-session case still reads like a roster.
+
+        The pid recorded is THIS process. Registration is meant to be called by
+        the session itself (cli.py calls it at startup); a wrapper registering on
+        behalf of someone else passes `pid` explicitly. Guessing the parent here
+        would record the short-lived shell that ran the command, which is the
+        fossil bug this whole section exists to fix.
+        """
         reg = self.agents()
-        prev = reg.get(name, {})
-        reg[name] = {
+        # The key is the session id whenever one was given -- never the name.
+        # Sharing a name across as many rows as there are sessions is the whole
+        # point: matching by name here would fold two live sessions onto one row
+        # and the second would erase the first, which is the fossil bug again.
+        if session_id:
+            key = session_id
+        else:
+            # No id, so the name is all we have. Reuse a row only if it is
+            # unambiguous: two same-named rows means we cannot tell which one
+            # this call belongs to, and guessing would erase a live session.
+            same = [k for k, v in reg.items()
+                    if v.get("name") == name or k == name]
+            key = same[0] if len(same) == 1 else name
+        prev = reg.get(key) or {}
+        who_pid = int(pid) if pid is not None else os.getpid()
+        reg[key] = {
+            "name": name,
             "session_id": session_id or prev.get("session_id", ""),
-            "pid": os.getpid(),
+            "pid": who_pid,
             "cwd": cwd or prev.get("cwd") or os.getcwd(),
             "note": note or prev.get("note", ""),
             "last_seen": _stamp(),
         }
         self.agents_file().write_text(
             json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
-        return reg[name]
+        return reg[key]
+
+    def live_agents(self) -> dict[str, Any]:
+        """Registered sessions whose process is still running, checked now.
+
+        `agents()` answers "who ever registered"; this answers "who is there",
+        and they are different questions with different costs -- a fossil that
+        reads as a peer is worse than no peer at all, because it invites a
+        session to wait for an answer that cannot come.
+        """
+        out: dict[str, Any] = {}
+        for name, info in self.agents().items():
+            if pid_alive(info.get("pid", 0)):
+                out[name] = info
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +425,44 @@ def render(entry: dict[str, Any]) -> str:
             f"{entry.get('from', '?')} -> {to if to != '*' else 'all'} "
             f"({entry.get('kind', 'msg')})\n"
             f"      {entry.get('body', '')}")
+
+
+
+
+def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
+    """Register this session and report who else is live, in one call.
+
+    This is the piece that makes the bus proactive instead of remembered. A
+    session that only reads the board when it happens to think of it will
+    coordinate exactly as often as it remembers to -- which, measured, is never.
+    Running this at startup means the answer to "is anyone else here" arrives
+    unprompted, and is recomputed from the process table rather than from a
+    registration someone wrote before they died.
+
+    Returns the line to show the operator: never raises, because a session that
+    cannot reach the bus is still a usable session and must not fail to start.
+    """
+    try:
+        bus.register(name, session_id=session, note="started")
+        others = {k: v for k, v in bus.live_agents().items()
+                  if v.get("session_id") != session}
+        unread = [e for e in bus.read("autoforge", session, advance=False)
+                  if e.get("to") in ("*", name, session)
+                  and e.get("from") != name]
+    except Exception as exc:                                   # noqa: BLE001
+        return f"bus unavailable ({type(exc).__name__}: {exc}) -- continuing alone"
+    parts = [f"registered as {name} ({session})"]
+    if others:
+        who = ", ".join(
+            f"{v.get('name') or k}({v.get('session_id') or k})"
+            for k, v in others.items())
+        parts.append(f"{len(others)} other live session(s): {who}")
+        parts.append("declare your lane before editing a shared file")
+    else:
+        parts.append("no other live session on this bus")
+    if unread:
+        parts.append(f"{len(unread)} unread message(s) on board `autoforge`")
+    return "; ".join(parts)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -263,6 +480,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cwd", default="")
     r.add_argument("--note", default="", help="what this session is holding")
 
+    dp = sub.add_parser("depart", help="say that this session is leaving")
+    dp.add_argument("--as", dest="who", default="")
+    dp.add_argument("--session", default="", help="the session id to retire")
+
     s = sub.add_parser("send", help="append a message")
     s.add_argument("--as", dest="who", required=True)
     s.add_argument("--board", default="default")
@@ -279,14 +500,22 @@ def build_parser() -> argparse.ArgumentParser:
     rd.add_argument("--mine", action="store_true",
                     help="show only entries addressed to me")
     rd.add_argument("--json", action="store_true")
+    rd.add_argument("--departed", action="store_true",
+                    help="also show what sessions that already left said")
 
     t = sub.add_parser("tail", help="the last N entries, cursor untouched")
     t.add_argument("--board", default="default")
     t.add_argument("-n", type=int, default=20)
     t.add_argument("--json", action="store_true")
 
+    st = sub.add_parser("startup", help="register and report who else is live")
+    st.add_argument("--as", dest="who", default="autoforge")
+    st.add_argument("--session", default="")
+
     sub.add_parser("boards", help="list boards and their depth")
-    sub.add_parser("who", help="list registered sessions")
+    wh = sub.add_parser("who", help="list sessions that are still running")
+    wh.add_argument("--all", action="store_true",
+                    help="include registrations whose process is gone")
     return p
 
 
@@ -314,7 +543,8 @@ def cmd_bus(argv: list[str] | None = None) -> int:
 
     if args.cmd == "read":
         entries = bus.read(args.board, args.who, advance=not args.peek,
-                           only_mine=args.mine, everything=args.all)
+                           only_mine=args.mine, everything=args.all,
+                           include_departed=args.departed)
         if not entries:
             print(f"(nothing unread on {args.board} for {args.who})")
             return 0
@@ -339,14 +569,31 @@ def cmd_bus(argv: list[str] | None = None) -> int:
             print(f"  (no boards yet under {bus.root})")
         return 0
 
+    if args.cmd == "depart":
+        session = args.session or os.environ.get("AUTOFORGE_SESSION_ID", "")
+        if not session and args.who:
+            session = str(bus.agents().get(args.who, {}).get("session_id", ""))
+        info = bus.depart(session, name=args.who or None)
+        who = info["session"] or "(no session id)"
+        print(f"departed {who} unregistered={info['unregistered'] or []}")
+        return 0
+
+    if args.cmd == "startup":
+        session = args.session or own_session_id()
+        line = startup_check(bus, session, name=args.who)
+        print(line)
+        return 0
+
     if args.cmd == "who":
-        reg = bus.agents()
-        for name, info in reg.items():
+        reg = bus.live_agents() if not args.all else bus.agents()
+        for key, info in reg.items():
+            name = info.get("name") or key
             print(f"  {name}  pid={info.get('pid', '?')}  "
                   f"{info.get('session_id') or '-'}  {info.get('note') or ''}"
                   f"  {info.get('last_seen', '')}")
         if not reg:
-            print(f"  (nobody registered under {bus.root})")
+            hint = " (--all shows registrations whose process is gone)" if not args.all else ""
+            print(f"  (no session is running under {bus.root}){hint}")
         return 0
 
     return 2

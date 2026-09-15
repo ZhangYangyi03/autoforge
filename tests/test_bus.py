@@ -138,14 +138,16 @@ def test_tail_does_not_touch_the_cursor(bus):
 
 # -- presence ----------------------------------------------------------------
 def test_register_keeps_what_was_learned_before(bus):
+    """A follow-up call without a session id lands on the same row.
+
+    Keyed by session id, since several sessions share the name "autoforge"; the
+    name is the label inside the record, so it is what a second call matches on
+    when it has no id to give.
+    """
     bus.register("peer", session_id="s1", note="holding skills.py")
     bus.register("peer", cwd="/repo")
 
-    info = bus.agents()["peer"]
-
-    assert info["session_id"] == "s1"
-    assert info["note"] == "holding skills.py"
-    assert info["cwd"] == "/repo"
+    info = bus.agents()["s1"]
 
 
 def test_who_is_empty_before_anyone_registers(bus):
@@ -217,3 +219,83 @@ def test_an_existing_mount_beats_a_fresh_home(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "platform"))
 
     assert bus_mod.default_bus_dir() == mount
+
+
+# -- presence: a fossil is not a peer ----------------------------------------
+def test_a_dead_pid_is_not_alive():
+    """The failure this exists for: a registration that outlives its process.
+
+    A session that wrote an hour ago and died since looks exactly like one that
+    is merely quiet, so liveness must be read off the process table, not off
+    `last_seen`.
+    """
+    from autoforge.bus import pid_alive
+
+    assert pid_alive(0) is False
+    assert pid_alive(-1) is False
+    assert pid_alive("not a pid") is False
+    assert pid_alive(99999999) is False
+
+
+def test_the_running_process_is_alive():
+    import os
+    from autoforge.bus import pid_alive
+
+    assert pid_alive(os.getpid()) is True
+
+
+def test_live_agents_drops_a_registration_whose_process_is_gone(bus):
+    bus.register("ghost", session_id="s-ghost", pid=99999999)
+    bus.register("me", session_id="s-me")
+    # Keyed by session, a name-keyed lookup no longer applies; assert on values.
+
+    live = bus.live_agents()
+
+    ids = {v["session_id"] for v in live.values()}
+    assert "s-ghost" not in ids
+    assert "s-me" in ids          # registered with this process’s own pid
+
+
+def test_send_stamps_the_session_so_a_name_is_not_the_identity(bus):
+    bus.send(sender="autoforge", board="work", body="one", session="s-1")
+
+    assert bus.tail("work", 1)[0]["session"] == "s-1"
+
+
+def test_departing_hides_that_sessions_entries(bus):
+    """What a session can honestly do about its own words in an append-only log."""
+    bus.send(sender="a", board="work", body="from the dead", session="s-gone")
+    bus.send(sender="a", board="work", body="still here", session="s-here")
+
+    bus.depart("s-gone")
+    got = [e["body"] for e in bus.read("work", "reader")]
+
+    assert got == ["still here"]
+    # And the log still holds it, for the question "what did it say".
+    assert [e["body"] for e in bus.read("work", "reader", everything=True,
+                                        include_departed=True)] == [
+        "from the dead", "still here"]
+
+
+def test_departing_unregisters_the_session(bus):
+    bus.register("me", session_id="s-me")
+
+    info = bus.depart("s-me")
+
+    assert info["unregistered"] == ["s-me"]
+    assert "s-me" not in bus.agents()
+
+
+def test_who_hides_a_registration_whose_process_is_gone(tmp_path, capsys):
+    d = str(tmp_path / "bus")
+    b = bus_mod.Bus(d)
+    b.register("ghost", session_id="s-ghost", pid=99999999)
+
+    assert bus_mod.cmd_bus(["--dir", d, "who"]) == 0
+    out = capsys.readouterr().out
+    assert "ghost" not in out
+    assert "--all" in out            # the hint, so the fossil is not simply lost
+
+    assert bus_mod.cmd_bus(["--dir", d, "who", "--all"]) == 0
+    assert "ghost" in capsys.readouterr().out
+

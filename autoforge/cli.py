@@ -793,6 +793,18 @@ def cmd_chat(args: argparse.Namespace) -> int:
     _describe(cfg, agent)
     print(BANNER)
     print(LIVE_HINT)
+    # Register with the bus and report who else is live, before the first run.
+    # Doing it here rather than on request is the whole point: a session that
+    # reads the board only when it remembers to coordinates exactly as often as
+    # it remembers, and the failure that costs is two sessions editing one file.
+    try:
+        from autoforge.bus import Bus, own_session_id, startup_check
+        _bus = Bus()
+        _session = own_session_id()
+        print(_c(_D, "  bus: " + startup_check(_bus, _session)))
+    except Exception as _exc:                                   # noqa: BLE001
+        _bus, _session = None, ""
+        print(_c(_D, f"  bus: unavailable ({type(_exc).__name__}) — continuing alone"))
 
     # One reader owns stdin for the whole session. During a run its lines are
     # steering; between runs they are the next prompt. That is what makes
@@ -873,6 +885,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
             history = result.messages
     finally:
         steering.close()
+
+    if _bus is not None:
+        try:
+            _bus.depart(_session, name="autoforge")
+        except Exception:                                       # noqa: BLE001
+            pass
 
     print(_c(_D, f"bye — {len(agent.registry.names())} tool(s) this session"))
     return 0
