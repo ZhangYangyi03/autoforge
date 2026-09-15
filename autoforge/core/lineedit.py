@@ -29,6 +29,15 @@ is written to `pastes/` and replaced by a `[Pasted text #N: L lines -> path]`
 placeholder, the way the Hermes CLI does it. `expand_paste_refs` puts the text
 back before the agent sees it.
 
+A break is the other tell. A terminal that is not sending bracketed-paste
+markers hands a slow paste over a line at a time, and every one of those lines
+ends in exactly one break — which is what Enter looks like too. Per line the
+two are the same shape, so the shape cannot decide it; what can is whether the
+next line's bytes are already on their way. A break that has input behind it
+is a break inside a block, and `SUBMIT_GRACE` is how long it waits to find
+out. Without this, one pasted table arrived as N steering messages and N
+interruptions.
+
 Not every terminal can be driven this way — a pipe, a dumb `TERM`, a `stdin`
 whose `fileno()` is not a tty. `available` is False there, and `Steering` falls
 back to the cooked-mode reader it used before. The fallback is the old
@@ -58,6 +67,7 @@ __all__ = [
     "paste_dir",
     "PASTE_CHARS",
     "PASTE_LINES",
+    "SUBMIT_GRACE",
 ]
 
 #: A paste of at least this many lines, or this many characters, is collapsed
@@ -65,6 +75,13 @@ __all__ = [
 #: easier to read in the input line than as a pointer to a temp file.
 PASTE_LINES = 5
 PASTE_CHARS = 2000
+
+#: How long a break waits to find out whether it is Enter or a break inside a
+#: block that is still arriving. Enter is the common case and this is paid on
+#: every one of them, so it is kept well under the ~200ms at which a pause
+#: starts to read as lag — and it only has to cover the gap between two lines
+#: of the same paste, which is a fraction of that.
+SUBMIT_GRACE = 0.15
 
 #: `[Pasted text #1: 9 lines -> /path]`. The arrow is a real U+2192.
 PASTE_REF_RE = re.compile(r"\[Pasted text #(\d+): (\d+) lines \u2192 (.+?)\]")
@@ -401,13 +418,15 @@ class LineEditor:
     def __init__(self, stream=None, out=None, term=None, *,
                  paste_lines: int = PASTE_LINES,
                  paste_chars: int = PASTE_CHARS,
-                 paste_to: Path | str | None = None) -> None:
+                 paste_to: Path | str | None = None,
+                 submit_grace: float = SUBMIT_GRACE) -> None:
         self.stream = stream if stream is not None else sys.stdin
         self.out = out if out is not None else sys.stdout
         self._term = term if term is not None else _RawTerminal(self.stream, self.out)
         self._paste_lines = paste_lines
         self._paste_chars = paste_chars
         self._paste_to = paste_to
+        self._submit_grace = max(0.0, float(submit_grace))
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._lock = threading.RLock()
         self._prompt = ""
@@ -558,11 +577,19 @@ class LineEditor:
                 ch = text[i]
                 i += 1
                 if ch in ("\r", "\n"):
-                    line = "".join(self._buf)
-                    self._buf, self._cursor = [], 0
-                    self._erase()
-                    self._raw("\n")
-                    return line
+                    if self._more_coming():
+                        # A break with the next line already on its way is a
+                        # break inside a block, not an Enter: the person at
+                        # the keyboard cannot have sent bytes that are still
+                        # in flight. Keep the break and keep reading; the
+                        # Enter is the break that nothing follows.
+                        self._buf.insert(self._cursor, "\n")
+                        self._cursor += 1
+                        # CRLF is one break, not two.
+                        if i < len(text) and text[i] == ("\n" if ch == "\r" else "\r"):
+                            i += 1
+                        continue
+                    return self._submit()
                 if ch in _BACKSPACE:
                     if self._cursor:
                         del self._buf[self._cursor - 1]
@@ -596,6 +623,34 @@ class LineEditor:
             self._erase()
             self._draw()
             return None
+
+    def _more_coming(self) -> bool:
+        """Is more of the same input already on its way to us?
+
+        Asked of the terminal rather than of a clock: a burst that has already
+        been sent is a fact, and it is the only thing that can tell a break
+        inside a block from an Enter. A terminal that cannot answer — a pipe,
+        a dumb one — answers no, and the editor behaves as it did before.
+        """
+        if self._submit_grace <= 0:
+            return False
+        try:
+            return bool(self._term.ready(self._submit_grace))
+        except Exception:                 # noqa: BLE001 - a terminal that cannot say
+            return False
+
+    def _submit(self) -> str:
+        """Hand the assembled line back and leave the input line empty.
+
+        A block that was gathered this way is a paste, so it leaves the same
+        way any other paste does: collapsed to a file if it is big enough to
+        make the input line unusable, verbatim if it is not.
+        """
+        line = "".join(self._buf)
+        self._buf, self._cursor = [], 0
+        self._erase()
+        self._raw("\n")
+        return self._as_paste(line)
 
     def _apply_key(self, name: str) -> None:
         if name == "left":

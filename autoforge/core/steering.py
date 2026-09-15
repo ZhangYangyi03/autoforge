@@ -26,6 +26,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from typing import Any, Callable, Iterable
 
 from .lineedit import LineEditor, expand_paste_refs
@@ -53,6 +54,15 @@ STATUS_WORDS = ("/status", "/progress", "/where", "?")
 
 #: `/stop` — end the run at the next safe point.
 STOP_WORDS = ("/stop", "/halt", "/abort")
+
+#: Lines closer together than this are one burst, not several messages. A
+#: burst is what a paste looks like when the terminal is too slow to hand the
+#: block over in one read: the fragments arrive as separate submits, and each
+#: one on its own is indistinguishable from a deliberate sentence. Nobody
+#: types two intended messages inside a second, so the window only ever fires
+#: on a burst — and the editor already folds the common case before it gets
+#: here, which is why this is the safety net rather than the mechanism.
+BURST_WINDOW = 1.0
 
 
 class Steering:
@@ -103,6 +113,13 @@ class Steering:
         self._thread: threading.Thread | None = None
         self.delivered = 0
         self.refused: list[str] = []
+        # The burst guard's memory: the last line taken in, and when. Read and
+        # written under `_burst_lock`; `_pending`'s own mutex is taken inside
+        # that to rewrite the queued line, so the loop can never be served a
+        # half-merged message.
+        self._burst_lock = threading.Lock()
+        self._tail: str | None = None
+        self._last_at = 0.0
 
     # -- lifecycle ------------------------------------------------------
     @property
@@ -231,7 +248,14 @@ class Steering:
                   f"Start the line with a space to send it as text.")
 
     def _queue(self, text: str) -> None:
+        if self._fold_into_pending(text):
+            # Part of a burst whose receipt has already been given. Saying
+            # "heard" again would turn one paste into a column of receipts,
+            # which is the noise this is here to remove.
+            return
         self._pending.put(text)
+        with self._burst_lock:
+            self._tail, self._last_at = text, time.monotonic()
         # "At the next step" was the truth when the step boundary was the only
         # way in, and it read as a brush-off: the next step was minutes away, so
         # the honest-sounding line was the one the operator heard as being
@@ -251,6 +275,45 @@ class Steering:
         else:
             self._say("✓ heard — nothing is running right now, so this goes in "
                       f"with your next request: {text[:60]}")
+
+    def _fold_into_pending(self, text: str) -> bool:
+        """Fold a fragment of a burst into the line already waiting.
+
+        True when `text` was folded, and then it is *not* queued again: the
+        queued line now carries it.
+
+        Only while a run is live, and only into a line the loop has not taken
+        yet. Both conditions are about the same thing — the operator's burst
+        is one thing to say, and rewriting history after the agent has read
+        half of it is not this class's job. Once the loop has taken the line,
+        this returns False and the fragment becomes its own supplement, which
+        is the honest outcome: it did arrive too late to be one message.
+        """
+        with self._burst_lock:
+            now = time.monotonic()
+            tail = self._tail
+            fresh = tail is not None and now - self._last_at <= BURST_WINDOW
+            # Measured from this line either way: a fragment that turns out
+            # not to fold is still what the next fragment is a burst with.
+            self._last_at = now
+        if not fresh or not self.running:
+            return False
+        # The queue's own mutex, not ours: taking it is what makes the rewrite
+        # atomic against `take_supplements`. Without it the loop could be
+        # handed the line in the instant between reading and replacing it.
+        with self._pending.mutex:
+            queue = self._pending.queue
+            # The line it was a burst with has to still be *there*. If the
+            # loop has taken it, this fragment arrived too late to be part of
+            # the same message, and saying so by sending it separately is
+            # better than rewriting what the agent has already read.
+            if not queue or queue[-1] != tail:
+                return False
+            merged = tail + "\n" + text
+            queue[-1] = merged
+        with self._burst_lock:
+            self._tail = merged
+        return True
 
     def _say(self, text: str) -> None:
         try:
