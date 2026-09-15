@@ -867,6 +867,66 @@ class ForgeAgent:
         except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
+    def _prelookup_market(self, need: str) -> str:
+        """Ask the shelf *before* the forge instead of only after it.
+
+        `_sync_to_market` below has always checked for an existing entry -- but
+        that check happens after the tool has already been built. The forge
+        itself never looked. On 2026-09-15 that showed up as a rule with zero
+        executions: 158 forges, not one pre-forge lookup, and a shelf that was
+        almost entirely this agent's own echo. The fix is not one more
+        principle -- the principle was already in the prompt and changed
+        nothing -- it is a lookup on the path the forge actually takes.
+
+        Best-effort by construction. An unreachable market returns "", and
+        an empty string means *no answer*, never *nothing there*: only a
+        lookup that came back and matched nothing licenses a forge.
+        """
+        url = None
+        try:
+            import json as _json
+            import os as _os
+            import urllib.request as _url
+            url = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
+            req = _url.Request(url.rstrip("/") + "/resources")
+            with _url.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            data = _json.loads(body)
+        except Exception as exc:                          # noqa: BLE001
+            self._record("market_prelookup", {"need": need, "ok": False,
+                                              "error": "%s: %s" % (type(exc).__name__, exc)})
+            return ""
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("items") or data.get("resources") or []
+        else:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        words = {w for w in need.lower().replace("_", " ").split() if len(w) > 3}
+        hits = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("id") or "")
+            desc = str(item.get("description") or "")
+            hay = (name + " " + desc).lower().replace("_", " ")
+            overlap = sum(1 for w in words if w in hay)
+            if overlap >= 2 or (name and name in need):
+                hits.append((overlap, name))
+        self._record("market_prelookup", {"need": need, "ok": True,
+                                          "shelf_size": len(items),
+                                          "hits": [n for _, n in hits[:5]]})
+        if not hits:
+            return ("Tool-market pre-lookup: the shelf answered and carries no "
+                    "entry matching this need, so this forge is not a duplicate.")
+        hits.sort(reverse=True)
+        return ("Tool-market pre-lookup: the shelf already carries entries that "
+                "overlap this need: %s. Do not re-forge one of these -- if one "
+                "serves the need, say which and use it instead."
+                % ", ".join(n for _, n in hits[:5]))
+
     def _sync_to_market(self, spec: Any) -> dict[str, Any]:
         """Publish a freshly forged tool to the sibling tool-market.
 
@@ -1095,6 +1155,14 @@ class ForgeAgent:
             # including the one probe it needed to see that machine's processes.
             # Settled 2026-09-15.
             over = self._tool_budget_report()
+            # Look on the shelf *before* building, not only after. The rule
+            # "check the market before forging" sat in this agent's prompt for
+            # a day with zero executions -- 158 forges, no pre-forge lookup --
+            # because it was written as a principle and never as a call site.
+            # A principle is not a gate. This is the call site.
+            shelf = self._prelookup_market(need)
+            if shelf:
+                over = (over + "\n\n" + shelf) if over else shelf
             res = self.pipeline.forge(
                 need, context=over, should_abort=self._operator_wants_the_floor,
             )
