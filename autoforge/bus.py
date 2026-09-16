@@ -140,10 +140,25 @@ def _ppid_of(pid) -> int:
         k.CloseHandle(snap)
 
 def _base_dir() -> str:
-    """The per-user data root, however this platform spells it."""
-    return (os.environ.get("LOCALAPPDATA")
-            or os.environ.get("XDG_DATA_HOME")
-            or os.path.expanduser("~"))
+    """The per-user data root, however this platform spells it.
+
+    On Windows the fallback is `%USERPROFILE%\AppData\Local`, not
+    `%USERPROFILE%`. `LOCALAPPDATA` is one of the variables the sandbox does
+    not pass to a forged child, and a scheduled task can run without it too --
+    so a bare `expanduser("~")` fallback resolves the *same* mount name
+    (`hermes/agent-bus`) to a *different* directory depending on who is asking.
+    The board then splits in two: one with every live session on it, one with
+    an empty registry, both called "autoforge". Measured on 2026-09-16: a
+    `bus send` returned `sent <id>` with exit code 0 and landed on the board
+    nobody was reading, because its parent process had no `LOCALAPPDATA`.
+    """
+    env = os.environ.get("LOCALAPPDATA")
+    if env:
+        return env
+    if os.name == "nt":
+        profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        return os.path.join(profile, "AppData", "Local")
+    return os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~")
 
 
 def default_home() -> str:
@@ -159,22 +174,138 @@ def default_home() -> str:
     return os.path.join(_base_dir(), "autoforge")
 
 
-#: Other mounts of the same protocol, best-known first. An existing board beats
-#: a fresh empty one: two agents that each default to their own empty directory
-#: look exactly like two agents with nothing to say -- which is the failure this
-#: module exists to prevent, so the default must not create it.
+#: Other mounts of the same protocol. An existing board beats a fresh empty
+#: one: two agents that each default to their own empty directory look exactly
+#: like two agents with nothing to say -- which is the failure this module
+#: exists to prevent, so the default must not create it.
 OTHER_MOUNTS = ("hermes/agent-bus",)
 
 
+def _mount_score(root: Path) -> tuple[int, float]:
+    """How much is *on* a mount: (entries, last write). Emptiness is not a claim."""
+    entries = 0
+    newest = 0.0
+    boards = root / "boards"
+    if boards.is_dir():
+        for f in boards.glob("*.ndjson"):
+            try:
+                entries += sum(1 for ln in f.read_text(encoding="utf-8").splitlines()
+                               if ln.strip())
+                newest = max(newest, f.stat().st_mtime)
+            except OSError:
+                pass
+    return entries, newest
+
+
+def _dedupe(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    keys: set[str] = set()
+    for q in paths:
+        key = os.path.normcase(os.path.abspath(str(q)))
+        if key not in keys:
+            keys.add(key)
+            out.append(q)
+    return out
+
+
+def env_mounts() -> list[Path]:
+    """The mounts the *handed* environment justifies. Only these are chosen.
+
+    Not a search of the disk. `default_bus_dir` has to be a function of what it
+    was given, or a test that sets its own environment gets answered by whatever
+    happens to be on the machine -- the same mistake one level up: a default
+    that reads state the caller never named.
+    """
+    rels = [os.environ.get("AUTOFORGE_BUS_DIR")]
+    rels += [os.path.join(_base_dir(), *rel.split("/")) for rel in OTHER_MOUNTS]
+    rels.append(os.path.join(default_home(), "bus"))
+    return _dedupe([Path(r) for r in rels if r])
+
+
+def diagnostic_mounts() -> list[Path]:
+    """Every directory the protocol might live in, for *diagnosis*.
+
+    Adds where a child with a scrubbed environment resolves to. A process that
+    does not inherit LOCALAPPDATA computes the profile-rooted mount, and that --
+    not a bad habit -- is how one protocol came to have two boards on this host.
+    Reported by `auto bus mounts`, never selected by default.
+    """
+    extra: list[Path] = []
+    if os.name == "nt":
+        profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        extra = [Path(profile).joinpath(*rel.split("/")) for rel in OTHER_MOUNTS]
+    return _dedupe(env_mounts() + extra)
+
+
+def candidate_mounts() -> list[Path]:
+    """Every directory this protocol might live in, de-duplicated, best first.
+
+    Kept as a list rather than a single answer because the *divergence* is the
+    bug: one mount is where the live sessions are, the other is where a child
+    with a scrubbed environment just wrote. Returning only the winner hides
+    that, which is exactly how the split went unnoticed.
+    """
+    return _dedupe(diagnostic_mounts())
+
+
+def mount_report() -> list[dict[str, Any]]:
+    """What is in each candidate mount: the data that makes a split visible."""
+    live = os.environ.get("AUTOFORGE_BUS_DIR")
+    rows = []
+    for q in candidate_mounts():
+        entries, newest = _mount_score(q)
+        rows.append({
+            "path": str(q),
+            "exists": q.is_dir(),
+            "entries": entries,
+            "newest": (datetime.fromtimestamp(newest).astimezone()
+                       .isoformat(timespec="seconds") if newest else ""),
+            "source": ("AUTOFORGE_BUS_DIR" if live and str(q) == live
+                       else "default" if q in env_mounts()
+                       else "scrubbed-env only"),
+        })
+    rows.sort(key=lambda r: (r["entries"], r["newest"]), reverse=True)
+    return rows
+
+
+def divergent_mounts(chosen: Path) -> list[dict[str, Any]]:
+    """Mounts that hold entries while the chosen one is not among the busiest.
+
+    A warning, not a redirect. Silently writing to a mount the caller did not
+    name is how a message ends up somewhere nobody looked; the fix is to say so
+    loudly and write where you were told.
+    """
+    rows = mount_report()
+    if not rows:
+        return []
+    key = os.path.normcase(os.path.abspath(str(chosen)))
+    top = rows[0]
+    chosen_row = next((r for r in rows
+                       if os.path.normcase(os.path.abspath(r["path"])) == key), None)
+    if chosen_row is None or top["entries"] == 0:
+        return []
+    if chosen_row["entries"] >= top["entries"]:
+        return []
+    return [r for r in rows
+            if r["entries"] > 0 and
+            os.path.normcase(os.path.abspath(r["path"])) != key]
+
+
 def default_bus_dir() -> Path:
-    """`$AUTOFORGE_BUS_DIR` wins, else the first mount that exists, else home/bus."""
+    """`$AUTOFORGE_BUS_DIR` wins, else the *busiest* existing mount, else home/bus.
+
+    "Busiest" replaced "first that exists" on 2026-09-16. A directory left over
+    from one earlier mistake is not empty and therefore satisfied the old rule,
+    and the mount every live session was using lost to it. An environment
+    variable still outranks everything: an explicit answer is not a guess to be
+    second-guessed.
+    """
     env = os.environ.get("AUTOFORGE_BUS_DIR")
     if env:
         return Path(env)
-    for rel in OTHER_MOUNTS:
-        candidate = Path(os.path.join(_base_dir(), *rel.split("/")))
-        if candidate.is_dir():
-            return candidate
+    existing = [q for q in env_mounts() if q.is_dir()]
+    if existing:
+        return max(existing, key=_mount_score)
     return Path(default_home()) / "bus"
 
 
@@ -619,6 +750,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--session", default="")
 
     sub.add_parser("boards", help="list boards and their depth")
+    sub.add_parser("mounts", help="every directory this protocol might live in, "
+                                  "and how much is on each")
     wh = sub.add_parser("who", help="list sessions that are still running")
     wh.add_argument("--all", action="store_true",
                     help="include registrations whose process is gone")
@@ -653,6 +786,19 @@ def cmd_bus(argv: list[str] | None = None) -> int:
                      session=session or None)
         print(f"sent {e['id']} to {args.board} "
               f"(to={e['to']}, kind={e['kind']})")
+        # Say the *root* as well as the board. Exit code 0 and "sent <id>" were
+        # true while the message sat on a mount nobody read, and a caller cannot
+        # check a delivery it was never told the address of.
+        print(f"  mount: {bus.root}")
+        split = divergent_mounts(bus.root)
+        if split:
+            hottest = split[0]
+            print(f"WARNING: {len(split)} other mount(s) hold entries and are "
+                  f"busier than the one just written ({hottest['entries']} vs "
+                  f"{[r['entries'] for r in mount_report() if r['path'] == str(bus.root)] or [0]}). "
+                  f"Busiest: {hottest['path']}", file=sys.stderr)
+            print("WARNING: another mount is busier; run `auto bus mounts`",
+                  file=sys.stderr)
         return 0
 
     if args.cmd == "read":
@@ -682,6 +828,23 @@ def cmd_bus(argv: list[str] | None = None) -> int:
             print(f"  {b}  ({len(bus.all_lines(b))} entries)")
         if not found:
             print(f"  (no boards yet under {bus.root})")
+        return 0
+
+    if args.cmd == "mounts":
+        rows = mount_report()
+        chosen = os.path.normcase(os.path.abspath(str(bus.root)))
+        for r in rows:
+            mark = "*" if os.path.normcase(os.path.abspath(r["path"])) == chosen else " "
+            state = "exists" if r["exists"] else "absent"
+            print(f" {mark} {r['entries']:>5} entries  {r['newest'] or '-':<25} "
+                  f"{state:<6} {r['path']:<52} {r['source']}")
+        print(f"\n  * = this invocation is writing there ({bus.root})")
+        split = divergent_mounts(bus.root)
+        if split:
+            print(f"\nSPLIT: {len(split)} other mount(s) hold entries, "
+                  f"busiest has {split[0]['entries']}.")
+            print("  Two mounts of the same protocol means two boards, two "
+                  "registries, and two sessions called the same name.")
         return 0
 
     if args.cmd == "depart":

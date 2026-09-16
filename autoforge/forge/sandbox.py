@@ -41,7 +41,30 @@ from typing import Any, Callable
 _NO_CONSOLE = 0x00000008 if os.name == "nt" else 0
 
 _RUNNER = textwrap.dedent('''
-    import io, json, sys, contextlib
+    import io, json, os, sys, contextlib
+
+    # No window for anything this code starts. The runner itself is launched
+    # detached, so Windows hands every console-subsystem child a *fresh* console
+    # -- a window on the operator's desktop, one per subprocess a snippet
+    # happens to start. Patched here rather than at the call sites, because the
+    # call sites are arbitrary snippet code: the number of windows tracked the
+    # number of subprocesses a run started, and a run that investigated the
+    # flapping was the run that flapped most.
+    #
+    # The flag is measured, not read. Enumerating visible top-level windows by
+    # pid: flags=0 -> one visible PseudoConsoleWindow, DETACHED_PROCESS -> none,
+    # CREATE_NO_WINDOW -> none. `GetConsoleWindow()` is the wrong probe -- it
+    # answers non-zero even under DETACHED_PROCESS, where no window is shown.
+    if os.name == "nt":
+        import subprocess as _sp
+        _NO_WINDOW = 0x00000008                     # DETACHED_PROCESS
+
+        class _QuietPopen(_sp.Popen):
+            def __init__(self, *a, **kw):
+                kw["creationflags"] = int(kw.get("creationflags") or 0) | _NO_WINDOW
+                super().__init__(*a, **kw)
+
+        _sp.Popen = _QuietPopen
 
     def _emit(obj):
         # Write UTF-8 bytes, not text. See the payload comment below: `-I`
