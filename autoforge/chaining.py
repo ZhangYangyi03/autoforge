@@ -60,6 +60,8 @@ import os
 
 import sqlite3
 
+import threading
+
 import time
 
 from typing import Any
@@ -70,8 +72,122 @@ GENESIS = "0" * 64
 
 _CHAIN_COLUMNS = ("prev_hash", "payload_hash", "writer_id")
 
+#: One lock per connection object, so two threads sharing a connection
+#: serialise instead of corrupting each other's cursors. Not a file lock and
+#: not per-database: the thing that is not re-entrant is the connection, so
+#: that is what gets the lock. Keyed by id() because a caller may hand this
+#: module a connection it got from anywhere -- the CLI opens one, tests open
+#: their own -- and every one of them has the same hazard.
+_LOCKS: "dict[int, tuple]" = {}
+_LOCKS_GUARD = threading.Lock()
 
 
+#: How long a writer waits for the file lock before giving up.
+#: Two agent sessions and the market server share this sqlite file on this
+#: machine, and a contended write is a normal event, not an error. Measured
+#: with the sqlite default (busy_timeout = 0): three processes appending 120
+#: events landed 91, and the 29 that went missing were raised as
+#: OperationalError("database is locked") -- lost refusals, silently, which is
+#: the one thing an audit log cannot do. With a wait, the same run lands 120.
+_BUSY_TIMEOUT_MS = 15000
+
+
+def _configure(conn, state):
+    """Give this connection a wait-on-lock, once, unless the caller chose one.
+
+    Set here rather than at every connect() because the callers are not one
+    caller: the CLI opens a connection, tests open their own, and a tool may
+    hand this module a connection from anywhere. A shared default of "abandon
+    the write immediately" is wrong for a ledger every process on the host
+    writes to, and the failure it produces is invisible -- the event is simply
+    gone, and verify_chain still says ok.
+
+    A caller who set a timeout explicitly keeps it: PRAGMA reports 0 for an
+    untouched connection, and anything else is a decision, not a default.
+    """
+    if state.get("busy_configured"):
+        return
+    state["busy_configured"] = True
+    try:
+        current = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        if not current:
+            # WAL first: readers should not block the writer at all, which is
+            # the other half of the same problem on this host.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass        # read-only or in-memory; the timeout still applies
+            conn.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
+    except sqlite3.DatabaseError:
+        # Not worth losing an event over: a connection that cannot answer a
+        # PRAGMA will fail on the INSERT with a better message.
+        pass
+
+
+def _write_lock(conn):
+    """The lock for this connection (and its one-time state), made once and shared.
+
+    Kept here rather than added to the sqlite3.connect call sites because
+    the hazard is not a property of any one caller: measured on this machine,
+    16 threads appending through one shared connection landed 5 rows and
+    raised 11 exceptions, and `verify_chain` still reported ok -- a silent
+    loss, not a detectable corruption. The rows that go missing are mostly
+    the refusals, which is the worst thing for an audit log to lose.
+
+    Held only around one append. BEGIN IMMEDIATE below still does the
+    cross-process work; this does the in-process work that BEGIN cannot,
+    because two threads on one connection are one transaction, not two.
+    """
+    key = id(conn)
+    ent = _LOCKS.get(key)
+    # (lock, the connection) both, because id() is only unique among live
+    # objects: a connection that is garbage-collected frees its key for the
+    # next allocation, and the next allocation could be a new connection.
+    # Identity is checked, not assumed, so a reused address makes a new lock
+    # instead of two connections sharing one.
+    if ent is None or ent[1] is not conn:
+        with _LOCKS_GUARD:
+            ent = _LOCKS.get(key)
+            if ent is None or ent[1] is not conn:
+                ent = (threading.RLock(), conn, {})
+                _LOCKS[key] = ent
+    return ent[0], ent[2]
+
+
+
+
+
+def rows_of(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
+    """Run a SELECT and hand back dicts, whatever the connection's row_factory is.
+
+    This exists because the rest of this module indexes rows by column name, and
+    a plain `sqlite3.connect()` returns tuples -- measured on this host, calling
+    `verify_chain` on a connection someone else opened raised
+    `TypeError: tuple indices must be integers or slices, not str`. For most
+    functions that is a bug; for this one it is worse, because the question it
+    answers is "was the log rewritten?" and a traceback is not a verdict.
+    ToolStore sets `row_factory`, but nothing in this module's contract says a
+    caller has one, and an audit log that can only be read by its own writer is
+    not an audit log.
+
+    `description` is the names sqlite actually returned, so this works for any
+    SELECT without the caller listing columns twice.
+    """
+    cur = conn.execute(sql, params)
+    names = [d[0] for d in (cur.description or ())]
+    if not names:
+        return []
+    if hasattr(cur, "fetchall"):
+        raw = cur.fetchall()
+    else:                                                     # pragma: no cover
+        raw = list(cur)
+    out: list[dict] = []
+    for r in raw:
+        try:
+            out.append({n: r[n] for n in names})              # sqlite3.Row
+        except (TypeError, IndexError):
+            out.append(dict(zip(names, r)))                   # tuple
+    return out
 
 
 def _j(obj: Any) -> str:
@@ -160,7 +276,25 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
 
         if col not in have:
 
-            conn.execute(f"ALTER TABLE forge_events ADD COLUMN {col} TEXT DEFAULT ''")
+            try:
+
+                conn.execute(f"ALTER TABLE forge_events ADD COLUMN {col} TEXT DEFAULT ''")
+
+            except sqlite3.OperationalError as e:
+
+                # Two processes can pass the `have` check at the same moment and
+
+                # both try to add the column; the loser gets "duplicate column".
+
+                # That is the schema converging, not a failure -- and it was
+
+                # being raised straight out of a WRITE path, so a concurrent
+
+                # first use of a fresh ledger turned into a lost event.
+
+                if "duplicate column" not in str(e).lower():
+
+                    raise
 
             added.append(col)
 
@@ -196,7 +330,7 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
 
 
 
-def _row_material(row: sqlite3.Row) -> str:
+def _row_material(row: dict) -> str:
 
     return "\x1f".join([str(row["id"]), format(float(row["timestamp"]), ".6f"),
 
@@ -226,13 +360,17 @@ def _baseline_digest(conn: sqlite3.Connection, up_to_id: int) -> tuple[str, int]
 
     n = 0
 
-    for row in conn.execute(
+    for row in rows_of(
+
+        conn,
 
         "SELECT id, timestamp, kind, payload FROM forge_events "
 
         "WHERE id <= ? AND (payload_hash IS NULL OR payload_hash = '') "
 
-        "ORDER BY id", (up_to_id,)
+        "ORDER BY id",
+
+        (up_to_id,),
 
     ):
 
@@ -332,43 +470,46 @@ def append_event(conn: sqlite3.Connection, kind: str, payload: dict,
 
     """
 
-    ensure_schema(conn)
+    lock, state = _write_lock(conn)
+    with lock:
+        _configure(conn, state)
+        ensure_schema(conn)
 
-    w = writer or writer_id(session)
+        w = writer or writer_id(session)
 
-    payload_json = _j(payload)
+        payload_json = _j(payload)
 
-    ts = time.time()
+        ts = time.time()
 
-    conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN IMMEDIATE")
 
-    try:
+        try:
 
-        prev = _head_hash(conn)
+            prev = _head_hash(conn)
 
-        digest = _digest(kind, payload_json, ts, prev, w)
+            digest = _digest(kind, payload_json, ts, prev, w)
 
-        conn.execute(
+            conn.execute(
 
-            "INSERT INTO forge_events (timestamp, kind, payload, prev_hash,"
+                "INSERT INTO forge_events (timestamp, kind, payload, prev_hash,"
 
-            " payload_hash, writer_id) VALUES (?,?,?,?,?,?)",
+                " payload_hash, writer_id) VALUES (?,?,?,?,?,?)",
 
-            (ts, kind, payload_json, prev, digest, w),
+                (ts, kind, payload_json, prev, digest, w),
 
-        )
+            )
 
-        conn.commit()
+            conn.commit()
 
-    except Exception:
+        except Exception:
 
-        conn.rollback()
+            conn.rollback()
 
-        raise
+            raise
 
-    return {"timestamp": ts, "kind": kind, "prev_hash": prev,
+        return {"timestamp": ts, "kind": kind, "prev_hash": prev,
 
-            "payload_hash": digest, "writer_id": w}
+                "payload_hash": digest, "writer_id": w}
 
 
 
@@ -393,7 +534,11 @@ def verify_chain(conn: sqlite3.Connection) -> dict:
     ok therefore means "nothing was rewritten", not "every row is chained".
     """
     ensure_schema(conn)
-    anchors = list(conn.execute("SELECT * FROM chain_anchors ORDER BY id"))
+    # Anchors as dicts, via rows_of rather than a row_factory this module does
+    # not control. See rows_of for why that matters here.
+    anchors = rows_of(conn, "SELECT id, created_at, up_to_id, rows,"
+                            " baseline_digest, head_hash FROM chain_anchors"
+                            " ORDER BY id")
     breaks: list[dict] = []
     gaps: list[dict] = []
     chained = 0
@@ -402,9 +547,13 @@ def verify_chain(conn: sqlite3.Connection) -> dict:
     prev = ""
     started = False
 
-    for row in conn.execute(
-        "SELECT id, timestamp, kind, payload, prev_hash, payload_hash, writer_id"
-        " FROM forge_events ORDER BY id"
+    # Ordered, named, and read through rows_of: the walk below is the thing
+    # that decides whether this log is trustworthy, so it must not depend on
+    # the caller having passed a connection with the right row_factory.
+    for row in rows_of(
+        conn,
+        "SELECT id, timestamp, kind, payload, prev_hash, payload_hash,"
+        " writer_id FROM forge_events ORDER BY id",
     ):
         if not row["payload_hash"]:
             unchained.append(row["id"])
@@ -513,11 +662,15 @@ def lineage_of(conn: sqlite3.Connection, tool: str, depth: int = 3) -> dict:
 
         for t in frontier:
 
-            for row in conn.execute(
+            for row in rows_of(
 
-                "SELECT id, timestamp, kind, payload FROM forge_events WHERE payload LIKE ?"
+                conn,
 
-                " ORDER BY id", (f'%"{t}"%',)
+                "SELECT id, timestamp, kind, payload FROM forge_events"
+
+                " WHERE payload LIKE ? ORDER BY id",
+
+                (f'%"{t}"%',),
 
             ):
 

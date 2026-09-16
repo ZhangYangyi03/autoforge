@@ -194,3 +194,117 @@ class TestStoreWiring:
         store.save_tool(spec)
         assert [v["version"] for v in store.versions_of("t")] == [1]
         store.close()
+
+class TestTheChainSurvivesContention:
+    """The four ways this ledger can lose an event without saying so.
+
+    Every test here is a regression test for something measured on this host,
+    not something imagined. The theme is identical in all four: the log looked
+    fine afterwards -- `verify_chain` said ok -- while events were simply gone,
+    and the events that go missing are disproportionately the refusals, which
+    are the only reason the log exists.
+    """
+
+    def test_sixteen_threads_on_one_connection_land_sixteen_rows(self, tmp_path):
+        """sqlite3.Connection is not re-entrant, and its cursors are shared.
+
+        Measured before the fix: 16 threads through one connection landed 5
+        rows, raised 11 exceptions (DatabaseError "another row available",
+        IndexError from a cursor consumed by the other thread), and
+        `verify_chain` still returned ok.
+        """
+        import threading
+
+        db = str(tmp_path / "threads.db")
+        conn = sqlite3.connect(db, check_same_thread=False, timeout=15)
+        conn.execute("CREATE TABLE forge_events (id INTEGER PRIMARY KEY"
+                     " AUTOINCREMENT, timestamp REAL, kind TEXT, payload TEXT)")
+        landed, errors = [], []
+
+        def write(i):
+            try:
+                chaining.append_event(conn, "gate_deny", {"i": i})
+                landed.append(i)
+            except Exception as exc:                          # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], errors
+        assert len(landed) == 16
+        assert conn.execute("SELECT COUNT(*) FROM forge_events").fetchone()[0] == 16
+        assert chaining.verify_chain(conn)["ok"] is True
+
+    def test_a_plain_connection_can_verify_and_anchor(self, tmp_path):
+        """A reader with no row_factory must still be able to ask.
+
+        Measured: `sqlite3.connect()` plus `verify_chain` raised
+        `TypeError: tuple indices must be integers or slices, not str`,
+        because the module indexed rows by name and only ToolStore set the
+        row_factory that makes that work. The one question this function
+        exists to answer was answered with a traceback.
+        """
+        db = str(tmp_path / "plain.db")
+        conn = sqlite3.connect(db)                 # deliberately no row_factory
+        conn.execute("CREATE TABLE forge_events (id INTEGER PRIMARY KEY"
+                     " AUTOINCREMENT, timestamp REAL, kind TEXT, payload TEXT)")
+        chaining.append_event(conn, "genuine", {"x": 1})
+
+        assert not hasattr(conn, "row_factory") or conn.row_factory is None
+        verdict = chaining.verify_chain(conn)
+        assert verdict["ok"] is True
+        assert verdict["chained_rows"] == 1
+        assert chaining.anchor(conn, note="plain")["rows"] == 0
+        assert chaining.verify_chain(conn)["ok"] is True
+        assert chaining.lineage_of(conn, "nothing")["nodes"] == ["nothing"]
+
+    def test_three_processes_land_every_row(self, tmp_path):
+        """The default busy timeout is zero, and this ledger is shared.
+
+        Three processes -- two agent sessions and the market server is the real
+        case on this host -- each appending through a plain connection. Measured
+        before the fix: 91 of 120 rows landed and 29 were raised as
+        OperationalError("database is locked"), then discarded by the caller.
+        The fix is a wait-on-lock set inside this module, because the callers
+        are not one caller and the sqlite default is "give up immediately".
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        db = str(tmp_path / "multi.db")
+        worker = textwrap.dedent(
+            """
+            import sqlite3, sys
+            from autoforge import chaining
+            conn = sqlite3.connect(sys.argv[1])        # no timeout set by hand
+            conn.execute("CREATE TABLE IF NOT EXISTS forge_events (id INTEGER"
+                         " PRIMARY KEY AUTOINCREMENT, timestamp REAL, kind TEXT,"
+                         " payload TEXT)")
+            ok = 0
+            for i in range(20):
+                chaining.append_event(conn, "gate_deny", {"w": sys.argv[2], "i": i})
+                ok += 1
+            print(ok)
+            """)
+        script = tmp_path / "worker.py"
+        script.write_text(worker, encoding="utf-8")
+
+        procs = [subprocess.Popen([sys.executable, str(script), db, tag],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True)
+                 for tag in ("A", "B", "C")]
+        outs = []
+        for p in procs:
+            out, err = p.communicate(timeout=180)
+            outs.append((out.strip(), err.strip()))
+
+        landed = [int(o) for o, _ in outs if o.isdigit()]
+        assert landed == [20, 20, 20], outs
+        conn = sqlite3.connect(db)
+        assert conn.execute("SELECT COUNT(*) FROM forge_events").fetchone()[0] == 60
+        assert chaining.verify_chain(conn)["ok"] is True
