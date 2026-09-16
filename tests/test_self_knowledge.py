@@ -65,8 +65,15 @@ class TestStoreReportIsMeasured:
         assert r["survives_restart"] is True
         assert os.path.isabs(r["db_path"])
         assert r["tools"] == 1
-        assert r["events"] == 2
-        assert r["event_kinds"] == {"run": 1, "forge": 1}
+        # Two events were logged; one more row is the store's own bookkeeping
+        # (the version it recorded for the save above). The report separates
+        # the two rather than either hiding the extra row or counting it as
+        # something the agent did.
+        assert r["events"] == 3
+        assert r["events_agent"] == 2
+        assert r["event_kinds_agent_only"] == {"run": 1, "forge": 1}
+        assert r["event_kinds"]["version_recorded"] == 1
+        assert r["versions"] >= 1
 
     def test_report_still_counts_after_a_reopen(self, store, db_path):
         store.save_tool(_spec("beta"))

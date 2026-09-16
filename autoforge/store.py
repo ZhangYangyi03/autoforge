@@ -9,6 +9,7 @@ structured fields avoid schema migrations while keeping the critical fields
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .tools.spec import ToolSpec, ToolState, ToolStats, TriggerProbe, normalise_parameters
+from . import chaining
 
 _DEFAULT_DB = "autoforge.db"
 
@@ -51,6 +53,28 @@ _DDL = (
     "\n    timestamp REAL NOT NULL,"
     "\n    kind TEXT NOT NULL,"
     "\n    payload TEXT NOT NULL DEFAULT '{}'"
+    "\n);"
+    # Version history, content-addressed. Two tables because they answer two
+    # different questions: version_blobs holds each distinct body of code once,
+    # keyed by its sha256, so identical code saved under two names is stored
+    # once and provably identical; tool_versions holds the timeline -- which
+    # sha a tool was on, from which parent, when. old_versions on the tools row
+    # stays for backward compatibility, but it only ever filled on an evolve
+    # win, which is why 114 tools had 0 archived versions: a version that was
+    # live and got replaced outside evolve left no trace at all.
+    "\nCREATE TABLE IF NOT EXISTS version_blobs ("
+    "\n    sha TEXT NOT NULL PRIMARY KEY,"
+    "\n    code TEXT NOT NULL,"
+    "\n    created_at REAL NOT NULL"
+    "\n);"
+    "\nCREATE TABLE IF NOT EXISTS tool_versions ("
+    "\n    tool TEXT NOT NULL,"
+    "\n    version INTEGER NOT NULL,"
+    "\n    blob_sha TEXT NOT NULL,"
+    "\n    parent_version INTEGER,"
+    "\n    verification TEXT NOT NULL DEFAULT '{}',"
+    "\n    archived_at REAL NOT NULL,"
+    "\n    PRIMARY KEY (tool, version)"
     "\n);"
     "\nCREATE TABLE IF NOT EXISTS dependencies ("
     "\n    tool TEXT NOT NULL,"
@@ -271,6 +295,10 @@ class ToolStore:
             ),
         )
         self._conn.commit()
+        # Every save is a version. Doing it here rather than at each call site is
+        # the difference between "history is what someone remembered to archive"
+        # and "history is what happened".
+        self.record_version(record.name, record.code, record.verification)
 
     def load_all_tools(self) -> dict[str, ToolRecord]:
         rows = self._conn.execute(
@@ -323,11 +351,124 @@ class ToolStore:
             "verification": verification,
             "archived_at": _now(),
         })
+        # Record the outgoing body at the version it actually held, before the
+        # bump. In the evolve path save_tool already recorded this exact body at
+        # this number, so this is a no-op there; it matters for the caller that
+        # archives a body the store never saw, which is the case that used to
+        # end with the code in a JSON column and nowhere else.
+        self.record_version(name, code, verification, version=row["version"])
         self._conn.execute(
             "UPDATE tools SET old_versions=?, version=version+1, updated_at=? WHERE name=?",
             (_j(versions), _now(), name),
         )
         self._conn.commit()
+
+    # -- versions (content-addressed) --------------------------------------
+    def record_version(self, tool: str, code: str, verification: dict[str, Any] | None = None,
+                       parent_version: int | None = None,
+                       version: int | None = None) -> dict[str, Any]:
+        """Record that `tool` held `code`, and give it the next number if it is new.
+
+        Bodies are stored once by sha256, so history costs a row per distinct
+        body rather than a full copy per tool per save. The number comes from the
+        timeline, never from the caller: a ToolSpec carrying version=1 through a
+        breed would otherwise reset the counter, which is how a tool reaches
+        version 1 four times and its history becomes unreadable.
+
+        Called on every save_tool. That placement is the fix for 114 tools with
+        0 archived versions -- before, only the evolve path archived anything, so
+        a body replaced any other way left no trace anywhere.
+        """
+        sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO version_blobs (sha, code, created_at) VALUES (?,?,?)",
+            (sha, code, _now()),
+        )
+        newest = self._conn.execute(
+            "SELECT version, blob_sha FROM tool_versions WHERE tool=?"
+            " ORDER BY version DESC LIMIT 1", (tool,)).fetchone()
+        if version is None:
+            if newest is not None and newest["blob_sha"] == sha:
+                self._conn.commit()
+                return {"tool": tool, "version": newest["version"], "blob_sha": sha,
+                        "parent_version": None, "new": False}
+            if newest is not None:
+                version = newest["version"] + 1
+            else:
+                row = self._conn.execute(
+                    "SELECT version FROM tools WHERE name=?", (tool,)).fetchone()
+                version = ((row["version"] if row is not None else 0) or 1)
+        known = self._conn.execute(
+            "SELECT blob_sha FROM tool_versions WHERE tool=? AND version=?",
+            (tool, version)).fetchone()
+        if known is None:
+            if parent_version is None:
+                prev = self._conn.execute(
+                    "SELECT MAX(version) FROM tool_versions WHERE tool=? AND version < ?",
+                    (tool, version)).fetchone()
+                parent_version = prev[0] if prev and prev[0] is not None else None
+            self._conn.execute(
+                "INSERT INTO tool_versions (tool, version, blob_sha, parent_version,"
+                " verification, archived_at) VALUES (?,?,?,?,?,?)",
+                (tool, version, sha, parent_version, _j(verification or {}), _now()),
+            )
+            # The timeline goes into the chained log as well, so "when did this
+            # tool's body change" is answerable from the same tamper-evident
+            # history as everything else rather than a second, weaker ledger.
+            chaining.append_event(self._conn, "version_recorded", {
+                "tool": tool, "version": version, "blob_sha": sha,
+                "parent_version": parent_version,
+            })
+        self._conn.commit()
+        return {"tool": tool, "version": version, "blob_sha": sha,
+                "parent_version": parent_version, "new": known is None}
+
+    def versions_of(self, tool: str) -> list[dict[str, Any]]:
+        """The recorded timeline for one tool, oldest first. Empty is an answer."""
+        rows = self._conn.execute(
+            "SELECT v.version, v.blob_sha, v.parent_version, v.archived_at,"
+            " v.verification, LENGTH(b.code) AS size"
+            " FROM tool_versions v JOIN version_blobs b ON b.sha = v.blob_sha"
+            " WHERE v.tool=? ORDER BY v.version", (tool,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["verification"] = json.loads(d["verification"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["verification"] = {}
+            out.append(d)
+        return out
+
+    def version_of(self, tool: str, version: int | None = None) -> dict[str, Any] | None:
+        """The body of one version, by number (default: the newest recorded)."""
+        if version is None:
+            row = self._conn.execute(
+                "SELECT * FROM tool_versions WHERE tool=? ORDER BY version DESC LIMIT 1",
+                (tool,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM tool_versions WHERE tool=? AND version=?",
+                (tool, version)).fetchone()
+        if row is None:
+            return None
+        blob = self._conn.execute(
+            "SELECT code FROM version_blobs WHERE sha=?", (row["blob_sha"],)).fetchone()
+        return {"tool": tool, "version": row["version"], "blob_sha": row["blob_sha"],
+                "parent_version": row["parent_version"], "archived_at": row["archived_at"],
+                "verification": _unjson(row["verification"]),
+                "code": blob["code"] if blob else None}
+
+    def version_graph(self) -> dict[str, Any]:
+        """Every recorded version and parent edge, for the lineage view."""
+        edges = [{"from": f"{r['tool']}@{r['parent_version']}",
+                  "to": f"{r['tool']}@{r['version']}"}
+                 for r in self._conn.execute(
+                     "SELECT tool, version, parent_version FROM tool_versions"
+                     " WHERE parent_version IS NOT NULL ORDER BY tool, version")]
+        n = self._conn.execute("SELECT COUNT(*) FROM tool_versions").fetchone()[0]
+        blobs = self._conn.execute("SELECT COUNT(*) FROM version_blobs").fetchone()[0]
+        return {"versions": n, "distinct_bodies": blobs, "edges": edges}
 
     # -- dependencies -----------------------------------------------------
     def save_deps(self, tool: str, depends_on: list[str]) -> None:
@@ -408,11 +549,27 @@ class ToolStore:
 
     # -- events -----------------------------------------------------------
     def log_event(self, kind: str, payload: dict[str, Any]) -> None:
-        self._conn.execute(
-            "INSERT INTO forge_events (timestamp, kind, payload) VALUES (?,?,?)",
-            (_now(), kind, _j(payload)),
-        )
-        self._conn.commit()
+        """Append one event. Delegates to the chain so every row self-witnesses.
+
+        The write path used to be a bare INSERT, which recorded what happened
+        and nothing about whether it was later rewritten. chaining.append_event
+        adds prev_hash/payload_hash/writer_id under BEGIN IMMEDIATE, so the
+        hash of this row is a claim about the row before it and cannot be made
+        against a stale head.
+        """
+        chaining.append_event(self._conn, kind, payload)
+
+    def verify_chain(self) -> dict[str, Any]:
+        """Walk the log and report what is provable about it, row by row."""
+        return chaining.verify_chain(self._conn)
+
+    def anchor_chain(self, note: str = "") -> dict[str, Any]:
+        """Freeze everything logged so far as a baseline."""
+        return chaining.anchor(self._conn, note=note)
+
+    def lineage_of(self, tool: str, depth: int = 3) -> dict[str, Any]:
+        """Derivation edges actually recorded for a tool -- not inferred ones."""
+        return chaining.lineage_of(self._conn, tool, depth=depth)
 
     def get_events(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -600,6 +757,17 @@ class ToolStore:
             for r in self._conn.execute(
                 "SELECT kind, COUNT(*) n FROM forge_events GROUP BY kind ORDER BY kind")
         }
+        # The agent's own bookkeeping is in the same table as the record of what
+        # happened, so an unfiltered count answers "how many events" with a
+        # number the reader cannot interpret. A version_recorded row is written
+        # by the store on every save, which makes it the loudest kind quickly.
+        bookkeeping = {"version_recorded"}
+        agent_events = {
+            r["kind"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT kind, COUNT(*) n FROM forge_events"
+                " WHERE kind NOT IN ('version_recorded') GROUP BY kind ORDER BY kind")
+        }
         return {
             "backend": "sqlite",
             "db_path": os.path.abspath(self.db_path),
@@ -607,7 +775,13 @@ class ToolStore:
             "tools": tools,
             "tool_states": states,
             "events": events,
+            "events_agent": sum(agent_events.values()),
+            "bookkeeping_kinds": sorted(bookkeeping),
+            "event_kinds_agent_only": agent_events,
             "event_kinds": kinds,
+            "versions": _one("SELECT COUNT(*) FROM tool_versions") or 0,
+            "distinct_bodies": _one("SELECT COUNT(*) FROM version_blobs") or 0,
+            "chain": self.verify_chain(),
             "memories": _one("SELECT COUNT(*) FROM memory") or 0,
             "skills": _one("SELECT COUNT(*) FROM skills") or 0,
             "skill_loads": _one("SELECT SUM(loads) FROM skills") or 0,

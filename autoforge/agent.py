@@ -507,6 +507,10 @@ BUILTIN_SCOPES: dict[str, str] = {
     # Reading the agent's own state. Nothing leaves the process.
     "my_capabilities": "read_only",
     "my_history": "read_only",
+    # verify_ledger reads the log and, when asked, writes one anchor row. The
+    # anchor is the whole reason it can catch a truncated tail, so it is not
+    # split off: this tool's cost is a read plus at most one append.
+    "verify_ledger": "local_write",
     "list_tools": "read_only",
     "find_gaps": "read_only",
     # Procedures. Reading one is a read; writing or retiring one edits a file
@@ -2007,6 +2011,37 @@ class ForgeAgent:
             for a in (self.selfmod.log() if self.selfmod else [])
         ]
 
+    def _verify_ledger(self, anchor_now: bool = False) -> str:
+        """Report what the ledger can prove about itself. Recorded, not asserted."""
+        if self.store is None:
+            return ("No store attached this session, so there is no ledger to check. "
+                    "Nothing is being recorded at all.")
+        if anchor_now:
+            self.store.anchor_chain("requested through verify_ledger")
+        v = self.store.verify_chain()
+        lines = [
+            f"Ledger: {v['chained_rows']} chained row(s), {v['unchained_rows']} without a hash,"
+            f" {v['anchors']} anchor(s).",
+            f"Head: {v['head_hash'][:16] if v['head_hash'] else '(none)'}",
+            f"Writers seen in the chained region: {', '.join(v['chained_writers']) or '(none)'}",
+        ]
+        if v["unchained_rows"]:
+            lines.append(
+                f"  {v['unchained_rows']} row(s) predate chaining or come from a process"
+                f" still running older code ({v['unchained_after_chaining_began']} of them"
+                " after chaining began). They are anchored, not chained: editing them"
+                " is detectable, editing them individually is not.")
+        if v["breaks"]:
+            lines.append("")
+            lines.append(f"BREAKS ({len(v['breaks'])}) -- the log disagrees with itself:")
+            for b in v["breaks"][:20]:
+                lines.append(f"  row {b['row']}: {b['kind']} — {b['detail']}")
+        else:
+            lines.append("")
+            lines.append("No breaks: nothing in the chained region was rewritten, and no"
+                         " anchored row changed.")
+        return "\n".join(lines)
+
     def _tool_history(self) -> None:
         def my_history(limit: int = 20) -> str:
             """What I have done and how I have changed myself — from the ledger.
@@ -2033,6 +2068,25 @@ class ForgeAgent:
             lines += ["", "Self-modifications (newest last):"]
             lines += mods or ["  (none)"]
             return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="verify_ledger",
+            description=(
+                "Check the on-disk event log for rewriting: every row carries a "
+                "hash of itself and a pointer to the row before it, so a changed "
+                "payload, a broken link, a deleted row or an edited legacy row "
+                "shows up as a break. Rows written by an older process carry no "
+                "hash and are reported as gaps, not failures. Use it before "
+                "trusting my_history, and after any session that shares this store."
+            ),
+            parameters={"type": "object", "properties": {
+                "anchor_now": {"type": "boolean", "description":
+                               "freeze the current state as a baseline, so a later "
+                               "truncation of the tail becomes visible"},
+            }},
+            fn=lambda anchor_now=False: self._verify_ledger(bool(anchor_now)),
+            source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
 
         self._add(ToolSpec(
             name="my_history",
@@ -3990,6 +4044,15 @@ class ForgeAgent:
                 "stopped_by_operator": result.stopped_by_operator,
                 "usage": usage,
             })
+            # Anchor at the end of every run. A chain that walks forward cannot
+            # see its own tail being cut -- whatever row is last always looks
+            # like a valid last row -- so the head recorded here is the only
+            # thing that makes a later truncation visible. It costs one row and
+            # runs once per task, not once per event.
+            try:
+                self.store.anchor_chain(f"end of run: {task[:80]}")
+            except Exception:                    # noqa: BLE001 - never fail a run for this
+                pass
         return result
 
     # ------------------------------------------------------------------
