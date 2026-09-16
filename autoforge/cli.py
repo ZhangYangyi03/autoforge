@@ -1196,6 +1196,127 @@ def cmd_tick(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_mission(args: argparse.Namespace) -> int:
+    """`auto mission ...` -- what is owed, read from a terminal.
+
+    The mission list also rides in the agent's own prompt, and that is the copy
+    that matters for not losing it mid-session. This command exists for the two
+    other readers: the person at the keyboard deciding what to start, and the
+    next process, which needs the list before any model is built. It therefore
+    never constructs an agent -- a mission report that required a working model
+    and a valid API key would be unreadable exactly when the work is stuck,
+    which is when someone would go looking for it.
+    """
+    from autoforge.mission import MissionError, MissionStore
+
+    store = MissionStore(getattr(args, "file", None))
+    action = (getattr(args, "mission_action", None) or "list").lower()
+    rest = list(getattr(args, "rest", None) or [])
+    # `rest` is REMAINDER, so a flag written after the first positional lands
+    # inside it -- and a note of "done --file C:\...\autoforge.db" is a trap
+    # that reads as data corruption later. Pull the known flags back out
+    # instead of documenting an argument order nobody will remember.
+    for flag in ("--file", "--parent", "-p", "--next-step"):
+        while flag in rest:
+            i = rest.index(flag)
+            value = rest[i + 1] if i + 1 < len(rest) else ""
+            rest = rest[:i] + rest[i + 2:]
+            if flag in ("--parent", "-p"):
+                try:
+                    args.parent = int(value)
+                except ValueError:
+                    pass
+            elif flag == "--next-step":
+                args.next_step = value
+            else:
+                store = MissionStore(value)
+
+    def _id_or_none(text: str | None):
+        if text is None:
+            return None
+        t = text.strip().lstrip("Mm")
+        return int(t) if t.isdigit() else None
+
+    if action == "add":
+        if not rest:
+            print("usage: auto mission add <what is owed> [-p <parent>] [--next-step S]")
+            return 2
+        parent = int(getattr(args, "parent", 0) or 0)
+        text, tail = rest[0], rest[1:]
+        if tail and tail[0] in ("-p", "--parent"):
+            parent = int(tail[1])
+        next_step = getattr(args, "next_step", "") or ""
+        if "--next-step" in rest:
+            next_step = rest[rest.index("--next-step") + 1]
+        try:
+            m = store.open(text, parent=parent, next_step=next_step)
+        except MissionError as exc:
+            print(f"not recorded: {exc}")
+            return 1
+        if not store.focused():
+            store.set_focus(m.id)
+        print(f"M{m.id} open: {m.text}")
+        return 0
+
+    if action == "note":
+        mid = _id_or_none(rest[0]) if rest else None
+        if mid is None:
+            print("usage: auto mission note <id> <note>")
+            return 2
+        try:
+            m = store.note(mid, note=" ".join(rest[1:]),
+                           next_step=(getattr(args, "next_step", "") or None))
+        except MissionError as exc:
+            print(exc)
+            return 1
+        print(m.line(0))
+        return 0
+
+    if action in ("close", "done"):
+        mid = _id_or_none(rest[0]) if rest else None
+        if mid is None:
+            print("usage: auto mission close <id> <note>")
+            return 2
+        try:
+            m = store.finish(mid, note=" ".join(rest[1:]),
+                             ok=action != "drop")
+        except MissionError as exc:
+            print(f"not closed: {exc}")
+            return 1
+        print(f"M{m.id} {m.status}: {m.close_note}")
+        return 0
+
+    if action == "show":
+        mid = _id_or_none(rest[0]) if rest else None
+        if mid is None:
+            print("usage: auto mission show <id>")
+            return 2
+        try:
+            m = store.get(mid)
+        except MissionError as exc:
+            print(exc)
+            return 1
+        print(m.line(0))
+        for c in store.all(None):
+            if c.parent == m.id and c.status == "open":
+                print(c.line(1))
+        print("  history (newest first):")
+        for h in store.history(mid):
+            when = time.strftime("%m-%d %H:%M", time.localtime(h["at"]))
+            print(f"    {when} {h['kind']}: {h['note'][:100]}")
+        return 0
+
+    if action == "focus":
+        mid = _id_or_none(rest[0]) if rest else 0
+        print(store.set_focus(mid or 0))
+        return 0
+
+    # default: the report, exactly as the prompt sees it
+    print(store.report(budget=10 ** 6) if action in ("all", "verbose")
+          else store.report())
+    return 0
+
+
 def cmd_modes(args: argparse.Namespace) -> int:
     print("standard  — full forging agent: meta-tools, 5-check verification, "
           "evolution, spawning, persistence")
@@ -1227,6 +1348,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"autoforge {__version__}")
 
     sub = p.add_subparsers(dest="command")
+    mi = sub.add_parser("mission", help="what is owed: open, note, close, list")
+    mi.add_argument("mission_action", nargs="?", default="list",
+                    help="list (default) | all | add | note | close | drop | show | focus")
+    mi.add_argument("--file", help="mission store (default: the same db as the tool store)")
+    mi.add_argument("--parent", type=int, default=0, help="open a sub-mission under this id")
+    mi.add_argument("--next-step", dest="next_step", default="", help="the next action")
+    mi.add_argument("rest", nargs=argparse.REMAINDER,
+                    help="free text for the action (id, note, mission sentence)")
+
     sub.add_parser("chat", help="talk to the agent in a REPL")
 
     f = sub.add_parser("forge", help="forge one tool from a need, then stop")
@@ -1308,6 +1438,7 @@ def command_table() -> dict[str, Any]:
         "modes": cmd_modes,
         "tick": cmd_tick,
         "bus": cmd_bus,
+        "mission": cmd_mission,
     }
 
 

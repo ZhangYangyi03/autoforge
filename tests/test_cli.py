@@ -117,7 +117,7 @@ def test_bare_auto_with_tty_enters_chat(monkeypatch, capsys):
 def test_parser_exposes_every_subcommand():
     names = cli.build_parser()._subparsers._group_actions[0].choices
     assert set(names) == {"chat", "forge", "list", "setup", "config",
-                          "web", "run", "modes", "tick", "bus"}
+                          "web", "run", "modes", "tick", "bus", "mission"}
 
 
 def test_every_offered_subcommand_has_a_handler():

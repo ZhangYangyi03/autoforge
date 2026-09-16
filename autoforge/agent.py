@@ -528,6 +528,12 @@ BUILTIN_SCOPES: dict[str, str] = {
     "remember": "local_write",
     "recall": "read_only",
     "forget": "local_write",
+    "mission_open": "local_write",
+    "mission_note": "local_write",
+    "mission_close": "local_write",
+    "mission_focus": "local_write",
+    "mission_list": "read_only",
+    "mission_show": "read_only",
     # Reading the agent's own state. Nothing leaves the process.
     "my_capabilities": "read_only",
     "my_history": "read_only",
