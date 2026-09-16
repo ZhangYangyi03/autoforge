@@ -45,11 +45,39 @@ if os.name == "nt" and not os.environ.get("AUTOFORGE_KEEP_CONSOLE"):
     #: changes `processes_launched` for the containment accounting.
     _NO_WINDOW = 0x00000008
 
+    #: ...with one exception, found by a run that returned nothing. Under
+    #: DETACHED_PROCESS, `wsl.exe` exits 0 and writes NOTHING to a captured
+    #: pipe: no stdout, no stderr, no error code. Measured on this host --
+    #: `0`/`CREATE_NO_WINDOW`/`NEW_PROCESS_GROUP` all return "hi", and
+    #: DETACHED_PROCESS returns "". This is the worst kind of failure: a
+    #: successful-looking result with the content silently missing, which
+    #: inside `wsl_isolation` reads as "the distro is not answering" and
+    #: would have been debugged for an hour as a WSL problem. Only this one
+    #: executable is affected, so only this one is special-cased: no console
+    #: window appears for it either way.
+    _WSL_EXE = 0x08000000          # CREATE_NO_WINDOW
+    _WSL_NAMES = frozenset(("wsl", "wsl.exe"))
+
+    def _is_wsl(argv) -> bool:
+        if isinstance(argv, (str, bytes)) or not argv:
+            return False
+        head = argv[0]
+        head = head.decode(errors="replace") if isinstance(head, bytes) else str(head)
+        return os.path.basename(head).lower() in _WSL_NAMES
+
     class _QuietPopen(_subprocess.Popen):
         """subprocess.Popen, but the child never gets a console window."""
 
         def __init__(self, *args, **kwargs):
-            kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | _NO_WINDOW
+            flags = int(kwargs.get("creationflags") or 0)
+            argv = args[0] if args else kwargs.get("args")
+            if _is_wsl(argv):
+                # CREATE_NO_WINDOW still suppresses the window, and unlike
+                # DETACHED_PROCESS it leaves wsl.exe able to speak.
+                flags |= _WSL_EXE
+            else:
+                flags |= _NO_WINDOW
+            kwargs["creationflags"] = flags
             super().__init__(*args, **kwargs)
 
     if _subprocess.Popen.__name__ != "_QuietPopen":

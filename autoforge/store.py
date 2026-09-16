@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import functools
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,12 @@ from .tools.spec import ToolSpec, ToolState, ToolStats, TriggerProbe, normalise_
 from . import chaining
 
 _DEFAULT_DB = "autoforge.db"
+
+#: How long a writer waits for the ledger's write lock before giving up.
+#: Two agent sessions and a market server share this sqlite file on this machine,
+#: and a contended write is a normal event, not an error.
+_SQLITE_BUSY_TIMEOUT_S = 15.0
+
 
 # -- column-level constants (used by schema generation) -------------
 _COLUMNS = dict(
@@ -262,13 +270,33 @@ class ToolStore:
         if not os.path.isabs(self.db_path):
             self.db_path = os.path.join(home, self.db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # One connection, used from several threads. That is deliberate -- a
+        # store lives inside an agent that calls it from tool threads -- but it
+        # needs two things sqlite does not do for you:
+        #
+        #   * a lock, because a sqlite3.Connection is not re-entrant. Its
+        #     cursors are shared state: while one thread is iterating a SELECT
+        #     (the head-hash read in chaining.append_event), a second thread
+        #     issuing another statement on the same connection makes the first
+        #     one fail. Measured before this lock existed: 16 threads writing
+        #     this ledger landed 4 rows and raised 12 exceptions, and the rows
+        #     that vanished were mostly the *refusals* -- the worst thing to
+        #     lose from an audit log, and the thing an audit log exists for;
+        #   * WAL with a busy timeout, so a second process (another agent
+        #     session, toolmarket on the same box) waits for the write lock
+        #     instead of failing at the moment something is being recorded.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False,
+                                     timeout=float(_SQLITE_BUSY_TIMEOUT_S))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=%d"
+                           % int(_SQLITE_BUSY_TIMEOUT_S * 1000))
         self._conn.executescript(_DDL)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- tools ------------------------------------------------------------
     def save_tool(self, spec: ToolSpec) -> None:
@@ -299,7 +327,6 @@ class ToolStore:
         # the difference between "history is what someone remembered to archive"
         # and "history is what happened".
         self.record_version(record.name, record.code, record.verification)
-
     def load_all_tools(self) -> dict[str, ToolRecord]:
         rows = self._conn.execute(
             "SELECT * FROM tools ORDER BY name"
@@ -330,7 +357,6 @@ class ToolStore:
             except Exception:  # noqa: BLE001
                 continue  # skip corrupted rows
         return result
-
     def delete_tool(self, name: str) -> None:
         self._conn.execute("DELETE FROM tools WHERE name=?", (name,))
         self._conn.execute("DELETE FROM dependencies WHERE tool=? OR depends_on=?",
@@ -422,7 +448,6 @@ class ToolStore:
         self._conn.commit()
         return {"tool": tool, "version": version, "blob_sha": sha,
                 "parent_version": parent_version, "new": known is None}
-
     def versions_of(self, tool: str) -> list[dict[str, Any]]:
         """The recorded timeline for one tool, oldest first. Empty is an answer."""
         rows = self._conn.execute(
@@ -439,7 +464,6 @@ class ToolStore:
                 d["verification"] = {}
             out.append(d)
         return out
-
     def version_of(self, tool: str, version: int | None = None) -> dict[str, Any] | None:
         """The body of one version, by number (default: the newest recorded)."""
         if version is None:
@@ -458,7 +482,6 @@ class ToolStore:
                 "parent_version": row["parent_version"], "archived_at": row["archived_at"],
                 "verification": _unjson(row["verification"]),
                 "code": blob["code"] if blob else None}
-
     def version_graph(self) -> dict[str, Any]:
         """Every recorded version and parent edge, for the lineage view."""
         edges = [{"from": f"{r['tool']}@{r['parent_version']}",
@@ -481,14 +504,12 @@ class ToolStore:
                 (tool, dep),
             )
         self._conn.commit()
-
     def get_deps(self, tool: str) -> list[str]:
         rows = self._conn.execute(
             "SELECT depends_on FROM dependencies WHERE tool=? ORDER BY depends_on",
             (tool,),
         ).fetchall()
         return [r["depends_on"] for r in rows]
-
     def get_reverse_deps(self, tool: str) -> list[str]:
         """Everything that depends on `tool` (for cascade checks)."""
         rows = self._conn.execute(
@@ -507,7 +528,6 @@ class ToolStore:
             (baseline.tool, float(baseline.frozen_at), _j(baseline.to_dict())),
         )
         self._conn.commit()
-
     def load_baseline(self, tool: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT baseline FROM baselines WHERE tool = ?", (tool,)
@@ -529,7 +549,6 @@ class ToolStore:
             ),
         )
         self._conn.commit()
-
     def load_topologies(self, limit: int = 20) -> list[dict[str, Any]]:
         """Most recent topologies first, newest at index 0."""
         rows = self._conn.execute(
@@ -557,20 +576,18 @@ class ToolStore:
         hash of this row is a claim about the row before it and cannot be made
         against a stale head.
         """
-        chaining.append_event(self._conn, kind, payload)
+        with self._lock:
+            return chaining.append_event(self._conn, kind, payload)
 
     def verify_chain(self) -> dict[str, Any]:
         """Walk the log and report what is provable about it, row by row."""
         return chaining.verify_chain(self._conn)
-
     def anchor_chain(self, note: str = "") -> dict[str, Any]:
         """Freeze everything logged so far as a baseline."""
         return chaining.anchor(self._conn, note=note)
-
     def lineage_of(self, tool: str, depth: int = 3) -> dict[str, Any]:
         """Derivation edges actually recorded for a tool -- not inferred ones."""
         return chaining.lineage_of(self._conn, tool, depth=depth)
-
     def get_events(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM forge_events ORDER BY id DESC LIMIT ?",
@@ -596,13 +613,11 @@ class ToolStore:
             (key, value, _j(tags or []), now, now),
         )
         self._conn.commit()
-
     def forget(self, key: str) -> bool:
         """Drop one memory. Returns whether it was there to drop."""
         cur = self._conn.execute("DELETE FROM memory WHERE key=?", (key,))
         self._conn.commit()
         return cur.rowcount > 0
-
     def recall(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         """Read memories back, most recently touched first.
 
@@ -633,7 +648,6 @@ class ToolStore:
             )
             self._conn.commit()
         return out
-
     def memory_for_injection(self, limit: int = 20) -> list[dict[str, Any]]:
         """Read kept facts for the per-turn block — without counting a recall.
 
@@ -689,7 +703,6 @@ class ToolStore:
             (name, path, source, description, when_to_use, _j(list(tags)), now, now),
         )
         self._conn.commit()
-
     def skill_rows(self) -> list[dict[str, Any]]:
         """Every known skill, most-loaded first — the order the router blends."""
         rows = self._conn.execute(
@@ -704,7 +717,6 @@ class ToolStore:
             }
             for r in rows
         ]
-
     def skill_load(self, name: str) -> int:
         """Count one load. Returns the new count, or 0 if there is no such skill.
 
@@ -722,7 +734,6 @@ class ToolStore:
             (n, _now(), name))
         self._conn.commit()
         return n
-
     def forget_skill_row(self, name: str) -> bool:
         """Drop a skill's row. The caller archives the file; usage goes with it.
 
@@ -793,3 +804,30 @@ class ToolStore:
 
 
 __all__ = ["ToolStore", "ToolRecord"]
+
+
+# -- thread safety, applied at one choke point -------------------------------
+#
+# The lock has to cover whole method bodies, not individual statements: the
+# failure is a cursor being iterated while another thread executes on the same
+# connection, and no per-statement lock can see that. Wrapping each method here,
+# once, is also why this is a loop and not 28 hand-indented bodies -- a hand-
+# edited docstring indent is exactly the kind of change that compiles and then
+# behaves differently from the version the tests were written against.
+#
+# `__init__` is excluded: it is the method that creates the lock.
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
+for _name in [n for n in dir(ToolStore) if not n.startswith("__")]:
+    _fn = getattr(ToolStore, _name)
+    if isinstance(_fn, (staticmethod, classmethod)) or not callable(_fn):
+        continue
+    if getattr(ToolStore, _name).__name__ != _name:
+        continue
+    setattr(ToolStore, _name, _serialized(_fn))

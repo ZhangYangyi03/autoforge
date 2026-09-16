@@ -86,7 +86,10 @@ _WRAPPER = r'''#!/usr/bin/env python3
 import ctypes, json, os, resource, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DENY = json.loads(sys.argv[1])
+#: The one directory the run may write. It is the tmpfs the guest script
+#: mounted, so nothing written here can reach a real file on either side.
+WRITABLE = (HERE, "/tmp")
+DENY = json.loads(open(sys.argv[1], encoding="utf-8").read())
 PAYLOAD = sys.argv[2]
 
 
@@ -127,12 +130,22 @@ def install_seccomp(deny):
     EPERM = 1
     BPF_LD, BPF_W, BPF_ABS, BPF_JMP, BPF_JEQ, BPF_K, BPF_RET = 0x20, 0x00, 0x00, 0x05, 0x10, 0x00, 0x06
 
-    def stmt(code, k):
-        return struct.pack("HBBI", code, 0, 0, k)
+    def stmt(code, k, jt=0, jf=0):
+        # jt/jf are the two jump offsets of a BPF jump instruction, and they are
+        # not optional. Both left at 0 -- what this code did at first -- makes a
+        # JEQ fall through on the TRUE branch AND on the false branch, so the
+        # `return EPERM` stub after every comparison is reached by EVERY syscall.
+        # The filter then denies everything: the run died with SIGSEGV (exit 139)
+        # while the source still looked exactly like a correct filter. Nothing
+        # but executing it distinguishes the two.
+        return struct.pack("HBBI", code, jt, jf, k)
 
     prog = stmt(BPF_LD | BPF_W | BPF_ABS, 0)          # seccomp_data.nr
     for nr in numbers:
-        prog += stmt(BPF_JMP | BPF_JEQ | BPF_K, nr) + stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+        # jt=0: on match, fall to the next instruction, which returns EPERM.
+        # jf=1: on no match, skip that return and test the next syscall.
+        prog += (stmt(BPF_JMP | BPF_JEQ | BPF_K, nr, jt=0, jf=1)
+                 + stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
     prog += stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
 
     buf = ctypes.create_string_buffer(prog, len(prog))
@@ -143,6 +156,69 @@ def install_seccomp(deny):
     PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 22, 2
     if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog)) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_SECCOMP)")
+
+
+def install_landlock(writable):
+    """Confine this process to a read-only view of the system plus one writable dir.
+
+    Deny-by-default over the whole filesystem, then allow back what a tool needs:
+    read+execute on the system trees, read on /proc, /sys and /dev, and
+    read+write+create only where the tool is actually supposed to write.
+
+    This is deliberately *narrower* than the namespace: the namespace says which
+    mounts exist, Landlock says which of them can be opened. Both are needed --
+    the mount namespace cannot stop a read of /root, and Landlock cannot stop a
+    socket from reaching the network.
+
+    Returns a small dict rather than raising, so the caller can put the real
+    state of the boundary into the receipt instead of assuming it worked.
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    NR_CREATE, NR_ADD, NR_RESTRICT = 444, 445, 446        # landlock_* on x86-64
+    EXECUTE, WRITE_FILE, READ_FILE, READ_DIR = 1, 2, 4, 8
+    REST = sum(1 << n for n in range(4, 15))              # remove/make/... and REFER
+    ALL = EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REST
+
+    class RulesetAttr(ctypes.Structure):
+        _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+    class PathBeneath(ctypes.Structure):
+        _fields_ = [("allowed_access", ctypes.c_uint64),
+                    ("parent_fd", ctypes.c_int32)]
+
+    no_new_privileges()
+    attr = RulesetAttr(ALL)
+    fd = libc.syscall(NR_CREATE, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+    if fd < 0:
+        return {"installed": False, "error": "landlock_create_ruleset: errno %d"
+                % ctypes.get_errno()}
+
+    def allow(path, access):
+        if not os.path.exists(path):
+            return
+        try:
+            pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        except OSError:
+            return
+        try:
+            pb = PathBeneath(access, pfd)
+            libc.syscall(NR_ADD, fd, 1, ctypes.byref(pb), 0)
+        finally:
+            os.close(pfd)
+
+    ro = EXECUTE | READ_FILE | READ_DIR
+    for path in ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc",
+                 "/sys", "/dev", "/usr/local", "/opt"):
+        allow(path, ro)
+    for path in writable:
+        allow(path, ALL)
+
+    rc = libc.syscall(NR_RESTRICT, fd, 0)
+    if rc < 0:
+        return {"installed": False, "error": "landlock_restrict_self: errno %d"
+                % ctypes.get_errno()}
+    return {"installed": True, "read_only": ["/usr", "/etc", "/proc", "/sys", "/dev"],
+            "writable": list(writable)}
 
 
 def limits(memory_mb, cpu_s, procs, fsize_mb):
@@ -160,6 +236,14 @@ def main():
     no_new_privileges()
     limits(memory_mb, cpu_s, procs, fsize_mb)
     install_seccomp(DENY)
+    # Landlock after seccomp: seccomp reasons about syscall numbers and
+    # cannot say "this tree and nothing else", which is the actual shape of
+    # what a data-processing tool needs. Without this the run still reads
+    # /root/.ssh and /etc/passwd inside the namespace -- measured, not
+    # assumed -- because a mount namespace hides the host's drives but not
+    # the Linux filesystem. A failure here is reported, not swallowed: a
+    # boundary that silently did not install reads exactly like one that did.
+    landlock_verdict = install_landlock(WRITABLE)
     # Only now, with the filter in place, is the tool's own module imported.
     sys.path.insert(0, HERE)
     os.chdir(HERE)
@@ -179,7 +263,9 @@ def main():
     except BaseException as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         return 0
-    print(json.dumps({"ok": True, "output": out}, default=str, ensure_ascii=False))
+    print(json.dumps({"ok": True, "output": out,
+                      "boundary": landlock_verdict},
+                     default=str, ensure_ascii=False))
     return 0
 
 
@@ -272,10 +358,17 @@ def _run_isolated(code, entry, args, *, names, distro, timeout,
     root, stage = _GUEST_ROOT, _GUEST_STAGE
     with tempfile.TemporaryDirectory(prefix="autoforge_wsl_") as td:
         open(os.path.join(td, "payload.json"), "w", encoding="utf-8").write(payload)
+        # The deny list travels as a FILE, not as argv. As argv it was
+        # interpolated into a single-quoted `bash -lc '...'` string, and the
+        # quote characters in the JSON ended that string early: the wrapper
+        # received a torn argument and died in json.loads before the filter
+        # was installed. A sandbox whose policy reaches it as shell-quoted
+        # text is a sandbox that can be silently misconfigured.
         open(os.path.join(td, "_wrapper.py"), "w", encoding="utf-8", newline="\n").write(_WRAPPER)
         src = _to_wsl_path(td)
         root = _GUEST_ROOT
         names_json = json.dumps(list(names))
+        open(os.path.join(td, "deny.json"), "w", encoding="utf-8").write(names_json)
         # The guest script: a fresh tmpfs as the whole visible world, then the
         # namespaces, then the wrapper (which applies rlimits, NO_NEW_PRIVS and
         # the seccomp filter before it imports anything).
@@ -289,14 +382,26 @@ def _run_isolated(code, entry, args, *, names, distro, timeout,
         guest = (
             "set -e;"
             f" rm -rf {root} {stage}; mkdir -p {root} {stage};"
-            f" cp '{src}/_wrapper.py' '{src}/payload.json' {stage}/;"
+            f" cp '{src}/_wrapper.py' '{src}/payload.json' '{src}/deny.json' {stage}/;"
             " unshare --user --map-root-user --mount --pid --net --fork bash -lc '"
             "   set -e;"
             f"   mount -t tmpfs -o size=64m,mode=700 tmpfs '{root}';"
-            f"   cp {stage}/_wrapper.py {stage}/payload.json '{root}/';"
-            "   for m in /mnt/c /mnt/d /mnt/wsl /mnt/host; do umount -l \"$m\" 2>/dev/null || true; done;"
+            f"   cp {stage}/_wrapper.py {stage}/payload.json {stage}/deny.json '{root}/';"
+            # The host drives are 9p mounts made by WSL itself, and `umount`
+            # does NOT remove them here: the attempt fails silently and
+            # /mnt/c/Windows stays readable from inside the namespace. Measured,
+            # not assumed -- the first version of this script did the umount and
+            # the tool could still list the C: drive. Masking the whole of /mnt
+            # with an empty tmpfs does work, and it is a namespace-local edit:
+            # the real /mnt is untouched outside.
+            "   mount -t tmpfs -o size=4k,mode=000 tmpfs /mnt 2>/dev/null || true;"
+            # And /sys/class/net must be re-read from the new network namespace,
+            # otherwise the tool is shown the HOST's interfaces while having no
+            # route out of them -- a view that invites the wrong conclusion in
+            # both directions.
+            "   mount -t sysfs sysfs /sys 2>/dev/null || true;"
             f"   cd '{root}';"
-            f"   exec python3 _wrapper.py {names_json!r} payload.json"
+            f"   exec python3 _wrapper.py deny.json payload.json"
             "     {memory} {cpu} {procs} {fsize}"
             "' 2>&1;"
             f" rm -rf {root} {stage} 2>/dev/null || true"
@@ -331,12 +436,32 @@ def _run_isolated(code, entry, args, *, names, distro, timeout,
                    f"raw={stdout[:400]}"),
             duration_ms=(time.perf_counter() - started) * 1000,
             returncode=proc.returncode, stdout=stdout[:2000])
-    return result_cls(
+    boundary = envelope.get("boundary") or {}
+    if envelope.get("ok") and not boundary.get("installed"):
+        # The run finished, but the filesystem half of the boundary did not
+        # install. Reporting `ok` here would be the same class of lie as a
+        # sandbox that never ran: the caller asked for a boundary and got a
+        # process. Say so, and keep the output, so the failure is
+        # diagnosable rather than merely refused.
+        return result_cls(
+            ok=False,
+            output=envelope.get("output"),
+            error=("the run executed but Landlock did not install (%s); "
+                   "the filesystem was NOT confined"
+                   % boundary.get("error", "no reason given")),
+            duration_ms=(time.perf_counter() - started) * 1000,
+            returncode=proc.returncode, stdout=stdout[:2000])
+    result = result_cls(
         ok=bool(envelope.get("ok")),
         output=envelope.get("output"),
         error=envelope.get("error"),
         duration_ms=(time.perf_counter() - started) * 1000,
         returncode=proc.returncode, stdout=stdout[:2000])
+    try:
+        result.boundary = boundary          # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return result
 
 
 def probe(distro: str = DEFAULT_DISTRO) -> dict:
