@@ -528,6 +528,8 @@ BUILTIN_SCOPES: dict[str, str] = {
     "remember": "local_write",
     "recall": "read_only",
     "forget": "local_write",
+    # Obligations. The three readers touch nothing; opening, noting, ending
+    # and re-focusing one write the mission table in the agent's own store.
     "mission_open": "local_write",
     "mission_note": "local_write",
     "mission_close": "local_write",
