@@ -522,6 +522,7 @@ BUILTIN_SCOPES: dict[str, str] = {
     "skill_forget": "local_write",
     # Self-modification writes the agent's own policy, prompt or store.
     "amend_self": "local_write",
+    "import_package": "system",
     "set_autonomy": "local_write",
     "retire_tool": "local_write",
     # Spawning and designing write nothing themselves; whatever the child then
@@ -836,6 +837,7 @@ class ForgeAgent:
         self._tool_design_team()
         self._tool_amend()
         self._tool_autonomy()
+        self._tool_source()
         self._tool_list()
         self._tool_evaluate()
         self._tool_gaps()
@@ -852,6 +854,124 @@ class ForgeAgent:
         self._tool_browser()
         self._tool_vision()
         self._tool_code()
+
+    def _import_package(self, path: str) -> str:
+        """Install edited source into the running process, mid-turn.
+
+        The gap this closes is narrow and specific. `amend_self` rewrites the
+        system prompt in memory and dies with the process. Editing agent.py
+        persists but needs a restart. Neither one is *hot*: there was no path
+        from "the code on disk changed" to "the process I am running in is
+        executing it". This is that path, and it exists because the alternative
+        -- restart and lose the conversation -- is the reason a live agent
+        would rather describe a fix than make one.
+
+        What happens, in order, and why each step is there:
+
+          1. the edit stays on disk; nothing is imported from the working tree,
+             so a half-saved file cannot be installed by accident;
+          2. the tree is COPIED to a staging directory outside the repo, and the
+             copy is what gets reloaded. An install that fails there tells you
+             the edit is wrong; an install that fails in the live tree tells you
+             the agent is now broken;
+          3. the staged agent.py is hashed and that exact byte-content is the
+             tree that is installed -- the check is what stops "I verified one
+             thing and shipped another";
+          4. if any module raises while being re-executed, every module's
+             namespace is restored from the snapshot taken before the reload
+             started. `importlib.reload` writes into the live namespace, so
+             without that a syntax error halfway through leaves a process that
+             is neither the old version nor the new one;
+          5. the live agent's class is swapped in place, so the object the run
+             loop already holds now dispatches to the new code, and its meta
+             tools are re-registered so a method the edit added is reachable by
+             the model.
+
+        The loop that is already executing resumes in the old frame: new code
+        takes effect at the next dispatch through this object, not mid-statement.
+        That limit is real and is reported rather than hidden.
+        """
+        if not self.policy.may_modify_own_prompt:
+            return ("Denied by autonomy policy: may_modify_own_prompt is off, "
+                    "and this is a modification of the code that runs me.")
+        repo = path or self._source_root()
+        if not repo or not os.path.isdir(repo):
+            return (f"No source tree to import from: {repo!r}. Point me at the "
+                    "repository that contains the autoforge package.")
+        repo = os.path.abspath(repo)
+
+        # Absolute, not relative: this function is compiled into its own
+        # namespace by the registry, where a relative import has no parent
+        # package to resolve against -- `from .. import x` dies with
+        # "attempted relative import beyond top-level package".
+        import importlib
+        engine = importlib.import_module(
+            (self.__class__.__module__.split(".")[0] or "autoforge")
+            + ".package_hot_reload")
+        import shutil
+        import tempfile
+
+        src_pkg = os.path.join(repo, "autoforge")
+        if not os.path.isfile(os.path.join(src_pkg, "agent.py")):
+            return f"{repo} does not look like the repository: no autoforge/agent.py in it."
+
+        # The staging copy is where the edit is proved. It is placed next to
+        # nothing the running process imported, so the import that follows is
+        # not served out of __pycache__ for the live tree -- an edit that never
+        # took effect is the one failure this whole file exists to prevent, and
+        # a stale .pyc looks exactly like success.
+        live_hash = engine.sha256_file(os.path.join(src_pkg, "agent.py"))
+        # Where THIS process really imported from: the class's own module file,
+        # not the instance (an instance has no __file__ -- reading one off it
+        # silently yields "" and makes the report claim a tree it never saw).
+        live_file = ""
+        try:
+            import sys as _sys
+            live_file = getattr(_sys.modules.get(type(self).__module__), "__file__", "") or ""
+        except Exception:                                     # noqa: BLE001
+            live_file = ""
+        live_base = os.path.dirname(os.path.dirname(os.path.abspath(live_file))) if live_file else ""
+        same_tree = os.path.normcase(live_base) == os.path.normcase(repo)
+        stage = os.path.join(tempfile.gettempdir(), "autoforge_hotstage")
+        if os.path.isdir(stage):
+            shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        shutil.copytree(src_pkg, os.path.join(stage, "autoforge"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.bak*"))
+        staged_agent = os.path.join(stage, "autoforge", "agent.py")
+        sha = engine.sha256_file(staged_agent)
+        report_prologue = (
+            "source tree: %s\n"
+            "staged copy: %s   sha256 %s\n"
+            "the copy is the tree that is installed, so what was hashed is what "
+            "runs.%s" % (
+                repo, stage, sha[:16],
+                "" if same_tree else
+                "\nNOTE: the running process was imported from %s, a different\n"
+                "tree from the one being installed; the installation still lands\n"
+                "in this process, but the two trees now differ on disk." % live_base,
+            ))
+
+        rep = engine.install(stage, check_sha=sha)
+
+        if rep["failed"]:
+            what = rep["failed"][0]
+            return ("Import refused, nothing installed. %s: %s. "
+                    "The process is unchanged (snapshot restored:%s)."
+                    % (what[0], what[1].splitlines()[0][:200], rep["rolled_back"]))
+        head = (report_prologue + "\nInstalled %d module(s) in %.2fs; %s."
+                % (len(rep["reloaded"]), rep.get("elapsed_s", 0),
+                   rep["swap_error"] or "no live object to swap"))
+        if rep.get("tools_added"):
+            head += " New tools reachable now: " + ", ".join(rep["tools_added"]) + "."
+        head += (" The turn in flight finishes in the old frame; the next call "
+                 "is the new code.")
+        return head
+
+    def _source_root(self) -> str:
+        """Where the agent's own source lives, worked out from this module."""
+        here = os.path.abspath(__file__)
+        return os.path.dirname(os.path.dirname(here))
 
     def _add(self, spec: ToolSpec) -> None:
         # Say what this tool touches, so a switched-off freedom has something to
@@ -1749,6 +1869,29 @@ class ForgeAgent:
                 "rationale": {"type": "string", "description": "WHY you are changing yourself"},
             }, "required": ["target", "new_value", "rationale"]},
             fn=amend_self, source="builtin", tags=["meta"],
+        ))
+
+    def _tool_source(self) -> None:
+        def import_package(path: str = "") -> str:
+            return self._import_package(path)
+
+        self._add(ToolSpec(
+            name="import_package",
+            description=(
+                "Reload your own source into the process you are already running "
+                "in, so an edit to your code takes effect without a restart. "
+                "Edits must already be on disk. The code is staged and tested in "
+                "a copy outside the repository first, and any failure leaves you "
+                "running exactly as you were."
+            ),
+            parameters={"type": "object", "properties": {
+                "path": {
+                    "type": "string",
+                    "description": ("repository that contains the autoforge package; "
+                                    "empty = the tree this agent was imported from"),
+                },
+            }, "required": []},
+            fn=import_package, source="builtin", tags=["meta", "self-modification"],
         ))
 
     def _tool_autonomy(self) -> None:

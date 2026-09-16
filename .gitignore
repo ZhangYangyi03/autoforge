@@ -14,3 +14,14 @@ build/
 *.db-wal
 autoforge_tools/
 note.txt
+
+# Backup files left by in-place edits (self_source_tentacle and by hand).
+# Twelve of them were sitting untracked in the tree; eleven of those were
+# stale copies of agent.py, which is exactly the kind of file a later session
+# mistakes for the real one.
+*.bak
+*.bak2
+*.bak_*
+*.pre-*.bak
+*.tentacle.bak
+bash.exe.stackdump
