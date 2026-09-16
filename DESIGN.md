@@ -75,3 +75,47 @@ registry 持有 schema 列表，新工具下一轮即可用。prompt caching 的
 | Voyager | 有 skill 库和入库验证，但检索不看执行效果 |
 | Tea/ATLASS | 会造工具，但触发问题未解、退化无检测 |
 | **autoforge** | **造得出 + 触得发 + 用不坏 —— 三段闭环** |
+
+## 2.6 The two planes: what is built, what is designed
+
+Written after the containment work landed, so that the line between the two is
+in the repo rather than in a conversation.
+
+System plane — BUILT and measured on this host
+  * `forge/containment.py` — a Windows Job Object around every forged run:
+    memory cap, process cap, CPU cap, and KILL_ON_JOB_CLOSE so a detached
+    grandchild cannot outlive the answer. Five measurements in
+    `tests/test_containment.py`; the A/B against the uncontained path is the
+    one that justifies the module.
+  * `forge/manifest.py` — the declaration, before the run: intent, and the
+    four numbers. Refused past the ceiling before any code executes, and
+    reconciled against the kernel's own accounting afterwards.
+  * `Sandbox.accounting` carries peak bytes / CPU / processes on the result,
+    so "declared 64 MB, peaked 71 MB" is a fact and not a review note.
+
+System plane — DESIGNED only, and labelled as such
+  * seccomp-bpf and Landlock on the Linux side (WSL2, Ubuntu-22.04 present).
+    Windows has no seccomp; the WFP filter that could enforce `network: False`
+    is not reachable from this process, which is why that field is recorded,
+    measured and reported as NOT enforced rather than quietly trusted.
+  * a Linux filesystem namespace. There is none on the Windows side and the
+    honest report says `isolated_from_host: False`.
+
+Network plane — BUILT
+  * `mcp.py` — MCP client, both transports: stdio, and Streamable HTTP with
+    SSE framing (protocol 2024-11-05).
+  * zero-copy outbound works here: `socket.sendfile` uses TransmitFile, 3 MB
+    over loopback in 44 ms.
+
+Network plane — DESIGNED, P0 first
+  * P0 — a `/mcp` endpoint on toolmarket, Streamable HTTP, so the 21 existing
+    routes become tools the client above already knows how to call. The
+    client exists; only the server half is missing. toolmarket is a shared
+    service, so the board is read before it is touched.
+  * P1 — SSE instead of polling: `/events` and `evolve/async` completing into
+    a stream rather than a `/tasks/{id}` poll.
+  * P2 — agent-to-agent: keep `bus.py`'s NDJSON for durable, cross-session
+    traffic; add a loopback length-prefixed frame channel for low latency.
+  * Not designed here, on purpose: a TCP stack, an HTTP stack, epoll, io_uring.
+    The kernel and uvicorn have those, and on Windows the equivalent is IOCP,
+    which `asyncio`'s ProactorEventLoop already is.

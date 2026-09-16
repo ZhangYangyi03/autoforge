@@ -128,6 +128,12 @@ class SandboxResult:
     duration_ms: float = 0.0
     returncode: int | None = None
     stderr: str = ""
+    #: What the kernel charged this run -- peak bytes, CPU, processes launched.
+    #: Empty on the uncontained path, where nothing is measuring. It travels on
+    #: the result rather than being read back from the job afterwards because
+    #: the job is closed by then (KILL_ON_JOB_CLOSE), and because a result that
+    #: can be read by anything is worth more than a handle that must be.
+    accounting: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -156,6 +162,17 @@ class Sandbox:
     #: of them would mean touching every call site to say the same thing. Set
     #: it for the span of a run and clear it after.
     abort_check: Callable[[], bool] | None = None
+    #: OS-level containment -- a Job Object on Windows, rlimits on POSIX. On by
+    #: default where the kernel API exists, because the agent's own reach being
+    #: bounded is the point, not an option. `contain=False` is the old path:
+    #: process + timeout + environment, which bounds blast radius and nothing
+    #: else -- a tool that detaches a grandchild outlives the run.
+    contain: bool = field(default_factory=lambda: os.name == "nt")
+    #: The three numbers the job enforces. Read by `reach()` so the report
+    #: states limits that were set, not limits that were intended.
+    memory_mb: int = 512
+    max_processes: int = 8
+    cpu_seconds: float = 30.0
 
     def effective_env(self) -> dict[str, str]:
         """The environment forged code actually gets — not the agent's own.
@@ -195,6 +212,17 @@ class Sandbox:
     def run(self, code: str, entry: str, args: dict[str, Any] | None = None) -> SandboxResult:
         if self.runner is not None:
             return self.runner(code, entry, args or {})
+        if self.contain:
+            # Imported here, not at module scope: the containment module talks
+            # to the kernel, and a Sandbox with contain=False must not require
+            # that API to exist.
+            from .containment import contained_runner
+
+            return contained_runner(
+                self, memory_mb=self.memory_mb,
+                max_processes=self.max_processes,
+                cpu_seconds=self.cpu_seconds,
+            )(code, entry, args or {})
 
         import time
 
@@ -208,7 +236,14 @@ class Sandbox:
             ensure_ascii=False,
         )
 
-        with tempfile.TemporaryDirectory(prefix="autoforge_") as td:
+        # ignore_cleanup_errors: a forged tool that detaches a grandchild
+        # leaves that child sitting in this directory with its cwd held
+        # open, and Windows then refuses the rmdir. Without this the
+        # PermissionError escapes `run` -- a tool that followed the rules
+        # and returned correctly is reported as a crash of the sandbox.
+        # Found by A/B against the contained path, not by reading.
+        with tempfile.TemporaryDirectory(
+                prefix="autoforge_", ignore_cleanup_errors=True) as td:
             runner_path = os.path.join(td, "_runner.py")
             with open(runner_path, "w", encoding="utf-8") as fh:
                 fh.write(_RUNNER)
@@ -357,10 +392,31 @@ class Sandbox:
             "env": f"{len(self.env_allow)} allow-listed vars, not the full environment",
             "restrict_builtins": self.restrict_builtins,
             "timeout_s": self.timeout,
+            "contained": self._containment_line(),
         }
         if probe:
             facts["probe"] = self._probe()
         return facts
+
+    def _containment_line(self) -> str:
+        """What the kernel is holding the run to, said in the same breath as reach.
+
+        Kept next to `isolated_from_host: False` on purpose. Containment does
+        not make the host disappear -- a contained run still reads the files
+        this user can read. What changes is that it cannot take the machine's
+        memory, its process table, or its CPU with it, and it cannot leave a
+        detached grandchild behind to outlive the answer it gave.
+        """
+        if self.runner is not None:
+            return "a custom runner (its limits are the runner's business)"
+        if not self.contain:
+            return ("none -- process + timeout only; a detached grandchild "
+                    "outlives the run")
+        if os.name == "nt":
+            return (f"job object: {self.memory_mb} MB memory cap, "
+                    f"{self.max_processes} processes, {self.cpu_seconds}s CPU, "
+                    "kill-on-close reaches the whole tree")
+        return "rlimits (address space, CPU, file size, open files)"
 
     def _probe(self) -> dict[str, Any]:
         """A real round-trip, so `reach` can be checked instead of believed.

@@ -26,6 +26,8 @@ from ..tools.spec import ToolSpec, ToolState, normalise_parameters
 from .adversary import AdversarialGate, AdversarialReport
 from .fuzzer import RobustnessResult, run_robustness_checks
 from .sandbox import Sandbox
+from .manifest import (apply_declaration, intent_for, reconcile,
+                       CapabilityManifest)
 
 
 @dataclass
@@ -41,6 +43,11 @@ class VerificationReport:
     tool: str
     passed: bool
     checks: list[CheckResult] = field(default_factory=list)
+    #: The manifest the run was admitted under, and what was measured against
+    #: it. A verdict of "passed" says the checks went green; this says what
+    #: the tool was allowed to be while it did.
+    declaration: CapabilityManifest | None = None
+    reconciliation: dict[str, Any] | None = None
 
     @property
     def failed(self) -> list[CheckResult]:
@@ -58,6 +65,8 @@ class VerificationReport:
                 {"name": c.name, "passed": c.passed, "detail": c.detail, "evidence": c.evidence}
                 for c in self.checks
             ],
+            "declaration": self.declaration.to_dict() if self.declaration else None,
+            "reconciliation": self.reconciliation,
         }
 
 
@@ -88,6 +97,12 @@ class ToolVerifier:
     ) -> None:
         self.llm = llm
         self.sandbox = sandbox or Sandbox()
+        #: Built at construction, before a line of any tool runs, so the
+        #: declaration cannot be written afterwards to match what happened.
+        self.declaration: CapabilityManifest = intent_for(name=None)
+        #: Peak bytes / CPU / processes the kernel charged the last run, filled
+        #: by check_execution and reconciled into the report.
+        self.measurements: dict[str, Any] = {}
         self.run_execution_check = run_execution_check
         self.run_robustness_check = run_robustness_check
         self.run_adversarial_check = run_adversarial_check
@@ -148,6 +163,7 @@ class ToolVerifier:
 
         if args:
             result = self.sandbox.run(spec.code, spec.name, args)
+            self.measurements = dict(getattr(result, "accounting", None) or {})
             evidence = {
                 "sample_call": args,
                 "output": str(result.output)[:300],
@@ -309,6 +325,12 @@ class ToolVerifier:
         # preconditions rather than dying three frames deep.
         spec.parameters = normalise_parameters(spec.parameters)
 
+        # Declare, then run under the declaration. The ordering is the point:
+        # a manifest written after the fact is a description, and this one has
+        # to be a constraint to be worth anything.
+        self.declaration = intent_for(name=spec.name, code=spec.code,
+                                      description=getattr(spec, "description", "") or "")
+        self.sandbox = apply_declaration(self.sandbox, self.declaration)
         checks: list[CheckResult] = []
 
         if self.run_execution_check:
@@ -334,7 +356,13 @@ class ToolVerifier:
                 checks.append(self.check_negative(spec, negatives[0]))
 
         passed = bool(checks) and all(c.passed for c in checks)
-        return VerificationReport(spec.name, passed, checks)
+        report = VerificationReport(spec.name, passed, checks)
+        report.declaration = self.declaration
+        # Declared against measured. A finding here does not fail the battery
+        # -- see manifest.reconcile for why -- it goes into the record so that
+        # a *pattern* of under-declaration is visible later.
+        report.reconciliation = reconcile(self.declaration, None, self.measurements)
+        return report
 
 
 def register_if_verified(
