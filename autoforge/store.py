@@ -299,34 +299,106 @@ class ToolStore:
             self._conn.close()
 
     # -- tools ------------------------------------------------------------
-    def save_tool(self, spec: ToolSpec) -> None:
-        record = ToolRecord.from_spec(spec)
-        self._conn.execute(
-            """INSERT OR REPLACE INTO tools
-            (name, version, description, parameters, code, entry,
-             source, generator, probes, effect_signature, state,
-             tags, cost_hint, created_at, verification, stats,
-             old_versions, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                record.name, record.version, record.description,
-                _j(record.parameters), record.code, record.entry,
-                record.source, record.generator, _j([
-                    {"query": p.query, "expect": p.expect, "negative_query": p.negative_query}
-                    for p in record.probes
-                ]),
-                record.effect_signature, record.state.value,
-                _j(record.tags), record.cost_hint,
-                record.created_at, _j(record.verification),
-                _j(record.stats), _j(record.old_versions),
-                record.updated_at,
-            ),
-        )
-        self._conn.commit()
+    def tools_written_by_other_sessions(self) -> list[str]:
+        """Tool names in this store written by a session that is not mine.
+
+        The rows carry no writer column, and adding one is a schema change to a
+        file two sessions and a market server are reading right now. So the
+        reader identifies a foreign row by its version-history stamps: every save
+        archives a version stamped with the writer's session (see
+        `record_version`), which is a name this process can compare against its
+        own without altering the table.
+
+        Best-effort and read-only, like every other report here: a store whose
+        schema predates those stamps returns an empty list rather than guessing,
+        because a wrong attribution sends the agent to the wrong peer. Measured
+        caveat, stated rather than buried: the version timeline does not carry a
+        session stamp today, so on this store the answer is an empty list -- the
+        query is the half that works, and it is honest about having nothing to
+        read. That is why the *enforcement* lives in `save_tool` (a live lane,
+        which is enforced) and this is only a report.
+        """
+        mine = os.environ.get("AUTOFORGE_SESSION") or ""
+        out: set[str] = set()
+        try:
+            rows = self._conn.execute(
+                "SELECT tool, session FROM version_timeline ORDER BY id").fetchall()
+        except sqlite3.Error:
+            return []
+        for row in rows:
+            who = str(row["session"] or "")
+            if who and mine and who != mine:
+                out.add(str(row["tool"]))
+        return sorted(out)
+
+    def save_tool(self, spec: ToolSpec, *, allow_overwrite: bool = False) -> None:
+        """Record a tool.
+
+        Refuses, by default, to replace a tool another session just wrote. The
+        insert below is an INSERT OR REPLACE, so before this check a second
+        session forging a colliding name silently destroyed the first session's
+        tool: no error, no row left to compare against, and the ledger recording
+        two forges that each looked successful. Two sessions on this machine
+        independently forged the same tools more than once (see
+        docs/DUPLICATE_NEEDS.md), so this is not a hypothetical collision.
+
+        A refusal is a refusal, not a merge: choosing between two tools with the
+        same name is a judgement about behaviour, and the place to make it is
+        `evolve_tool` or an explicit `allow_overwrite=True` by a session that has
+        looked at both. Hiding that choice inside an INSERT was the bug.
+        """
+        from .lanes import LaneRefused, LaneMissing, claim, release, resource
+
+        held = None
+        if not allow_overwrite:
+            try:
+                held = claim(resource(f"tool/{spec.name}"), name="store",
+                             why=f"forging tool {spec.name}")
+            except LaneRefused as exc:
+                raise ValueError(
+                    f"refusing to save tool {spec.name!r}: {exc}. A different "
+                    f"session is writing that name; evolve it or save under "
+                    f"another name") from exc
+            except LaneMissing:
+                held = None
+            except Exception:                # noqa: BLE001 - a lane disabled on
+                held = None                  # this host must not block saving
+        try:
+            record = ToolRecord.from_spec(spec)
+            self._conn.execute(
+                """INSERT OR REPLACE INTO tools
+                (name, version, description, parameters, code, entry,
+                 source, generator, probes, effect_signature, state,
+                 tags, cost_hint, created_at, verification, stats,
+                 old_versions, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record.name, record.version, record.description,
+                    _j(record.parameters), record.code, record.entry,
+                    record.source, record.generator, _j([
+                        {"query": p.query, "expect": p.expect, "negative_query": p.negative_query}
+                        for p in record.probes
+                    ]),
+                    record.effect_signature, record.state.value,
+                    _j(record.tags), record.cost_hint,
+                    record.created_at, _j(record.verification),
+                    _j(record.stats), _j(record.old_versions),
+                    record.updated_at,
+                ),
+            )
+            self._conn.commit()
+        finally:
+            if held is not None:
+                # Released immediately: this lane marks the write in progress,
+                # not the tool's existence forever. A permanent claim would make
+                # the first forge of a name block every later evolve of it, which
+                # is the opposite of what the lane is for.
+                release(held.target, session=held.session)
         # Every save is a version. Doing it here rather than at each call site is
         # the difference between "history is what someone remembered to archive"
         # and "history is what happened".
         self.record_version(record.name, record.code, record.verification)
+
     def load_all_tools(self) -> dict[str, ToolRecord]:
         rows = self._conn.execute(
             "SELECT * FROM tools ORDER BY name"

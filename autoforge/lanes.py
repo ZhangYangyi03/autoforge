@@ -184,12 +184,42 @@ class Lane:
 
 
 def lane_file(target: str, root: str | os.PathLike[str] | None = None) -> Path:
-    """One file per target path, named by a digest so any path is representable."""
+    """One file per target, named by a digest so any target is representable."""
     import hashlib
     root = Path(root) if root is not None else lanes_dir()
-    key = hashlib.sha256(os.path.normcase(os.path.abspath(target)).encode(
-        "utf-8", "replace")).hexdigest()[:16]
+    key = hashlib.sha256(_normalise(target).encode("utf-8", "replace")).hexdigest()[:16]
     return root / f"{key}.json"
+
+
+#: A lane target that is not a file. Forging writes no .py to disk -- a tool's
+#: source goes into a row of the shared sqlite store -- and the collision that
+#: matters there is not two writers on a file but two sessions claiming the same
+#: NAME. `save_tool` is an INSERT OR REPLACE, so the second writer does not fail
+#: loudly: it silently replaces a peer's freshly forged tool with its own. A
+#: path-shaped target would be a lie about what is being held, so the target is
+#: named instead, and nothing here ever touches the filesystem with it.
+RESOURCE_PREFIX = "resource://"
+
+
+def resource(name: str) -> str:
+    """The lane target for a shared named thing: a tool row, a market entry."""
+    name = str(name).strip()
+    if not name:
+        raise ValueError("a resource lane needs a name")
+    return RESOURCE_PREFIX + name
+
+
+def _normalise(target: str) -> str:
+    """Paths are normalised (case, separators, ..); resource names are not.
+
+    A resource name is an opaque key: lowercasing it would merge two tools whose
+    names differ only in case, which is a silent aliasing bug of exactly the kind
+    this module exists to stop.
+    """
+    target = str(target)
+    if target.startswith(RESOURCE_PREFIX):
+        return target
+    return os.path.normcase(os.path.abspath(target))
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -261,7 +291,12 @@ def is_free(target: str, scratch: tuple[str, ...] | None = None) -> bool:
     indistinguishable from no guard, which is why the first test written for this
     module asserts a project file is *not* free.
     """
-    p = os.path.normcase(os.path.abspath(target))
+    target = str(target)
+    if target.startswith(RESOURCE_PREFIX):
+        # A named resource is shared by definition: there is no scratch copy of
+        # "the tool called read_magic_value".
+        return False
+    p = _normalise(target)
     roots = free_prefixes() if scratch is None else tuple(
         os.path.normcase(os.path.abspath(s)) + os.sep for s in scratch)
     return any(p.startswith(pre) for pre in roots)
@@ -286,7 +321,9 @@ def claim(target: str, *, session: str = "", name: str = "autoforge",
     reason and leaves the reason on record.
     """
     session = session or own_session_id()
-    target = os.path.abspath(target)
+    target = str(target)
+    if not target.startswith(RESOURCE_PREFIX):
+        target = os.path.abspath(target)
     if is_free(target, scratch):
         return Lane(target=target, session=session, name=name, pid=os.getpid(),
                     taken_at=time.time(), expires_at=time.time() + ttl_s, why=why)
@@ -327,7 +364,10 @@ def break_lane(target: str, *, session: str = "", name: str = "autoforge",
     renewed = list(lane.renewed) if lane else []
     if lane is not None:
         renewed.append(now)
-    out = Lane(target=os.path.abspath(target), session=session or own_session_id(),
+    target = str(target)
+    out = Lane(target=(target if target.startswith(RESOURCE_PREFIX)
+                       else os.path.abspath(target)),
+               session=session or own_session_id(),
                name=name, pid=os.getpid(), taken_at=now,
                expires_at=now + ttl_s, why=why, renewed=renewed)
     _write_atomic(lane_file(out.target, root), out.to_dict())

@@ -250,3 +250,106 @@ class TestTheEnvironmentCannotLieToIt:
     def test_lane_root_follows_the_bus_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AUTOFORGE_BUS_DIR", str(tmp_path))
         assert lanes.lanes_dir() == tmp_path / "lanes"
+
+
+
+    """Forging writes no .py to disk -- it writes a ROW, into a shared store.
+
+    So the collision on this path is not two writers on a file, it is two
+    sessions claiming the same tool NAME. `save_tool` is an INSERT OR REPLACE,
+    which means the second writer does not fail loudly: it destroys the first
+    session's freshly forged tool and leaves two ledger entries that both look
+    like successes. Measured on the demand side: 20 clusters of one job under
+    different tool names, 145 more retried under one name
+    (docs/DUPLICATE_NEEDS.md). The lane is what makes the second writer stop.
+    """
+
+    def _spec(self, name, desc):
+        from autoforge.tools.spec import ToolSpec, ToolState
+
+        def _fn():
+            return 1
+
+        return ToolSpec(name=name, description=desc,
+                        parameters={"type": "object", "properties": {}},
+                        fn=_fn, code=f"def {name}():\n    return 1\n",
+                        source="forged", state=ToolState.ACTIVE)
+
+    def test_a_live_lane_on_the_name_refuses_the_save(self, store, monkeypatch):
+        # The claim goes through the ENV, not through `root=store`: `save_tool`
+        # resolves lanes from AUTOFORGE_BUS_DIR, and pointing the two sides at
+        # different directories is exactly how this test passed while proving
+        # nothing the first time it was written.
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        monkeypatch.setenv("AUTOFORGE_SESSION", "session-A")
+        st = ToolStore(os.path.join(store, "t.db"))
+        try:
+            st.save_tool(self._spec("reader", "A's reader"))
+            lanes.claim(lanes.resource("tool/reader"), session="session-B",
+                        name="peer", why="forging same name")
+            with pytest.raises(ValueError) as exc:
+                st.save_tool(self._spec("reader", "B's reader"))
+            assert "peer" in str(exc.value)
+            # And the original survived -- a refusal that still replaced the row
+            # would be the same silent loss with an exception attached.
+            assert st.load_all_tools()["reader"].description == "A's reader"
+        finally:
+            st.close()
+
+    def test_my_own_saves_are_never_blocked(self, store, monkeypatch):
+        """Re-entry, or `evolve_tool` would be unable to save its own winner."""
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        monkeypatch.setenv("AUTOFORGE_SESSION", "session-A")
+        st = ToolStore(os.path.join(store, "t.db"))
+        try:
+            st.save_tool(self._spec("reader", "v1"))
+            st.save_tool(self._spec("reader", "v2"))
+            assert st.load_all_tools()["reader"].description == "v2"
+        finally:
+            st.close()
+
+    def test_the_lane_is_released_after_the_write(self, store, monkeypatch):
+        """The lane marks the write in progress, not the name forever.
+
+        A permanent claim would make the first forge of a name block every later
+        save of it -- evolve included -- which is the opposite of the intent.
+        """
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        monkeypatch.setenv("AUTOFORGE_SESSION", "session-A")
+        st = ToolStore(os.path.join(store, "t.db"))
+        try:
+            st.save_tool(self._spec("reader", "v1"))
+            again = ToolStore(os.path.join(store, "other.db"))
+            try:
+                again.save_tool(self._spec("reader", "v2"))
+            finally:
+                again.close()
+        finally:
+            st.close()
+
+    def test_a_broken_lane_store_does_not_block_saving(self, store, monkeypatch):
+        """A lane module that cannot load must not make the shelf read-only."""
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        st = ToolStore(os.path.join(store, "t.db"))
+        try:
+            st.save_tool(self._spec("reader", "v1"))
+        finally:
+            st.close()
+
+    def test_overwrite_is_available_but_has_to_be_asked_for(self, store, monkeypatch):
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        monkeypatch.setenv("AUTOFORGE_SESSION", "session-A")
+        st = ToolStore(os.path.join(store, "t.db"))
+        try:
+            st.save_tool(self._spec("reader", "v1"))
+            lanes.claim(lanes.resource("tool/reader"), session="session-B",
+                        name="peer", why="forging same name")
+            st.save_tool(self._spec("reader", "forced"), allow_overwrite=True)
+            assert st.load_all_tools()["reader"].description == "forced"
+        finally:
+            st.close()
