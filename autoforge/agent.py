@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .autonomy.policy import FULL_FREEDOM, AutonomyPolicy
+from .autonomy.controls import plane as control_plane
 from .autonomy.selfmod import Amendment, SelfModifier
 from .autonomy.spawn import ShareMode, Spawner
 from .autonomy.roles import brief_for_node, role_brief
@@ -61,6 +62,7 @@ from .forge.sandbox import Sandbox
 from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .mcp import MCPClient, MCPHub
+from .mission import MissionError, MissionStore
 from .ecosystem import merged_servers, read_all as ecosystem_read_all
 from .browser import (
     Browser,
@@ -115,6 +117,9 @@ You can:
 - my_history     — your ledger: past forges, runs, self-changes
 - remember       — keep a fact across sessions; kept facts are put in front of
   you on every turn, so do not recall what is already listed above
+- mission_*      — what I owe: mission_open records a request before it is a
+  task, mission_note moves it, mission_close ends it with a note. Kept
+  apart from remember (facts) and schedule (times) on purpose.
 - skill_view     — load a procedure I wrote down earlier; skill_write saves
   one. Facts go in memory, how-to goes in a skill.
 - mcp_servers    — tools from processes whose code I cannot read; configured,
@@ -208,6 +213,25 @@ Freedoms, when compared to another agent's:
 - Do not claim a limit you have. Do not invent a freedom you lack. The measured
   self-report above is the arbiter, recomputed every turn.
 
+
+What I owe comes before what I am asked (the fix for "many tasks, and the total
+one is gone"):
+- The MISSION block above is on disk, not in the conversation. It is the answer to
+  "what am I for", and it is printed into every request on purpose: an agent that
+  forgot to look somewhere will not look, so the thing most easily lost is put
+  where it cannot be missed.
+- A request from the operator is a mission before it is a task. Call mission_open
+  with it, then work. Do not silently let request N+1 replace request N -- that
+  replacement, never announced, is exactly the failure this block exists for.
+- If the request is a sub-part of something already open, pass parent=<id>. A
+  sub-mission is how one obligation is worked in pieces without the whole
+  disappearing.
+- When the work moves, mission_note it. When it is finished or abandoned,
+  mission_close it with a note. An open mission that is done is a lie the next
+  session inherits, and a closed one that was never done is ruled out by the note.
+- At the start of a run, read the MISSION block before planning. If it disagrees
+  with what you were about to do, say so in one line -- the block is the record of
+  what the operator asked for, and the conversation is the newer thing.
 
 Answering beats evidence-gathering (operator rule, 2026-09-15: three times in a row
 he interrupted a 'simple' task because it took minutes):
@@ -701,9 +725,21 @@ class ForgeAgent:
         # the next session loaded the tool back as `active`.
         self.registry.on_state_change = self._persist_tool_state
 
+        # The control plane: one object that remembers what the gate, the
+        # declaration check and the self-modifier decided. Built before both of
+        # the things it observes, because it is handed to them at construction.
+        # With no `store` on this agent its ledger is None and every receipt is
+        # counted but not written -- and `summary()` says `writing: False` rather
+        # than reporting an audit trail that does not exist.
+        # The process-wide plane, not a private one: the registry resolves its
+        # own recorder through `plane()`, and a second plane here would put the
+        # gate receipts somewhere nothing reads while `summary()` reported a run
+        # that had none.
+        self.controls = control_plane(agent="autoforge")
         self.selfmod = SelfModifier(
             require_rationale=self.policy.require_change_rationale,
             log_all=self.policy.log_all_changes,
+            controls=self.controls,
         )
         self.verifier = ToolVerifier(
             self.llm, sandbox=self.sandbox,
@@ -827,6 +863,14 @@ class ForgeAgent:
         if self.store is not None and self.policy.log_all_changes:
             self.store.log_event("agent_init", {"policy": self.policy.to_dict()})
 
+        # Binding lives in `attach_store`, not here. `store` is a class attribute
+        # assigned from outside after construction -- the CLI does it, and a bare
+        # test agent never has one -- so a bind at this point binds to nothing and
+        # looks identical from the inside. A second copy of the bind lived here
+        # for one edit too long, which is the argument in miniature for one entry
+        # point rather than two: two attempts to bind is how one of them quietly
+        # stops being the live one.
+
     # ------------------------------------------------------------------
     # meta tools — the agent's handle on itself
     # ------------------------------------------------------------------
@@ -851,6 +895,7 @@ class ForgeAgent:
         self._tool_cpu()
         self._tool_notify()
         self._tool_schedule()
+        self._tool_mission()
         self._tool_browser()
         self._tool_vision()
         self._tool_code()
@@ -2331,6 +2376,51 @@ class ForgeAgent:
             fn=forget, source="builtin", tags=["meta"], effect_signature="local_write",
         ))
 
+    def _mission_lines(self) -> list[str]:
+        """What I owe, carried into every request next to what I know.
+
+        Separate from `_memory_lines` and separate from `schedule`. A kept fact
+        is knowledge, a schedule entry is a time, and a mission is an
+        obligation: the operator's actual complaint was that a session with
+        many tasks forgets the one sentence that says what they are all for.
+        That sentence belongs in the prompt, not in a table the agent has to
+        remember to read -- an agent that has forgotten to look somewhere will
+        not look.
+
+        Degrades to a single honest line when there is no store, so a stock run
+        without persistence says so instead of printing an empty section that
+        reads as "I owe nothing".
+        """
+        if self.store is None:
+            return ["MISSION — what I owe: no store this session, so nothing "
+                    "survives a restart and nothing is tracked."]
+        try:
+            store = self._mission_store()
+            return store.report().splitlines()
+        except Exception as exc:  # a broken mission table must not eat the turn
+            return [f"MISSION — unreadable: {exc}"]
+
+    def _mission_store(self) -> MissionStore:
+        """One MissionStore per agent, sharing the tool store's sqlite file.
+
+        Same file on purpose: a mission and the ledger entry for the work it
+        caused then cannot drift apart, and a restore of one restores the
+        other.
+        """
+        st = getattr(self, "_missions", None)
+        if st is None:
+            # Borrow the tool store's connection rather than opening a second
+            # one on the same file. Two connections on one sqlite file is how
+            # the first version of this died: schema setup under a live writer
+            # raised `database is locked`, and the mission list became exactly
+            # as unreadable as the thing it was built to stop losing.
+            st = MissionStore(
+                getattr(self.store, "db_path", None),
+                conn=getattr(self.store, "_conn", None),
+            )
+            self._missions = st
+        return st
+
     def _memory_lines(self) -> list[str]:
         """The facts the agent chose to keep, carried into every request.
 
@@ -2832,6 +2922,193 @@ class ForgeAgent:
             ),
             parameters={"type": "object", "properties": {}},
             fn=notify_channels, source="builtin", tags=["meta", "comms"],
+        ))
+
+    def _tool_mission(self) -> None:
+        """The mission tools: recording what is owed, so it stops being lost.
+
+        Why these are separate from `schedule_*`: a schedule entry answers
+        "when does this happen", and the operator's complaint was not about
+        timing. It was that after many tasks, the total one had scrolled out of
+        view and been replaced by the most recent request. A conversation
+        cannot hold that; a row can, and the row is printed into every prompt
+        (see `_mission_lines`). The tool's job is to keep that row true.
+
+        Two refusals are the whole design: a mission with open sub-missions
+        cannot be closed, and a closed mission cannot be reopened. Both exist
+        so that "still owed" and "finished" can never be made to look alike
+        after the fact.
+        """
+
+        def _store() -> MissionStore:
+            if self.store is None:
+                raise MissionError(
+                    "no store this session, so a mission would not survive the "
+                    "turn it was recorded in")
+            return self._mission_store()
+
+        def mission_open(text: str, parent: int = 0, next_step: str = "",
+                         focus: bool = False) -> str:
+            try:
+                m = _store().open(text, parent=parent, next_step=next_step)
+            except MissionError as exc:
+                return f"Not recorded. {exc}"
+            if focus or not _store().focused():
+                _store().set_focus(m.id)
+            self._record("mission_open", {"id": m.id, "parent": m.parent})
+            return (f"M{m.id} is now open, and rides in every prompt from here.\n"
+                    f"  {m.text}\n"
+                    f"Update it with mission_note as the work moves, and end it "
+                    f"with mission_close -- an open mission that is finished is "
+                    f"a lie the next session inherits.")
+
+        def mission_list(status: str = "open") -> str:
+            try:
+                st = _store()
+            except MissionError as exc:
+                return str(exc)
+            if status in ("all", ""):
+                rows = st.all(None)
+                return "\n".join(m.line(0) for m in rows) or "No missions at all yet."
+            rows = st.tree(status) if status == "open" else st.all(status)
+            if not rows:
+                return f"No {status} missions."
+            focus = st.focused()
+            out = []
+            for m in rows:
+                out.append(m.line(0) + ("  <== focus" if m.id == focus else ""))
+                out += [c.line(1) for c in getattr(m, "children", [])]
+            return "\n".join(out)
+
+        def mission_note(mid: int, note: str = "", next_step: str | None = None) -> str:
+            try:
+                m = _store().note(mid, note=note, next_step=next_step)
+            except MissionError as exc:
+                return str(exc)
+            self._record("mission_note", {"id": mid})
+            return f"Recorded on M{m.id}. It reads:\n{m.line(0)}"
+
+        def mission_show(mid: int) -> str:
+            try:
+                st = _store()
+                m = st.get(mid)
+            except MissionError as exc:
+                return str(exc)
+            lines = [m.line(0)]
+            for c in st.all(None):
+                if c.parent == m.id:
+                    lines.append(c.line(1))
+            lines.append("  history (newest first):")
+            for h in st.history(mid):
+                when = time.strftime("%m-%d %H:%M", time.localtime(h["at"]))
+                lines.append(f"    {when} {h['kind']}: {h['note'][:100]}")
+            return "\n".join(lines)
+
+        def mission_close(mid: int, note: str = "", ok: bool = True) -> str:
+            try:
+                m = _store().finish(mid, note=note, ok=ok)
+            except MissionError as exc:
+                return f"Not closed. {exc}"
+            self._record("mission_close", {"id": mid, "ok": ok})
+            return (f"M{m.id} is {m.status} and stays on the record -- closing is "
+                    f"not deleting, so \"I stopped tracking it\" can never be "
+                    f"mistaken for \"it is done\".")
+
+        def mission_focus(mid: int) -> str:
+            try:
+                return _store().set_focus(mid)
+            except MissionError as exc:
+                return str(exc)
+
+        self._add(ToolSpec(
+            name="mission_open",
+            description=(
+                "Record something you owe, so it stops being lost when the next "
+                "request arrives. This is not a schedule entry (that is for "
+                "timing) and not a kept fact (that is knowledge): it is the "
+                "answer to 'what am I for right now'. A request from the "
+                "operator is a mission before it is a task -- open it first, "
+                "then work. Pass parent to hang a sub-task under an existing "
+                "mission instead of replacing it."
+            ),
+            parameters={"type": "object", "properties": {
+                "text": {"type": "string", "description": "what is owed, one sentence"},
+                "parent": {"type": "integer",
+                           "description": "mission id this belongs under (0 = a new root)"},
+                "next_step": {"type": "string", "description": "the very next action"},
+                "focus": {"type": "boolean",
+                          "description": "make this the focus even if one is set"},
+            }, "required": ["text"]},
+            fn=mission_open, source="builtin", tags=["meta", "mission"],
+            effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="mission_list",
+            description=(
+                "Read what is owed: open missions with their sub-missions, or "
+                "the closed ones as history. Call this instead of trusting that "
+                "you remember the whole list -- the answer is on disk, not in "
+                "the conversation."
+            ),
+            parameters={"type": "object", "properties": {
+                "status": {"type": "string",
+                           "description": "open (default) | done | dropped | all"},
+            }},
+            fn=mission_list, source="builtin", tags=["meta", "mission"],
+        ))
+        self._add(ToolSpec(
+            name="mission_note",
+            description=(
+                "Update one mission: a note on where it got to, and/or its next "
+                "step. Use it when the work moves, so the mission in the prompt "
+                "describes now rather than when it was opened."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer", "description": "mission id, e.g. 3 for M3"},
+                "note": {"type": "string", "description": "what happened"},
+                "next_step": {"type": "string", "description": "the next action"},
+            }, "required": ["mid"]},
+            fn=mission_note, source="builtin", tags=["meta", "mission"],
+            effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="mission_show",
+            description=(
+                "One mission in full: its line, its sub-missions, and its "
+                "history of openings, notes and closings."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer"},
+            }, "required": ["mid"]},
+            fn=mission_show, source="builtin", tags=["meta", "mission"],
+        ))
+        self._add(ToolSpec(
+            name="mission_close",
+            description=(
+                "End a mission, with a note saying what happened. Refuses while "
+                "sub-missions are still open, because closing a parent early "
+                "hides work that is still owed. Pass ok=false to drop one. The "
+                "mission is never deleted: the note is what lets a later run "
+                "tell a finished mission from an abandoned one."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer"},
+                "note": {"type": "string", "description": "what happened"},
+                "ok": {"type": "boolean", "description": "true=done, false=dropped"},
+            }, "required": ["mid"]},
+            fn=mission_close, source="builtin", tags=["meta", "mission"],
+            effect_signature="local_write",
+        ))
+        self._add(ToolSpec(
+            name="mission_focus",
+            description=(
+                "Mark which open mission this session is on, so the prompt says "
+                "so. Pass 0 to clear it."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer"},
+            }, "required": ["mid"]},
+            fn=mission_focus, source="builtin", tags=["meta", "mission"],
         ))
 
     def _tool_schedule(self) -> None:
@@ -4000,6 +4277,35 @@ class ForgeAgent:
                 continue
         self._persisted_tool_count = loaded
 
+    def attach_store(self, store: Any) -> None:
+        """Give this agent its ledger, and point every recorder at it.
+
+        One entry point instead of an attribute assignment, because there are
+        four objects here that each decide something and each needs the same
+        connection to write its receipt: the control plane (gate, declaration,
+        self-modification), the egress gateway (outbound admissions), and the
+        registry, which is handed the plane rather than the connection so that
+        its lazy lookup finds the same one. Binding three of the four and leaving
+        the fourth is how a run ends up with an audit trail that is complete
+        except for what the operator actually refused.
+
+        Failures are reported, not raised: an agent with a store that could not
+        be bound still works, and every summary in it says `writing: False` rather
+        than claiming records nobody wrote.
+        """
+        self.store = store
+        conn = getattr(store, "_conn", None)
+        if conn is None:
+            return
+        self.controls.bind(conn)
+        self.registry.controls = self.controls
+        try:
+            from . import egress
+
+            egress.bind(conn)
+        except Exception:                                     # noqa: BLE001
+            pass
+
     def _persist_tool_state(self, spec: ToolSpec) -> None:
         """Write a tool's new state through to the store.
 
@@ -4114,8 +4420,13 @@ class ForgeAgent:
         # counts and `kept` carries recall counters -- both move between turns,
         # and putting either one early invalidates the whole block behind it.
         # Stable first (prompt, host facts, skill menu), volatile last.
+        # The mission block rides next to `kept`: same reason it is bounded,
+        # different question. `kept` is what I know, this is what I owe --
+        # and it is the one that gets lost first when a session has many
+        # requests, because every new request looks like a new prompt.
+        mission = self._mission_lines()
         out = (f"{self.system_prompt}\n\n{facts}\n\n{menu}\n\n"
-               f"{kept}\n\n{self._self_report()}")
+               f"{kept}\n\n{mission}\n\n{self._self_report()}")
         if self.role_brief:
             # Last, and separately labelled: a role narrows what this run is
             # for, and the point of putting it after the general instructions is

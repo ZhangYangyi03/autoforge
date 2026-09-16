@@ -15,6 +15,48 @@ Design pillars
 Freedom is the default; verification lets you *trust* what the freedom produced.
 """
 
+import os
+
+# No console window for any child this *process* starts.
+#
+# The agent is started by a scheduled task through pythonw, which owns no
+# console. Windows gives a console-subsystem child of a console-less parent a
+# *fresh* console -- a visible window on the operator's desktop -- so every
+# subprocess that starts without a flag flashes one. Measured on 2026-09-16 by
+# enumerating visible top-level windows by pid: flags=0 yields one visible
+# PseudoConsoleWindow, DETACHED_PROCESS none. `GetConsoleWindow()` is the wrong
+# probe for this: it reports non-zero even under DETACHED_PROCESS, where no
+# window is shown.
+#
+# Done here, at import, rather than at each call site: the spawns live in
+# webtools (the search worker), market, schedule, cpu/safety and mcp, and a rule
+# that has to be remembered at five places is a rule that will be missing from
+# the sixth. Nothing in this package does `from subprocess import Popen`, so the
+# class is always looked up on the module and one assignment covers all of them.
+#
+# AUTOFORGE_KEEP_CONSOLE=1 opts out, for the case where a visible window is what
+# is wanted -- debugging a child that dies before it can log.
+if os.name == "nt" and not os.environ.get("AUTOFORGE_KEEP_CONSOLE"):
+    import subprocess as _subprocess
+
+    #: DETACHED_PROCESS: no console is created at all. CREATE_NO_WINDOW is the
+    #: other candidate and was rejected here -- it suppresses the window but
+    #: still creates a console, which lands in this process's job object and
+    #: changes `processes_launched` for the containment accounting.
+    _NO_WINDOW = 0x00000008
+
+    class _QuietPopen(_subprocess.Popen):
+        """subprocess.Popen, but the child never gets a console window."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | _NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    if _subprocess.Popen.__name__ != "_QuietPopen":
+        _subprocess.Popen = _QuietPopen
+        globals()["_QuietPopen"] = _QuietPopen
+
+
 # One source of truth: pyproject.toml. Hardcoding the version here meant the
 # package reported 0.2.0 while pyproject said 0.4.0 -- a number nobody would
 # notice was wrong until they quoted it. Read it from the installed metadata

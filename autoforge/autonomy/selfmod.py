@@ -67,10 +67,16 @@ class SelfModifier:
         require_rationale: bool = True,
         log_all: bool = True,
         veto: Callable[[Amendment], str | None] | None = None,
+        controls: Any = None,
     ) -> None:
         self.require_rationale = require_rationale
         self.log_all = log_all
         self.veto = veto
+        # Optional on purpose: this object is used in isolation by its own tests,
+        # and a recording hook that is required would make every one of them
+        # construct an audit chain to test a diff. `None` means "the in-memory
+        # list is the only record", which is what every caller got before.
+        self.controls = controls
         self.amendments: list[Amendment] = []
 
     def amend(
@@ -87,14 +93,23 @@ class SelfModifier:
 
         `target` is a label for the log. `attr`/`nested` locate the real
         attribute — left unset, `target` is used as the attribute name.
+
+        Four things can happen and all four are recorded: the change lands, the
+        rationale is missing, the value is unchanged, or the veto refuses. Every
+        exit goes through `_settle` rather than appending where it stands, which
+        is the only reason the *count of preconditions that ran* can be reported:
+        a guard that stops running is invisible in a log that only lists verdicts,
+        and "this was rejected" reads exactly the same whether one check looked at
+        it or none did.
         """
-        if self.require_rationale and not rationale.strip():
-            amend = Amendment(
-                target=target, rationale=rationale, before=None, after=new_value,
-                accepted=False, rejected_reason="rationale required but not provided",
-            )
-            self.amendments.append(amend)
-            return amend
+        checked = 0
+        if self.require_rationale:
+            checked += 1
+            if not rationale.strip():
+                return self._settle(Amendment(
+                    target=target, rationale=rationale, before=None, after=new_value,
+                    accepted=False, rejected_reason="rationale required but not provided",
+                ), checked)
 
         # Resolve the container that holds the attribute
         holder = host
@@ -108,22 +123,38 @@ class SelfModifier:
             target=target, rationale=rationale, before=before, after=new_value,
         )
 
+        checked += 1
         if amendment.is_noop():
             amendment.accepted = False
             amendment.rejected_reason = "no-op (value unchanged)"
-            self.amendments.append(amendment)
-            return amendment
+            return self._settle(amendment, checked)
 
         if self.veto is not None:
+            checked += 1
             reason = self.veto(amendment)
             if reason:
                 amendment.accepted = False
                 amendment.rejected_reason = reason
-                self.amendments.append(amendment)
-                return amendment
+                return self._settle(amendment, checked)
 
         setattr(holder, attr_name, new_value)
+        return self._settle(amendment, checked)
+
+    def _settle(self, amendment: Amendment, checked: int) -> Amendment:
+        """One exit for every verdict: keep it, and put it on the ledger.
+
+        The list is the object's own memory and dies with it; the ledger is what
+        the next session can read. Both are written, and neither is allowed to
+        fail the change: a self-modification that succeeded but could not be
+        logged has still happened, and refusing it afterwards would be a lie
+        about the state of the object.
+        """
         self.amendments.append(amendment)
+        if self.controls is not None:
+            try:
+                self.controls.amendment(amendment, checked=checked)
+            except Exception:                                # noqa: BLE001
+                pass
         return amendment
 
     # -- introspection ---------------------------------------------------

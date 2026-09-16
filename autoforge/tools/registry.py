@@ -64,6 +64,7 @@ class ToolRegistry:
         policy: Any = None,
         confirmer: Any = None,
         on_state_change: Callable[[ToolSpec], None] | None = None,
+        controls: Any = None,
     ) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self.min_calls_for_judgement = min_calls_for_judgement
@@ -78,6 +79,13 @@ class ToolRegistry:
         # exactly as it did before this existed.
         self.policy = policy
         self.confirmer = confirmer
+        # Where a gate decision goes so that it outlives the process. Optional,
+        # and defaulted lazily rather than imported at module scope: `registry`
+        # is imported by the sandbox's own tests, and reaching for the audit
+        # package from here on import would make a tool registry depend on
+        # sqlite. `None` means "use the process plane", which is itself inert
+        # until something binds a ledger to it.
+        self.controls = controls
         # Told whenever a tool's *state* moves, so a decision made here can
         # outlive the process. A registry alone persists nothing: it is a dict
         # of specs, and retire/quarantine/promote are memory writes. That was
@@ -93,6 +101,28 @@ class ToolRegistry:
         # this to include DRAFT so a tool can be tested before it is trusted.
         self.visible_states = visible_states or {ToolState.PROBATION, ToolState.ACTIVE}
         self._events: list[dict[str, Any]] = []
+
+    @property
+    def _plane(self) -> Any:
+        """The control plane, resolved on first use.
+
+        Not resolved in `__init__`: a registry built inside a fresh process --
+        which is every test -- would then import the audit layer whether or not
+        it ever gated anything. Lazy keeps the cost where the decision is.
+        """
+        if self.controls is not None:
+            return self.controls
+        from autoforge.autonomy.controls import plane
+
+        # Always the process plane, never a null one chosen by guessing from the
+        # environment: an unbound plane is already inert (it counts nothing,
+        # writes nothing, and says `writing: False`), and a registry that picked
+        # the null plane because an env var was absent would go on recording
+        # nothing after `bind()` had attached a ledger. Which one to use is a
+        # question about the ledger, and the plane can answer it; the registry
+        # cannot.
+        self.controls = plane()
+        return self.controls
 
     # -- registration -------------------------------------------------
     def register(self, spec: ToolSpec, *, replace: bool = True) -> ToolSpec:
@@ -225,6 +255,8 @@ class ToolRegistry:
             except Exception as exc:  # noqa: BLE001 - a broken confirmer must not run the tool
                 self._log("confirm", name, {"needed": needed, "outcome": "error",
                                             "error": f"{type(exc).__name__}: {exc}"})
+                self._plane.gate(tool=name, needed=needed, outcome="error",
+                                 question=question, error=f"{type(exc).__name__}: {exc}")
                 return ToolResult(
                     name, False, "",
                     error=(f"Denied: the confirmer raised {type(exc).__name__}: {exc}. "
@@ -234,6 +266,11 @@ class ToolRegistry:
 
         if answer is None:
             self._log("confirm", name, {"needed": needed, "outcome": "no_operator"})
+            # Recorded as a denial with its own outcome: a tool that did not run
+            # because nobody could answer looks exactly like a tool that ran and
+            # did nothing, and the ledger is where that difference has to survive.
+            self._plane.gate(tool=name, needed=needed, outcome="no_operator",
+                             question=question)
             return ToolResult(
                 name, False, "",
                 error=(f"Denied: {question} There is nobody to ask in this run "
@@ -245,6 +282,9 @@ class ToolRegistry:
 
         self._log("confirm", name,
                   {"needed": needed, "outcome": "confirmed" if answer else "refused"})
+        self._plane.gate(tool=name, needed=needed,
+                         outcome="confirmed" if answer else "refused",
+                         question=question)
         if answer:
             return None
         return ToolResult(

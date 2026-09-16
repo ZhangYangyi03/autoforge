@@ -52,6 +52,14 @@ EVENT_TYPES = (
     "tool_allow", "tool_deny",
     "credential_allow", "credential_deny",
     "limit_breached", "policy_alert",
+    # The control layer's own decisions: the autonomy gate, the declared
+    # envelope, and a change to the agent itself. Not dimension verdicts --
+    # they answer "was this allowed" about the machinery rather than about a
+    # file or a host -- which is why they carry dimension "policy" and why they
+    # are named here rather than folded into one of the ten above.
+    "gate_allow", "gate_deny",
+    "declaration_allow", "declaration_deny",
+    "selfmod_allow", "selfmod_deny",
     # not a dimension verdict: the two spellings for a decision that did not say
     # which question it was answering. Kept in the vocabulary so a reader sees
     # the ambiguity instead of an event type that looks authoritative.
@@ -160,6 +168,16 @@ def _rows(conn: sqlite3.Connection, since: float | None = None,
     fields live inside the JSON payload — a `LIKE` over that text would match a
     rule name inside a *reason* string and call it a different event.
     """
+    # `ToolStore`'s own DDL creates `forge_events` without the chain columns;
+    # `chaining.ensure_schema` adds them, idempotently, and every write path
+    # calls it. A *reader* did not, so "what was refused" raised `no such column:
+    # prev_hash` on a store where nothing had been written yet — the one case
+    # where the honest answer is "nothing", and the case that produced every
+    # first-run support question. Reading a chain that does not exist yet is not
+    # an error.
+    from autoforge import chaining
+
+    chaining.ensure_schema(conn)
     sql = ("SELECT id, timestamp, payload, prev_hash, payload_hash FROM forge_events"
            " WHERE kind = ? ORDER BY id")
     out = []

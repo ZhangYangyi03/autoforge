@@ -345,13 +345,11 @@ def _build_mode(cfg: dict, mode: str = "standard"):
     # The CLI's `forge` writes JSON artifacts by hand; the harness wants the
     # sealed tool to survive the session, so it gets a store.
     try:
-        agent.store = ToolStore(os.environ.get("AUTOFORGE_DB") or None)
-        # Bind the egress gateway to the same ledger as everything else, so an
-        # outbound admission is a row in the chain the operator already verifies
-        # -- rather than a second log with its own idea of what happened.
-        from . import egress
-
-        egress.bind(agent.store._conn)
+        # One call, so the store is never attached without the recorders that
+        # depend on it being attached -- the egress gateway and the control plane
+        # among them. `attach_store` is what binds those; assigning `agent.store`
+        # directly would leave every receipt counted and none written.
+        agent.attach_store(ToolStore(os.environ.get("AUTOFORGE_DB") or None))
     except Exception as exc:                                   # noqa: BLE001
         # A silent fallback here is indistinguishable from "this agent has no
         # memory", which is exactly how it reads from the inside. Print the

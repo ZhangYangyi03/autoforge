@@ -27,7 +27,24 @@ from .adversary import AdversarialGate, AdversarialReport
 from .fuzzer import RobustnessResult, run_robustness_checks
 from .sandbox import Sandbox
 from .manifest import (apply_declaration, intent_for, reconcile,
-                       CapabilityManifest)
+                       CapabilityManifest, ManifestRefused)
+
+
+def _plane():
+    """The process control plane, if the control layer is importable.
+
+    Guarded because `forge` is used by tools that do not need it, and a missing
+    recorder is not a reason to fail a verification battery. The plane, when it
+    exists, is inert until a ledger is bound to it — see autonomy/controls.py.
+    """
+    try:
+        from ..autonomy.controls import plane
+
+        return plane()
+    except Exception:                                        # noqa: BLE001
+        from ..autonomy.controls import null_plane
+
+        return null_plane
 
 
 @dataclass
@@ -330,6 +347,23 @@ class ToolVerifier:
         # to be a constraint to be worth anything.
         self.declaration = intent_for(name=spec.name, code=spec.code,
                                       description=getattr(spec, "description", "") or "")
+        # A declaration is admitted, or it is refused, and either way it is a row.
+        # `admit()` has existed since the manifest was written and nothing ever
+        # called it: the ceiling was computed and never asked, which is the
+        # difference between a budget and a decoration.
+        #
+        # The refusal is enforced *and* recorded, in that order of authority: the
+        # receipt is written first only because once `ManifestRefused` is raised
+        # there is no later frame in which to write it. The raise is not softened
+        # into a failed check — "refused before any code ran" is the promise the
+        # module makes in its own error message, and a verifier that ran the code
+        # anyway to be able to report on it would break exactly that promise.
+        try:
+            self.declaration.admit()
+        except ManifestRefused as exc:
+            _plane().declaration(self.declaration, source=spec.name, refused=str(exc))
+            raise
+        _plane().declaration(self.declaration, source=spec.name)
         self.sandbox = apply_declaration(self.sandbox, self.declaration)
         checks: list[CheckResult] = []
 
