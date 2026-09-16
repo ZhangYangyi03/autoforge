@@ -743,7 +743,14 @@ class ForgeAgent:
         # own recorder through `plane()`, and a second plane here would put the
         # gate receipts somewhere nothing reads while `summary()` reported a run
         # that had none.
-        self.controls = control_plane(agent="autoforge")
+        # No argument: `plane()` takes none, and the ControlPlane it returns
+        # already defaults agent="autoforge". The first version of this line
+        # passed agent="autoforge" and raised TypeError at construction, which
+        # took every test that builds a real agent down with it -- a
+        # construction-time failure in the object all the other tests need.
+        # Caught and fixed by the other session; recorded here because the bug
+        # was mine, and the next reader should not have to diff to learn that.
+        self.controls = control_plane()
         self.selfmod = SelfModifier(
             require_rationale=self.policy.require_change_rationale,
             log_all=self.policy.log_all_changes,

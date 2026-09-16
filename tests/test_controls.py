@@ -327,3 +327,56 @@ def test_two_threads_gating_at_once_do_not_lose_a_count(store, plane):
         t.join()
     assert len(rows(store, "gate_allow")) == 8
     assert chained(store).get("ok")
+
+class TestAnAgentCanBeBuilt:
+    """The construction-time regression, caught by the least clever test here.
+
+    Measured: the first version of `attach_store`'s counterpart in `__init__`
+    called `control_plane(agent="autoforge")`, but `plane()` takes no argument
+    and its `ControlPlane` already defaults the name. That raised TypeError at
+    construction -- and because 21 test files build a real `ForgeAgent` to get
+    at anything else, one wrong call in the constructor took 28 tests down and
+    looked like 28 unrelated failures.
+
+    The cheap test that would have caught it is this one: build the object the
+    other tests are standing on, with an explicit llm so nothing reaches the
+    network.
+    """
+
+    def test_forge_agent_constructs(self):
+        from autoforge.agent import ForgeAgent
+        from autoforge.autonomy.policy import FULL_FREEDOM
+
+        class _LLM:
+            def complete(self, *a, **k):        # pragma: no cover - never called
+                raise AssertionError("construction must not call the model")
+
+        agent = ForgeAgent(_LLM(), policy=FULL_FREEDOM)
+        assert agent.controls is not None
+        # The plane is process-wide, so a second agent resolves to the same
+        # object -- the property the registry's lazy lookup depends on.
+        other = ForgeAgent(_LLM(), policy=FULL_FREEDOM)
+        assert other.controls is agent.controls
+
+    def test_attaching_a_store_records_the_plane_binding(self, tmp_path):
+        """`attach_store` is the one entry point, and it must not raise.
+
+        A file, not ":memory:": `ToolStore` treats its path as a real path and
+        joins it against the home directory, so ":memory:" becomes a filename
+        and sqlite refuses it. Found by writing this test.
+        """
+        from autoforge.agent import ForgeAgent
+        from autoforge.autonomy.policy import FULL_FREEDOM
+
+        class _LLM:
+            def complete(self, *a, **k):        # pragma: no cover
+                raise AssertionError("construction must not call the model")
+
+        store = ToolStore(str(tmp_path / "attach.db"))
+        try:
+            agent = ForgeAgent(_LLM(), policy=FULL_FREEDOM)
+            agent.attach_store(store)              # must not raise
+            assert agent.store is store
+            assert agent.registry.controls is agent.controls
+        finally:
+            store.close()
