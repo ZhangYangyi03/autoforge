@@ -99,6 +99,21 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
             if value not in (None, ""):
                 src[field] = f"env {name}"
                 return value
+        # A credential field may live in the vault instead of the config file.
+        # This sits *between* the environment and the file, and the order is the
+        # point: a flag or a variable is a deliberate statement about this one
+        # run, while the file is the durable copy -- and where the two durable
+        # copies disagree, the vault is the one that was not sitting in plaintext
+        # in the same directory as the backups. `get_secret` returns the plaintext
+        # value only as a fallback, and the source is recorded either way, so
+        # `auto config` can still say where a key came from.
+        if field in _VAULTED:
+            from . import vault as _vault
+
+            value, where = _vault.get_secret(field, fallback=saved.get(field))
+            if where == "vault":
+                src[field] = "vault"
+                return value
         value = saved.get(field)
         if value not in (None, ""):
             # Just "config": the path is printed once in the header, and repeating
@@ -212,6 +227,14 @@ def _resolve_policy(args: argparse.Namespace, saved: dict, src: dict) -> tuple[s
     return "full", "default"
 
 
+#: Config fields that may be held in the vault rather than the file.
+#:
+#: Only the one that is actually plaintext in the file today. A longer list
+#: written speculatively would be a list of fields nobody has moved, and the
+#: next reader could not tell which of them the vault really holds.
+_VAULTED = frozenset({"api_key"})
+
+
 def _config(args: argparse.Namespace) -> dict:
     return _resolve(args)[0]
 
@@ -323,6 +346,12 @@ def _build_mode(cfg: dict, mode: str = "standard"):
     # sealed tool to survive the session, so it gets a store.
     try:
         agent.store = ToolStore(os.environ.get("AUTOFORGE_DB") or None)
+        # Bind the egress gateway to the same ledger as everything else, so an
+        # outbound admission is a row in the chain the operator already verifies
+        # -- rather than a second log with its own idea of what happened.
+        from . import egress
+
+        egress.bind(agent.store._conn)
     except Exception as exc:                                   # noqa: BLE001
         # A silent fallback here is indistinguishable from "this agent has no
         # memory", which is exactly how it reads from the inside. Print the

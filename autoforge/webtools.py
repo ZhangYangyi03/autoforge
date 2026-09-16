@@ -234,8 +234,17 @@ def safe_redirects(url: str, *, allow_private: bool = False) -> list[str]:
 
     seen: list[str] = []
     current = url
+    from . import egress
+
     for _ in range(MAX_REDIRECTS):
         seen.append(current)
+        # Per hop, not once up front. `safe_redirects` exists because a library
+        # following redirects checks exactly one URL -- the one a hostile page
+        # need not control -- and an egress check done only on the caller's URL
+        # has the identical hole. A refusal raises rather than returning a short
+        # chain: a caller that got back a partial chain would report "no
+        # redirects" for what was actually "the second hop was refused".
+        egress.admit(current, tool="webtools")
         response = requests.get(
             current, timeout=DEFAULT_TIMEOUT, allow_redirects=False,
             headers={"User-Agent": USER_AGENT},

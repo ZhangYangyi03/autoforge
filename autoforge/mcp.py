@@ -678,6 +678,19 @@ class MCPHttpClient:
         """
         import requests
 
+        # The one door out. An MCP server is arbitrary code at the far end of a
+        # URL the agent may have been handed, so the host is admitted before a
+        # socket is opened, and the verdict goes to the audit chain where
+        # `egress.coverage()` says it does. A refused host raises MCPError like
+        # every other failure here, because a caller catching GatewayDenied and
+        # one catching MCPError would be two error paths for one problem.
+        from . import egress
+
+        try:
+            egress.admit(self.config.url, tool="mcp:%s" % self.config.name)
+        except egress.GatewayDenied as exc:
+            raise MCPError(f"egress refused for server {self.config.name!r}: {exc}") from exc
+
         try:
             resp = requests.post(self.config.url, json=msg,
                                  headers=self._headers(), timeout=timeout, stream=True)
