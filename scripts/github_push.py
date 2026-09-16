@@ -74,31 +74,47 @@ def start_proxy(upstream: tuple[str, int], port: int = 8899):
                 except OSError:
                     pass
 
+    def handle(client):
+        """One connection, start to finish, on its own thread.
+
+        The first version did the CONNECT handshake inline in the accept loop,
+        and a single idle client -- git leaves one behind after a fetch -- parked
+        the loop inside recv() so no later connection was ever accepted. git
+        reported that as "Proxy CONNECT aborted", which reads like the proxy
+        refusing when in fact it had stopped listening. A handshake is a wait,
+        and a wait must not be on the accept path.
+        """
+        try:
+            client.settimeout(15)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            if not head.startswith(b"CONNECT"):
+                return
+            up = socket.create_connection(upstream, timeout=15)
+            client.settimeout(None)
+            client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            threading.Thread(target=pump, args=(client, up), daemon=True).start()
+            threading.Thread(target=pump, args=(up, client), daemon=True).start()
+        except OSError:
+            pass
+        finally:
+            if not head or not head.startswith(b"CONNECT"):
+                try:
+                    client.close()
+                except OSError:
+                    pass
+
     def serve(srv):
         while not stop.is_set():
             try:
                 client, _ = srv.accept()
             except OSError:
                 break
-            try:
-                head = b""
-                while b"\r\n\r\n" not in head:
-                    chunk = client.recv(4096)
-                    if not chunk:
-                        break
-                    head += chunk
-                if not head.startswith(b"CONNECT"):
-                    client.close()
-                    continue
-                up = socket.create_connection(upstream, timeout=15)
-                client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                threading.Thread(target=pump, args=(client, up), daemon=True).start()
-                threading.Thread(target=pump, args=(up, client), daemon=True).start()
-            except OSError:
-                try:
-                    client.close()
-                except OSError:
-                    pass
+            threading.Thread(target=handle, args=(client,), daemon=True).start()
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -124,10 +140,13 @@ def main() -> int:
     stop, port = start_proxy((ip, 443), a.port)
     G = ["git", "-c", "http.version=HTTP/1.1",
          "-c", "http.proxy=http://127.0.0.1:%d" % port]
+    local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=a.repo,
+                           capture_output=True, text=True).stdout.strip()
+    remote_sha, checked = "", False
     try:
         f = subprocess.run(G + ["fetch", a.remote], cwd=a.repo,
                            capture_output=True, text=True, timeout=90)
-        print("fetch rc", f.returncode, f.stderr.strip()[-160:])
+        print("fetch rc", f.returncode, f.stderr.strip()[-160:].replace("\n", " "))
         rc = 1
         for attempt in range(3):
             p = subprocess.run(G + ["push", a.remote, a.branch], cwd=a.repo,
@@ -138,17 +157,28 @@ def main() -> int:
             if rc == 0:
                 break
             time.sleep(4)
+
+        # Ask the remote, THROUGH THE PROXY, and ask before the proxy is shut
+        # down. The first version checked after stop.set(), so the comparison
+        # used a direct connection that this machine cannot make -- it timed
+        # out, returned an empty list, and the tool announced "NOT on the
+        # remote" for a commit that had in fact landed. A verification step
+        # that can fail for its own reasons is worse than none: it manufactures
+        # a false alarm and teaches the operator to ignore the real one.
+        ls = subprocess.run(G + ["ls-remote", a.remote, "refs/heads/" + a.branch],
+                            cwd=a.repo, capture_output=True, text=True, timeout=60)
+        remote_sha = ls.stdout.split()[0] if ls.stdout.split() else ""
+        checked = bool(remote_sha)
     finally:
         stop.set()
 
-    local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=a.repo,
-                           capture_output=True, text=True).stdout.strip()
-    remote = subprocess.run(["git", "ls-remote", a.remote, "refs/heads/" + a.branch],
-                            cwd=a.repo, capture_output=True, text=True).stdout.split()
-    remote_sha = remote[0] if remote else ""
-    same = local == remote_sha
     print("local  HEAD : %s" % local[:12])
-    print("remote %-5s: %s" % (a.branch, remote_sha[:12] or "(nothing)"))
+    print("remote %-5s: %s" % (a.branch, remote_sha[:12] or "(could not be read)"))
+    if not checked:
+        print("RESULT: UNKNOWN -- the remote could not be reached to confirm. "
+              "The push exit code above is not evidence either way.")
+        return 3
+    same = local == remote_sha
     print("RESULT: %s" % ("the commit is on the remote" if same else
                           "NOT on the remote -- the push did not land"))
     return 0 if same else 1
