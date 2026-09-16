@@ -678,7 +678,28 @@ def startup_check(bus: "Bus", session: str, *, name: str = "autoforge") -> str:
             f"{v.get('name') or k}({v.get('session_id') or k})"
             for k, v in others.items())
         parts.append(f"{len(others)} other live session(s): {who}")
-        parts.append("declare your lane before editing a shared file")
+        # Not "declare your lane before editing a shared file" -- that was the
+        # advisory line, and it is exactly the line that did not arrive in time
+        # for the two sessions that both wrote forge/wsl_isolation.py. What is
+        # reported now is concrete: which targets are actually held live, by
+        # whom and for how long. `autoforge/lanes.py` refuses the write when the
+        # lane is live, so this report is what makes the refusal predictable
+        # rather than a surprise at the moment of editing.
+        try:
+            from . import lanes as _lanes
+            held_now = [l for l in _lanes.holders() if l.state() == "live"]
+            if held_now:
+                parts.append("live lanes: " + ", ".join(
+                    f"{os.path.basename(l.target)} by {l.name} ({l.age_s:.0f}s)"
+                    for l in held_now[:4]))
+            else:
+                parts.append("no file lane is held -- take one with "
+                             "`python -c \"from autoforge import lanes; "
+                             "lanes.claim(<path>, why=...)\"" + "` before editing")
+        except Exception:                                        # noqa: BLE001
+            # A session that cannot reach the lane store must still start; the
+            # guard is enforced at the write, so the report is a convenience.
+            pass
     else:
         parts.append("no other live session on this bus")
     needs = [e for e in now if e.get("kind") in ("ask", "claim")]
