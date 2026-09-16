@@ -1626,7 +1626,14 @@ class ForgeAgent:
             # "remember" nothing it made and re-forge it every session. Mirrors
             # what evolve_tool already does for the tools it replaces.
             if self.store:
-                self.store.save_tool(res.spec)
+                try:
+                    self.store.save_tool(res.spec)
+                except ValueError as exc:
+                    # The shelf refused the write because a peer session holds
+                    # that name. Say so; a traceback here would read as "the
+                    # forge failed" when the tool was built, verified and is in
+                    # memory -- only the row was not taken.
+                    return (f"Forged {res.spec.name!r} but did not save it: {exc}")
             # Push to the sibling tool-market, so a tool this agent made is
             # visible to anything else that speaks the same protocol. This is
             # deliberately *after* the local save and deliberately unable to
@@ -1688,7 +1695,14 @@ class ForgeAgent:
             self._freeze_baseline(baseline.extended_with(new_spec))
             if self.store:
                 self.store.archive_version(name, spec.code, spec.verification)
-                self.store.save_tool(new_spec)
+                try:
+                    self.store.save_tool(new_spec, allow_overwrite=True)
+                except ValueError as exc:
+                    # Evolve is the deliberate replacement path -- it has already
+                    # judged the old and new versions -- so it overrides the
+                    # peer-write backstop. It still reports a live-lane refusal
+                    # rather than pretending the row was written.
+                    return (f"Evolved {name!r} in memory but did not save it: {exc}")
             return f"Evolved {name!r}: new version active (fitness {result.best_mutant.fitness:.2f})."
 
         self._add(ToolSpec(

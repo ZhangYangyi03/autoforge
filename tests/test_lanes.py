@@ -353,3 +353,165 @@ class TestTheEnvironmentCannotLieToIt:
             assert st.load_all_tools()["reader"].description == "forced"
         finally:
             st.close()
+
+
+class TestTheWriterStampOnAVersion:
+    """A live lane covers a write in flight; it does NOT cover two sessions a
+    few seconds apart. That gap was measured end to end: A saved a tool, released
+    the lane, B saved the same name and replaced A's work, and nothing anywhere
+    objected. Closing it needs a per-write writer stamp, so `tool_versions` grew a
+    `session` column -- and a column added to a table that already exists is
+    exactly the kind of change that gets believed without ever running.
+    """
+
+    def _mk(self, name, desc, body):
+        from autoforge.tools.spec import ToolSpec, ToolState
+
+        return ToolSpec(name=name, description=desc,
+                        parameters={"type": "object", "properties": {}},
+                        fn=lambda: 1,
+                        code=f"# {body}\ndef {name}():\n    return 1\n",
+                        source="forged", state=ToolState.ACTIVE)
+
+    def test_the_column_is_added_to_a_store_that_predates_it(self, store, monkeypatch):
+        """The migration path, on a store created without the column."""
+        import sqlite3
+
+        from autoforge.store import ToolStore
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "old.db")
+        os.makedirs(store, exist_ok=True)
+        raw = sqlite3.connect(db)
+        raw.execute("CREATE TABLE tool_versions (tool TEXT NOT NULL, version INTEGER NOT"
+                    " NULL, blob_sha TEXT NOT NULL, parent_version INTEGER, verification"
+                    " TEXT NOT NULL DEFAULT '{}', archived_at REAL NOT NULL,"
+                    " PRIMARY KEY (tool, version))")
+        raw.execute("INSERT INTO tool_versions (tool, version, blob_sha,"
+                    " parent_version, verification, archived_at)"
+                    " VALUES (?,?,?,?,?,?)", ("old", 1, "sha", None, "{}", 1.0))
+        raw.commit()
+        raw.close()
+
+        st = ToolStore(db)
+        try:
+            cols = [d[1] for d in st._conn.execute("PRAGMA table_info(tool_versions)")]
+            assert "session" in cols
+            # The pre-existing row survives, and reads as UNKNOWN rather than as
+            # someone else's -- refusing on it would block every tool the agent
+            # had before today.
+            assert st._conn.execute("SELECT COUNT(*) FROM tool_versions").fetchone()[0] == 1
+            assert st.tools_written_by_other_sessions() == []
+        finally:
+            st.close()
+
+    def test_the_migration_is_idempotent(self, store, monkeypatch):
+        from autoforge.store import ToolStore
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "twice.db")
+        st = ToolStore(db)
+        st.close()
+        st = ToolStore(db)
+        st.close()
+
+    def test_a_foreign_write_seconds_ago_refuses_the_next_save(self, store, monkeypatch):
+        """The measured collision, in-process: two sessions, no overlap in time."""
+        import subprocess
+        import sys
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "x.db")
+        child = (
+            "import os,sys\n"
+            "sys.path.insert(0, __REPR__)\n"
+            "os.environ['AUTOFORGE_BUS_DIR']=sys.argv[2]\n"
+            "os.environ['AUTOFORGE_SESSION']=sys.argv[3]\n"
+            "from autoforge.store import ToolStore\n"
+            "from autoforge.tools.spec import ToolSpec, ToolState\n"
+            "n=sys.argv[1]\n"
+            "st=ToolStore(sys.argv[4])\n"
+            "s=ToolSpec(name=n, description='peer', parameters={'type':'object',"
+            "'properties':{}}, fn=lambda:1, code='# peer\\ndef %s():\\n    return 1\\n'%n,"
+            " source='forged', state=ToolState.ACTIVE)\n"
+            "try:\n"
+            "    st.save_tool(s); print('SAVED')\n"
+            "except ValueError as e:\n"
+            "    print('REFUSED', e)\n"
+        ).replace('__REPR__', repr(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        p = os.path.join(store, "child.py")
+        os.makedirs(store, exist_ok=True)
+        open(p, "w", encoding="utf-8").write(child)
+        r = subprocess.run([sys.executable, p, "shared_name", store, "peer-session", db],
+                           capture_output=True, text=True, timeout=120, errors="replace")
+        assert "SAVED" in r.stdout, r.stdout + r.stderr
+
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_SESSION", "my-session")
+        st = ToolStore(db)
+        try:
+            assert st.tools_written_by_other_sessions() == ["shared_name"]
+            with pytest.raises(ValueError) as exc:
+                st.save_tool(self._mk("shared_name", "mine", "mine"))
+            assert "peer-session" not in str(exc.value)   # names the age, not a guess
+            assert "second" not in str(exc.value)
+        finally:
+            st.close()
+
+    def test_the_identical_body_is_not_refused(self, store, monkeypatch):
+        """Nobody loses anything when the body is the same; refusing would only
+        teach the caller to pass allow_overwrite out of habit."""
+        import subprocess
+        import sys
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "same.db")
+        os.makedirs(store, exist_ok=True)
+        from autoforge.store import ToolStore
+        monkeypatch.setenv("AUTOFORGE_SESSION", "first")
+        st = ToolStore(db)
+        st.save_tool(self._mk("twin", "one", "same body"))
+        st.close()
+        monkeypatch.setenv("AUTOFORGE_SESSION", "second")
+        st = ToolStore(db)
+        try:
+            st.save_tool(self._mk("twin", "two", "same body"))
+        finally:
+            st.close()
+
+    def test_a_deliberate_replacement_is_allowed(self, store, monkeypatch):
+        from autoforge.store import ToolStore
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "force.db")
+        monkeypatch.setenv("AUTOFORGE_SESSION", "first")
+        st = ToolStore(db)
+        st.save_tool(self._mk("swap", "one", "v1"))
+        st.close()
+        monkeypatch.setenv("AUTOFORGE_SESSION", "second")
+        st = ToolStore(db)
+        try:
+            st.save_tool(self._mk("swap", "two", "v2"), allow_overwrite=True)
+            assert st.load_all_tools()["swap"].description == "two"
+        finally:
+            st.close()
+
+    def test_an_unstamped_row_is_unknown_not_foreign(self, store, monkeypatch):
+        """Every tool forged before today has session=''. Treating that as
+        "someone else's" would make the whole existing shelf unsaveable."""
+        from autoforge.store import ToolStore
+
+        monkeypatch.setenv("AUTOFORGE_BUS_DIR", store)
+        db = os.path.join(store, "legacy.db")
+        st = ToolStore(db)
+        st.save_tool(self._mk("legacy", "one", "v1"))
+        st._conn.execute("UPDATE tool_versions SET session=''")
+        st._conn.commit()
+        st.close()
+        monkeypatch.setenv("AUTOFORGE_SESSION", "someone-new")
+        st = ToolStore(db)
+        try:
+            assert st.tools_written_by_other_sessions() == []
+            st.save_tool(self._mk("legacy", "two", "v2"), allow_overwrite=False)
+        finally:
+            st.close()

@@ -82,6 +82,13 @@ _DDL = (
     "\n    parent_version INTEGER,"
     "\n    verification TEXT NOT NULL DEFAULT '{}',"
     "\n    archived_at REAL NOT NULL,"
+    # Who wrote this version. Added after the table existed, so it is applied by
+    # `_ensure_columns` rather than by editing the DDL alone: CREATE TABLE IF NOT
+    # EXISTS does nothing to a table that is already there, which is exactly how
+    # a migration gets believed without ever running. No foreign key and no
+    # DEFAULT beyond '': a row written before this column existed is *unknown*,
+    # not someone else's, and every reader here treats '' as unknown.
+    "\n    session TEXT NOT NULL DEFAULT '',"
     "\n    PRIMARY KEY (tool, version)"
     "\n);"
     "\nCREATE TABLE IF NOT EXISTS dependencies ("
@@ -286,6 +293,10 @@ class ToolStore:
         #     session, toolmarket on the same box) waits for the write lock
         #     instead of failing at the moment something is being recorded.
         self._lock = threading.RLock()
+        # tool name -> session, for writes this process made. The persisted copy
+        # is the `session` column; this is only the in-process fast path.
+        self._last_writer: dict[str, str] = {}
+        self._last_writer_at: dict[str, float] = {}
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False,
                                      timeout=float(_SQLITE_BUSY_TIMEOUT_S))
         self._conn.row_factory = sqlite3.Row
@@ -293,6 +304,42 @@ class ToolStore:
         self._conn.execute("PRAGMA busy_timeout=%d"
                            % int(_SQLITE_BUSY_TIMEOUT_S * 1000))
         self._conn.executescript(_DDL)
+        self._ensure_columns()
+
+    #: Columns added to a table that already shipped. SQLite has no
+    #: "ADD COLUMN IF NOT EXISTS", so each is attempted and the duplicate-column
+    #: error is the success path. Kept as data rather than as a migration script
+    #: so a store created before the column and a store created after converge on
+    #: the same shape -- two sessions on this machine are reading this file right
+    #: now, and one of them may well be older code than the other.
+    _ADDED_COLUMNS = (
+        ("tool_versions", "session", "TEXT NOT NULL DEFAULT ''"),
+    )
+
+    def _ensure_columns(self) -> None:
+        """Add columns that predate the running code, idempotently.
+
+        Read first, write only if something is actually missing. The obvious
+        version -- attempt the ALTER and treat "duplicate column" as success --
+        makes EVERY open of the store take a write lock, and this store is opened
+        by two sessions and a market server on the same file. Measured: with that
+        version, `test_two_processes_on_one_file` failed roughly one run in five
+        with `database is locked` raised from `PRAGMA journal_mode=WAL` at open.
+        A migration that has already run costs nothing and must cost nothing.
+        """
+        for table, column, dtype in self._ADDED_COLUMNS:
+            try:
+                have = {d[1] for d in self._conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if not have or column in have:
+                continue                 # nothing to do: no write, no lock
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {dtype}")
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     def close(self) -> None:
         with self._lock:
@@ -300,36 +347,89 @@ class ToolStore:
 
     # -- tools ------------------------------------------------------------
     def tools_written_by_other_sessions(self) -> list[str]:
-        """Tool names in this store written by a session that is not mine.
+        """Tool names whose CURRENT version was written by a session that is not mine.
 
-        The rows carry no writer column, and adding one is a schema change to a
-        file two sessions and a market server are reading right now. So the
-        reader identifies a foreign row by its version-history stamps: every save
-        archives a version stamped with the writer's session (see
-        `record_version`), which is a name this process can compare against its
-        own without altering the table.
+        Reads the `session` stamp on the version timeline. Two things it is
+        deliberately careful about:
 
-        Best-effort and read-only, like every other report here: a store whose
-        schema predates those stamps returns an empty list rather than guessing,
-        because a wrong attribution sends the agent to the wrong peer. Measured
-        caveat, stated rather than buried: the version timeline does not carry a
-        session stamp today, so on this store the answer is an empty list -- the
-        query is the half that works, and it is honest about having nothing to
-        read. That is why the *enforcement* lives in `save_tool` (a live lane,
-        which is enforced) and this is only a report.
+          * only the LATEST version per tool counts. A tool I rewrote after a peer
+            touched it is mine now, and reporting it as theirs would send the
+            agent to negotiate over something it already owns;
+          * session='' is unknown, not foreign. Every tool forged before the
+            column existed carries it, so treating it as someone else's would
+            make the entire existing shelf -- 114 rows on this host -- look like a
+            peer's property.
+
+        This is a report, not the gate. The gate is inside `save_tool`. Every
+        earlier version of this method was a stub that queried a table that does
+        not exist and returned [] -- which looked like "no collisions" rather
+        than like a broken query, and that is the failure mode this file keeps
+        running into.
         """
         mine = os.environ.get("AUTOFORGE_SESSION") or ""
-        out: set[str] = set()
+        if not mine:
+            return []
         try:
             rows = self._conn.execute(
-                "SELECT tool, session FROM version_timeline ORDER BY id").fetchall()
+                "SELECT t.tool AS tool, t.session AS session FROM tool_versions t"
+                " WHERE t.version = (SELECT MAX(x.version) FROM tool_versions x"
+                "                     WHERE x.tool = t.tool)").fetchall()
         except sqlite3.Error:
             return []
-        for row in rows:
-            who = str(row["session"] or "")
-            if who and mine and who != mine:
-                out.add(str(row["tool"]))
-        return sorted(out)
+        return sorted({str(r["tool"]) for r in rows
+                       if str(r["session"] or "") and str(r["session"]) != mine})
+
+    def _foreign_write_age(self, tool: str, mine: str, body: str = "") -> float | None:
+        """Seconds since another session last wrote this tool, or None.
+
+        The backstop for the gap a live lane cannot cover: a lane is held only
+        while a write is in flight, so two sessions a few seconds apart never
+        contend for it. Measured end to end before this existed: session A saved
+        a tool, released the lane, session B saved the same name, and B replaced
+        A's work with no error anywhere.
+
+        The ROW is the truth and is always read; the in-process cache is only a
+        fallback for a table this code cannot read (a store older than the
+        column). An earlier version of this consulted the cache first and
+        returned on a hit -- and since the cache holds this process's own writes,
+        it short-circuited the query that would have seen the other session. A
+        row with session='' is a write from before the column existed: unknown,
+        not someone else's, so it refuses nothing.
+        """
+        who, when = "", None
+        try:
+            row = self._conn.execute(
+                "SELECT session, archived_at FROM tool_versions WHERE tool=?"
+                " ORDER BY version DESC LIMIT 1", (tool,)).fetchone()
+            if row is not None:
+                who, when = str(row["session"] or ""), row["archived_at"]
+        except sqlite3.Error:
+            row = None
+        if not who and tool in self._last_writer:
+            who, when = self._last_writer[tool], self._last_writer_at.get(tool)
+        if not who or who == mine or when is None:
+            return None
+        if body:
+            # Same body, nobody is losing anything: re-saving identical code under
+            # the same name is a no-op and refusing it would only push a caller
+            # into allow_overwrite for no reason. A different body is the case
+            # that silently destroyed a peer's work.
+            import hashlib
+            sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            try:
+                blob = self._conn.execute(
+                    "SELECT blob_sha FROM tool_versions WHERE tool=?"
+                    " ORDER BY version DESC LIMIT 1", (tool,)).fetchone()
+            except sqlite3.Error:
+                blob = None
+            if blob is not None and blob["blob_sha"] == sha:
+                return None
+        return max(0.0, _now() - float(when))
+
+    #: Seconds after which another session's write stops refusing this one. It is
+    #: not a lock timeout: the point is to make *contention* visible, not to
+    #: forbid a deliberate override, and the ledger keeps every version anyway.
+    FOREIGN_WRITE_GRACE_S = 900.0
 
     def save_tool(self, spec: ToolSpec, *, allow_overwrite: bool = False) -> None:
         """Record a tool.
@@ -349,8 +449,20 @@ class ToolStore:
         """
         from .lanes import LaneRefused, LaneMissing, claim, release, resource
 
+        mine = os.environ.get("AUTOFORGE_SESSION") or ""
         held = None
         if not allow_overwrite:
+            # The backstop first: a live lane only covers a write in flight, and
+            # two sessions that save the same name a few seconds apart never
+            # contend for one. This is the check that closing that gap required
+            # the `session` column for.
+            age = self._foreign_write_age(spec.name, mine, spec.code or "")
+            if age is not None and age <= self.FOREIGN_WRITE_GRACE_S:
+                raise ValueError(
+                    f"refusing to save tool {spec.name!r}: another session wrote "
+                    f"that name {age:.0f}s ago and its version is the one on "
+                    f"record. Evolve it, save under another name, or pass "
+                    f"allow_overwrite=True to replace it deliberately.")
             try:
                 held = claim(resource(f"tool/{spec.name}"), name="store",
                              why=f"forging tool {spec.name}")
@@ -397,7 +509,8 @@ class ToolStore:
         # Every save is a version. Doing it here rather than at each call site is
         # the difference between "history is what someone remembered to archive"
         # and "history is what happened".
-        self.record_version(record.name, record.code, record.verification)
+        self.record_version(record.name, record.code, record.verification,
+                            session=mine or None)
 
     def load_all_tools(self) -> dict[str, ToolRecord]:
         rows = self._conn.execute(
@@ -464,7 +577,8 @@ class ToolStore:
     # -- versions (content-addressed) --------------------------------------
     def record_version(self, tool: str, code: str, verification: dict[str, Any] | None = None,
                        parent_version: int | None = None,
-                       version: int | None = None) -> dict[str, Any]:
+                       version: int | None = None,
+                       session: str | None = None) -> dict[str, Any]:
         """Record that `tool` held `code`, and give it the next number if it is new.
 
         Bodies are stored once by sha256, so history costs a row per distinct
@@ -505,18 +619,22 @@ class ToolStore:
                     "SELECT MAX(version) FROM tool_versions WHERE tool=? AND version < ?",
                     (tool, version)).fetchone()
                 parent_version = prev[0] if prev and prev[0] is not None else None
+            who = session or os.environ.get("AUTOFORGE_SESSION") or ""
             self._conn.execute(
                 "INSERT INTO tool_versions (tool, version, blob_sha, parent_version,"
-                " verification, archived_at) VALUES (?,?,?,?,?,?)",
-                (tool, version, sha, parent_version, _j(verification or {}), _now()),
+                " verification, archived_at, session) VALUES (?,?,?,?,?,?,?)",
+                (tool, version, sha, parent_version, _j(verification or {}), _now(),
+                 who),
             )
             # The timeline goes into the chained log as well, so "when did this
             # tool's body change" is answerable from the same tamper-evident
             # history as everything else rather than a second, weaker ledger.
             chaining.append_event(self._conn, "version_recorded", {
                 "tool": tool, "version": version, "blob_sha": sha,
-                "parent_version": parent_version,
+                "parent_version": parent_version, "session": who,
             })
+            self._last_writer[tool] = who
+            self._last_writer_at[tool] = _now()
         self._conn.commit()
         return {"tool": tool, "version": version, "blob_sha": sha,
                 "parent_version": parent_version, "new": known is None}
