@@ -349,6 +349,11 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
                     [base.python, "-I", runner_path],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, env=base.effective_env(), cwd=td,
+                    # Same reason as the plain path, and the same measurement
+                    # decided the flag: DETACHED_PROCESS (no console, job count
+                    # unchanged), not CREATE_NO_WINDOW (window hidden, console
+                    # still created, job count 1 -> 2).
+                    creationflags=(0x00000008 if os.name == "nt" else 0),
                 )
             except OSError as exc:
                 closer()

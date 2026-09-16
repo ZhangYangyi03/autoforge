@@ -28,6 +28,18 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+#: Windows: give the child no console at all. Not CREATE_NO_WINDOW -- that flag
+#: suppresses the *window* while Windows still creates a console, which shows up
+#: as an extra hidden conhost.exe inside this sandbox's job object and moved the
+#: measured `processes_launched` from 1 to 2 (found by test_containment, not by
+#: reading). DETACHED_PROCESS creates no console for the child, so there is
+#: nothing to display: same job count, no window. The child talks over pipes.
+#:
+#: Why it matters at all: the agent is started by a scheduled task through
+#: pythonw, which has no console, and a console-subsystem child of a
+#: console-less parent gets a *fresh* console window on the desktop.
+_NO_CONSOLE = 0x00000008 if os.name == "nt" else 0
+
 _RUNNER = textwrap.dedent('''
     import io, json, sys, contextlib
 
@@ -259,6 +271,11 @@ class Sandbox:
                     stderr=subprocess.PIPE,
                     env=env,
                     cwd=td,
+                    # All three stdio handles are pipes, so the child needs no
+                    # console -- and on Windows a console-subsystem child of a
+                    # parent that has no console gets a *new* one, with a
+                    # visible window. Every sandboxed call would flash one.
+                    creationflags=_NO_CONSOLE,
                 )
             except OSError as exc:
                 return SandboxResult(
