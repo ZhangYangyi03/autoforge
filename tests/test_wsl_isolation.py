@@ -8,9 +8,11 @@ and misbehaved silently.
   * a seccomp BPF program whose JEQ instructions had jt=jf=0, so every syscall
     reached the `return EPERM` stub. The filter denied everything and the run
     died with SIGSEGV (exit 139) -- not a refusal that says "no", a crash;
-  * `wsl.exe` under DETACHED_PROCESS exits 0 with empty stdout and empty
-    stderr. Every other child on this host is fine with that flag; this one is
-    not, and the symptom inside this module is "the distro is not answering".
+  * `wsl.exe` under a DETACHED_PROCESS child exits 0 with empty stdout and empty
+    stderr -- no error, no output, just nothing, which read inside this module as
+    "the distro is not answering". The spawn flag is CREATE_NO_WINDOW now, so the
+    case should no longer be reachable; the probes below are what would catch it
+    coming back.
 
 So the tests below are behavioural where they can be (run it, look at what came
 back) and structural where a behaviour cannot be observed from outside: the

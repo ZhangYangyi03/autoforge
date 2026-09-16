@@ -893,9 +893,15 @@ def launch_browser(port: int = 9222, *, headless: bool = True,
     kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL,
                               "stderr": subprocess.DEVNULL}
     if sys.platform.startswith("win"):
-        # Detached so closing the agent does not kill the browser it started,
-        # and no console window flashes up.
-        kwargs["creationflags"] = 0x00000008 | 0x08000000
+        # Detached, so that quitting the agent does not take the browser with
+        # it. The package's Popen hook still ORs CREATE_NO_WINDOW into this, and
+        # Windows ignores that flag while DETACHED_PROCESS is set -- which is
+        # fine here, because it would buy nothing: this executable is
+        # GUI-subsystem, and a GUI process is never allocated a console, so
+        # there is no window for the flag to suppress. Noted because the pair
+        # used to be written out as `0x8 | 0x08000000`, where the second value
+        # only looked like it was doing something.
+        kwargs["creationflags"] = 0x00000008 | 0x00000200
     else:
         kwargs["start_new_session"] = True
 

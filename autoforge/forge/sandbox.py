@@ -28,36 +28,46 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-#: Windows: give the child no console at all. Not CREATE_NO_WINDOW -- that flag
-#: suppresses the *window* while Windows still creates a console, which shows up
-#: as an extra hidden conhost.exe inside this sandbox's job object and moved the
+#: Windows: hide the child's console. CREATE_NO_WINDOW, not DETACHED_PROCESS.
+#:
+#: DETACHED_PROCESS was the earlier value here, and the reason was a job-object
+#: count: CREATE_NO_WINDOW still creates a console, which shows up as an extra
+#: hidden conhost.exe inside this sandbox's job object, and that moved the
 #: measured `processes_launched` from 1 to 2 (found by test_containment, not by
-#: reading). DETACHED_PROCESS creates no console for the child, so there is
-#: nothing to display: same job count, no window. The child talks over pipes.
+#: reading). The trade was wrong, because DETACHED_PROCESS creates no console
+#: *for the run to pass down*: a snippet that starts a console-subsystem child
+#: of its own is then a console-less parent's child and gets a fresh window on
+#: the operator's desktop, which is the whole thing being prevented. The extra
+#: processes_launched count is a conhost, not the tool's own descendant, and the
+#: manifest ceiling that reads it is 8 (32 for the ceiling probe) against a
+#: measured 2 -- the headroom absorbs it.
 #:
 #: Why it matters at all: the agent is started by a scheduled task through
 #: pythonw, which has no console, and a console-subsystem child of a
 #: console-less parent gets a *fresh* console window on the desktop.
-_NO_CONSOLE = 0x00000008 if os.name == "nt" else 0
+_NO_CONSOLE = 0x08000000 if os.name == "nt" else 0
 
 _RUNNER = textwrap.dedent('''
     import io, json, os, sys, contextlib
 
-    # No window for anything this code starts. The runner itself is launched
-    # detached, so Windows hands every console-subsystem child a *fresh* console
-    # -- a window on the operator's desktop, one per subprocess a snippet
-    # happens to start. Patched here rather than at the call sites, because the
-    # call sites are arbitrary snippet code: the number of windows tracked the
-    # number of subprocesses a run started, and a run that investigated the
-    # flapping was the run that flapped most.
+    # No window for anything this code starts. The runner's console is hidden
+    # (CREATE_NO_WINDOW, inherited by everything the snippet spawns), so a
+    # console-subsystem child of a snippet is not treated as a console-less
+    # parent's child and given a fresh window. Patched here rather than at the
+    # call sites, because the call sites are arbitrary snippet code: the number
+    # of windows tracked the number of subprocesses a run started, and a run
+    # that investigated the flapping was the run that flapped most.
     #
-    # The flag is measured, not read. Enumerating visible top-level windows by
-    # pid: flags=0 -> one visible PseudoConsoleWindow, DETACHED_PROCESS -> none,
-    # CREATE_NO_WINDOW -> none. `GetConsoleWindow()` is the wrong probe -- it
-    # answers non-zero even under DETACHED_PROCESS, where no window is shown.
+    # Not DETACHED_PROCESS: that creates no console, so the snippet's own
+    # children would each get one. The flag is measured, not read. Enumerating
+    # visible top-level windows by pid: flags=0 -> one visible
+    # PseudoConsoleWindow, CREATE_NO_WINDOW -> none (and DETACHED_PROCESS ->
+    # none for the runner itself, while re-creating the problem one level down).
+    # `GetConsoleWindow()` is the wrong probe -- it answers non-zero even under
+    # DETACHED_PROCESS, where no window is shown.
     if os.name == "nt":
         import subprocess as _sp
-        _NO_WINDOW = 0x00000008                     # DETACHED_PROCESS
+        _NO_WINDOW = 0x08000000                     # CREATE_NO_WINDOW
 
         class _QuietPopen(_sp.Popen):
             def __init__(self, *a, **kw):
@@ -188,6 +198,14 @@ class Sandbox:
     env_allow: tuple[str, ...] = (
         "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
         "HOME", "USERPROFILE", "LANG", "LC_ALL", "PYTHONPATH",
+        # Where a child's own data belongs. Left out, `ToolStore` falls back to
+        # `~` and mkdirs `~/autoforge` -- a directory named exactly like the
+        # package -- and a home-cwd import of `autoforge` then resolves to that
+        # empty directory as a *namespace package*: no `__init__.py`, so the
+        # CREATE_NO_WINDOW hook installed there never runs and every subprocess
+        # flashes a console window. Measured 2026-09-16; see tests/test_store.py
+        # for the pin.
+        "APPDATA", "LOCALAPPDATA",
     )
     runner: Callable[[str, str, dict[str, Any]], SandboxResult] | None = None
     #: Asked while a child is running: ``True`` means kill it now and report

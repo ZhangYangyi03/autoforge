@@ -257,14 +257,28 @@ def _default_home() -> str:
     means the agent's memory silently resets whenever it is launched from a
     different directory, which reads to the agent as "I have no memory" rather
     than "I looked in the wrong place". The env var still overrides.
+
+    The fallback is dotted, and that is load-bearing rather than cosmetic.
+    `LOCALAPPDATA` and `XDG_DATA_HOME` are outside every directory Python
+    searches for imports, so a data directory named `autoforge` under them is
+    only a data directory. The home directory is not: a process whose cwd (or
+    sys.path[0]) is `~` imports this package *by that name*, and a plain
+    `~/autoforge` is then a namespace package that shadows the real one --
+    importing successfully, as an empty directory, with no `__init__.py`.
+    Measured on 2026-09-16: the sandbox's env_allow dropped LOCALAPPDATA, so a
+    contained job that built a store created `~/autoforge`; from then on
+    `pythonw -m autoforge` died with `cannot import name '__version__'` and the
+    CREATE_NO_WINDOW hook in `__init__.py` never ran, which is why every
+    subprocess had been flashing a console window. `.autoforge` cannot shadow
+    anything, so the failure cannot come back this way.
     """
     env = os.environ.get("AUTOFORGE_HOME")
     if env:
         return env
-    base = (os.environ.get("LOCALAPPDATA")
-            or os.environ.get("XDG_DATA_HOME")
-            or os.path.expanduser("~"))
-    return os.path.join(base, "autoforge")
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    if base:
+        return os.path.join(base, "autoforge")
+    return os.path.join(os.path.expanduser("~"), ".autoforge")
 
 
 # ---------------------------------------------------------------------------

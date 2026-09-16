@@ -7,9 +7,11 @@ The spawns are scattered (webtools' search worker, market, schedule, cpu/safety,
 mcp), so the flag is applied once, at import, instead of at each call site.
 
 The probe matters as much as the flag. `GetConsoleWindow()` answers non-zero
-even under DETACHED_PROCESS, where no window is shown, so a test built on it
-would pass while the operator still saw windows. These count *visible top-level
-windows owned by the child's pid*, which is what a person actually sees.
+even for a child whose window is not shown, so a test built on it would pass
+while the operator still saw windows. These count *visible top-level windows
+owned by the child's pid*, which is what a person actually sees -- and they
+count them for the child's own children too, because a flag that only hides the
+direct child's window moves the flash one level down rather than removing it.
 """
 import ctypes
 import os

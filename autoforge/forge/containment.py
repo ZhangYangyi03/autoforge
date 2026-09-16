@@ -336,7 +336,16 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
             budget = min(float(cpu_seconds), float(base.timeout) + grace - 1.0)
             if os.name == "nt":
                 job = JobHandle(memory_bytes=memory_mb * MB,
-                                max_processes=max_processes,
+                                # +1 on Windows: CREATE_NO_WINDOW gives the
+                                # runner a console, and that console's host
+                                # (conhost.exe) is a process *inside this job*.
+                                # It is the platform's price for a window nobody
+                                # can see, not a process the tool started, so the
+                                # declaration's `max_processes` must not be made
+                                # to pay for it -- otherwise a declared cap of 2
+                                # leaves the tool room for exactly zero children.
+                                max_processes=max_processes
+                                + (1 if os.name == "nt" else 0),
                                 cpu_seconds=budget)
                 closer, assigner = job.close, job.assign
             else:
@@ -349,11 +358,14 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
                     [base.python, "-I", runner_path],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, env=base.effective_env(), cwd=td,
-                    # Same reason as the plain path, and the same measurement
-                    # decided the flag: DETACHED_PROCESS (no console, job count
-                    # unchanged), not CREATE_NO_WINDOW (window hidden, console
-                    # still created, job count 1 -> 2).
-                    creationflags=(0x00000008 if os.name == "nt" else 0),
+                    # Same reason as the plain path. CREATE_NO_WINDOW, not
+                    # DETACHED_PROCESS: a detached runner holds no console to
+                    # pass to the snippet's own children, so each of those gets
+                    # a fresh window -- the flash moved one level down instead of
+                    # going away. The extra hidden conhost.exe this costs inside
+                    # the job moves processes_launched 1 -> 2, against a ceiling
+                    # of 8; see the note on _NO_CONSOLE in sandbox.py.
+                    creationflags=(0x08000000 if os.name == "nt" else 0),
                 )
             except OSError as exc:
                 closer()

@@ -109,7 +109,13 @@ def ensure_running(url=None, *, launch: bool = True, timeout: float = STARTUP_TI
         return report
     creationflags = 0
     if os.name == "nt":
-        creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+        # CREATE_NO_WINDOW, not DETACHED_PROCESS. The launcher is a shell script,
+        # so the process started here is a shell and the server is its child: if
+        # the shell is launched detached it has no console to pass down, and the
+        # server -- console-subsystem -- is given a fresh, visible console
+        # instead. Hidden-console-plus-new-group keeps the flash off the desktop
+        # and still lets the server outlive this agent.
+        creationflags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     try:
         proc = subprocess.Popen(

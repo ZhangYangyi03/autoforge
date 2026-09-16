@@ -47,8 +47,14 @@ DETACH = (
 
 
 def _alive(pid) -> bool:
+    # encoding="mbcs": tasklist speaks the ANSI code page, and this host's is
+    # CP936 -- its header contains bytes that are not valid UTF-8, so the
+    # default text mode raised in the reader thread and left stdout as None
+    # (which then blew up on the `in`). The PID we look for is ASCII, so
+    # replacing the undecodable header bytes loses nothing.
     out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, encoding="mbcs",
+                         errors="replace").stdout or ""
     return str(pid) in out
 
 
@@ -109,7 +115,32 @@ def test_normal_tool_is_unaffected():
     box = Sandbox(timeout=10.0)
     r = box.run("def f(a=1):\n    return {'v': a * 2}", "f", {"a": 21})
     assert r.ok and r.output == {"v": 42}
-    assert r.accounting.get("processes_launched") == 1
+    # 2, not 1. The runner is started with CREATE_NO_WINDOW, so Windows gives it
+    # a console -- invisible -- and that console is a hidden conhost.exe inside
+    # the job this number is read from. The tool launched nothing itself; the
+    # second process is the platform's. The number was 1 while the runner was
+    # started DETACHED_PROCESS, which is the flag that leaked windows from the
+    # snippet's own children, so the 1 was the cheaper of two wrong readings.
+    assert r.accounting.get("processes_launched") == 2
+
+
+def test_the_process_count_moves_with_the_tool_not_the_platform():
+    """The counterpart to the floor above: the number still detects a leak.
+
+    Pinned as its own measurement because changing 1 to 2 in a single test would
+    otherwise look like an assertion loosened to make a red test green. It is a
+    calibrated floor: the constant part is the runner and its hidden console, and
+    a tool that starts one child on top of that moves the count again.
+    """
+    box = Sandbox(timeout=15.0)
+    r = box.run(
+        "import subprocess, sys\n"
+        "def f():\n"
+        "    subprocess.Popen([sys.executable, '-c',"
+        " 'import time; time.sleep(1)']).wait()\n"
+        "    return 'done'\n", "f")
+    assert r.ok, r.error
+    assert r.accounting.get("processes_launched", 0) >= 3
 
 
 def test_accounting_travels_on_the_result():
@@ -162,13 +193,25 @@ def test_reconcile_reports_under_declaration_on_the_axis_that_moved():
     it was asserting never happened. Which is itself the useful fact: a
     declaration can be too small in two different ways and only one of them
     shows up as "used more than declared".
+
+    The work is ~0.25 s (n=2_000_000, measured), not the ~0.8 s it started at,
+    and that is a deliberate move off a knife edge rather than a loosened
+    assertion. `JOB_OBJECT_LIMIT_JOB_TIME` is checked when the kernel
+    reschedules, so it lands *late* -- 2.4 s of overshoot for a 3 s budget,
+    measured on this host and written down in containment.py. A run whose CPU
+    cost sits under that overshoot is therefore a coin flip between "finished"
+    and "killed by the CPU limit", and at 0.8 s against a 0.1 s budget this test
+    was exactly that: it passed alone and failed in file order, three runs out
+    of four. The process the hidden console adds (conhost.exe, see
+    test_normal_tool_is_unaffected) was enough to tip it. 0.25 s still
+    under-reports the declaration by 2.5x, which is all the assertion needs.
     """
     m = CapabilityManifest(intent="tiny", memory_mb=256, cpu_seconds=0.1, wall_s=30.0)
     box = apply_declaration(Sandbox(), m)
-    r = box.run("def f(n=10000000):\n    return sum(i * i for i in range(n))", "f")
+    r = box.run("def f(n=2000000):\n    return sum(i * i for i in range(n))", "f")
     out = reconcile(m, r, r.accounting)
     assert r.ok, r.error
-    assert out["under_declared"], "a 0.1s declaration with 0.8s of work must be reported"
+    assert out["under_declared"], "a 0.1s declaration with 0.25s of work must be reported"
     assert any("cpu" in f for f in out["under_declared"])
 
 

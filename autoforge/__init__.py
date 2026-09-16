@@ -26,7 +26,8 @@ import os
 # enumerating visible top-level windows by pid: flags=0 yields one visible
 # PseudoConsoleWindow, DETACHED_PROCESS none. `GetConsoleWindow()` is the wrong
 # probe for this: it reports non-zero even under DETACHED_PROCESS, where no
-# window is shown.
+# window is shown. The flag is CREATE_NO_WINDOW, not DETACHED_PROCESS: see the
+# long note at `_NO_WINDOW` below for why the difference is load-bearing.
 #
 # Done here, at import, rather than at each call site: the spawns live in
 # webtools (the search worker), market, schedule, cpu/safety and mcp, and a rule
@@ -39,45 +40,43 @@ import os
 if os.name == "nt" and not os.environ.get("AUTOFORGE_KEEP_CONSOLE"):
     import subprocess as _subprocess
 
-    #: DETACHED_PROCESS: no console is created at all. CREATE_NO_WINDOW is the
-    #: other candidate and was rejected here -- it suppresses the window but
-    #: still creates a console, which lands in this process's job object and
-    #: changes `processes_launched` for the containment accounting.
-    _NO_WINDOW = 0x00000008
-
-    #: ...with one exception, found by a run that returned nothing. Under
-    #: DETACHED_PROCESS, `wsl.exe` exits 0 and writes NOTHING to a captured
-    #: pipe: no stdout, no stderr, no error code. Measured on this host --
-    #: `0`/`CREATE_NO_WINDOW`/`NEW_PROCESS_GROUP` all return "hi", and
-    #: DETACHED_PROCESS returns "". This is the worst kind of failure: a
-    #: successful-looking result with the content silently missing, which
-    #: inside `wsl_isolation` reads as "the distro is not answering" and
-    #: would have been debugged for an hour as a WSL problem. Only this one
-    #: executable is affected, so only this one is special-cased: no console
-    #: window appears for it either way.
-    _WSL_EXE = 0x08000000          # CREATE_NO_WINDOW
-    _WSL_NAMES = frozenset(("wsl", "wsl.exe"))
-
-    def _is_wsl(argv) -> bool:
-        if isinstance(argv, (str, bytes)) or not argv:
-            return False
-        head = argv[0]
-        head = head.decode(errors="replace") if isinstance(head, bytes) else str(head)
-        return os.path.basename(head).lower() in _WSL_NAMES
+    #: CREATE_NO_WINDOW: the child gets a console, but it is hidden -- and every
+    #: console-subsystem process it starts inherits that hidden console instead
+    #: of being handed a fresh one of its own.
+    #:
+    #: The previous value was DETACHED_PROCESS (0x00000008), chosen because it
+    #: was measured to produce no visible window for the *direct* child. It is
+    #: the wrong flag, for two reasons that only show up one level deeper or one
+    #: pipe further:
+    #:
+    #:   * DETACHED_PROCESS creates no console at all, so the child has none to
+    #:     pass down. Every console-subsystem process *it* starts is therefore a
+    #:     console-less parent's child -- exactly the condition this block exists
+    #:     to prevent -- and Windows gives it a fresh, visible console. One level
+    #:     of detachment only moves the flash from the child to the grandchild.
+    #:     `shell=True` always adds that level: cmd.exe is the child, the real
+    #:     command is the flashed grandchild.
+    #:   * a detached child has no console for `wsl.exe` to write to, and it
+    #:     then exits 0 with empty stdout and empty stderr on a captured pipe --
+    #:     measured on this host. That silent-nothing is what `wsl_isolation`
+    #:     used to read as "the distro is not answering".
+    #:
+    #: CREATE_NO_WINDOW has neither problem. Verified on 2026-09-16 by
+    #: enumerating visible top-level windows by pid under the default Windows
+    #: Terminal host: DETACHED_PROCESS -> one CASCADIA_HOSTING_WINDOW_CLASS
+    #: window, which also took focus; CREATE_NO_WINDOW -> none, with the
+    #: command's output intact. The wsl carve-out that used to live here is gone
+    #: with it: CREATE_NO_WINDOW needs no per-executable exception.
+    _NO_WINDOW = 0x08000000        # CREATE_NO_WINDOW
 
     class _QuietPopen(_subprocess.Popen):
         """subprocess.Popen, but the child never gets a console window."""
 
         def __init__(self, *args, **kwargs):
             flags = int(kwargs.get("creationflags") or 0)
-            argv = args[0] if args else kwargs.get("args")
-            if _is_wsl(argv):
-                # CREATE_NO_WINDOW still suppresses the window, and unlike
-                # DETACHED_PROCESS it leaves wsl.exe able to speak.
-                flags |= _WSL_EXE
-            else:
-                flags |= _NO_WINDOW
-            kwargs["creationflags"] = flags
+            # OR'd, not assigned: a caller that asks for CREATE_NEW_PROCESS_GROUP
+            # or a detached browser keeps its flag.
+            kwargs["creationflags"] = flags | _NO_WINDOW
             super().__init__(*args, **kwargs)
 
     if _subprocess.Popen.__name__ != "_QuietPopen":

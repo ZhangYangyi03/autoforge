@@ -98,7 +98,7 @@ def launch_app():
         return "Docker Desktop.exe: NOT INSTALLED at the expected path"
     if engine_answering(timeout=3):
         return "Docker Desktop: engine already answering, app not launched"
-    flags = 0x00000008 | 0x00000200          # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    flags = 0x08000000 | 0x00000200          # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
     subprocess.Popen([DOCKER_DESKTOP, "-Autostart"], creationflags=flags,
                      close_fds=True)
     return "Docker Desktop: launched detached with -Autostart (no window waited on)"
