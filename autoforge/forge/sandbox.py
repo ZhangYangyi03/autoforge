@@ -203,6 +203,16 @@ class Sandbox:
     #: process + timeout + environment, which bounds blast radius and nothing
     #: else -- a tool that detaches a grandchild outlives the run.
     contain: bool = field(default_factory=lambda: os.name == "nt")
+    #: Run on the Linux side instead, under a real kernel boundary: namespaces,
+    #: a tmpfs for the whole visible filesystem, no network, NO_NEW_PRIVS and a
+    #: seccomp filter. Off unless asked for, because it needs the WSL distro to
+    #: be running and is slower; when it is on and the distro is down, the run
+    #: is REFUSED rather than quietly downgraded to the Windows path. A caller
+    #: who asked for a boundary and silently got none has been lied to, and
+    #: "the tool ran fine" is exactly how that lie reads afterwards.
+    isolate: bool = False
+    #: Which distro to isolate inside, when `isolate` is on.
+    distro: str = "Ubuntu"
     #: The three numbers the job enforces. Read by `reach()` so the report
     #: states limits that were set, not limits that were intended.
     memory_mb: int = 512
@@ -245,6 +255,18 @@ class Sandbox:
                 [n for n in names if not found.get(n)])
 
     def run(self, code: str, entry: str, args: dict[str, Any] | None = None) -> SandboxResult:
+        if self.isolate:
+            # Checked before `runner`, because `isolate` is the stronger
+            # promise: a caller that set both meant the boundary, not the hook.
+            from .wsl_isolation import WslUnavailable, runner_for
+
+            try:
+                return runner_for(self, distro=self.distro)(code, entry, args or {})
+            except WslUnavailable as exc:
+                return SandboxResult(
+                    ok=False, error=str(exc),
+                    duration_ms=0.0, returncode=None,
+                )
         if self.runner is not None:
             return self.runner(code, entry, args or {})
         if self.contain:
