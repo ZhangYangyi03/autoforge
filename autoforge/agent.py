@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import sys
 import textwrap
 import time
@@ -944,6 +945,156 @@ class ForgeAgent:
         except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
+    # Words that describe a *sentence*, not a capability. Without this the
+    # lexical half matches on "with" and "report" and names five tools that
+    # have nothing to do with the need.
+    _LEXICAL_STOPWORDS = frozenset(
+        "with this that from into when then your have will does each some more "
+        "need tool which what over under than make made used using".split())
+
+    def _market_search(self, need: str, k: int = 5) -> list[dict[str, Any]]:
+        """Semantic hits from the sibling market's `/search`, best-effort.
+
+        `/resources` is lexical: it can only find an entry that shares *words*
+        with the need, so a tool that already does the job under different words
+        is invisible to it -- which is the whole case a duplicate check exists
+        to catch. On 2026-09-16 the market grew a hybrid dense+BM25 endpoint
+        with a cross-encoder rerank, so the gate can ask the question it means
+        to ask instead of the one string matching can answer.
+
+        Returns [] on any failure, including no such endpoint on an older
+        market. [] means *no answer*, never *nothing there*: the caller must not
+        read a broken search as an empty shelf.
+        """
+        try:
+            import json as _json
+            import os as _os
+            import urllib.parse as _parse
+            import urllib.request as _url
+            base = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
+            qs = _parse.urlencode({"q": need, "k": int(k)})
+            req = _url.Request(base.rstrip("/") + "/search?" + qs)
+            with _url.urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:                          # noqa: BLE001
+            self._record("market_semantic_lookup", {
+                "need": need, "ok": False,
+                "error": "%s: %s" % (type(exc).__name__, exc)})
+            return []
+        if isinstance(data, dict):
+            results = data.get("results") or []
+            conf = data.get("confidence") if isinstance(data.get("confidence"), dict) else {}
+        else:
+            results, conf = (data if isinstance(data, list) else []), {}
+        if not isinstance(results, list):
+            results = []
+        # The endpoint says so itself when its best hit is below its own
+        # threshold. Taking it at its word is the difference between a ranked
+        # list and a claim.
+        if conf.get("confident") is False:
+            self._record("market_semantic_lookup", {
+                "need": need, "ok": True, "confident": False, "hits": []})
+            return []
+        scored: list[dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            try:
+                score = float(item.get("score") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            scored.append({"name": str(item["name"]), "score": score,
+                           "description": str(item.get("description") or "")})
+        if not scored:
+            return []
+        top = max(x["score"] for x in scored)
+        # A hit is an entry that stands with the top one, not an entry that
+        # merely exists. Measured on this shelf: the correct answer for "count
+        # running processes on this windows box" scored 0.10 with the runner-up
+        # at 0.038, while a genuine synonym cluster came back 0.99/0.98/0.95.
+        # Next to the top score, both shapes are obvious; next to zero, neither
+        # is, and the gate would cry duplicate on every forge.
+        floor = max(0.01, 0.5 * top)
+        kept = [x for x in scored if x["score"] >= floor][:k]
+        self._record("market_semantic_lookup", {
+            "need": need, "ok": True, "confident": conf.get("confident"),
+            "top_score": top, "hits": [x["name"] for x in kept]})
+        return kept
+
+    @staticmethod
+    def _canon_token(token: str) -> str:
+        """One word from a name, reduced to what it means, not how it ends.
+
+        Equality after this reduction, never a prefix test. A prefix test is
+        what made `repo` match `report` on 2026-09-16 and reported
+        `inspect_repo_gitignore_and_systemdrive_dir` as an overlap for a need
+        about transcoding video. The endings below are a closed list on
+        purpose: an open one is a spell-checker, and this is not a spell-check.
+        """
+        for suffix in ("ing", "es", "s", "ed"):
+            if len(token) > 4 and token.endswith(suffix):
+                return token[: -len(suffix)]
+        return token
+
+    @classmethod
+    def _name_tokens(cls, text: str) -> list[str]:
+        """A tool name or a need, as comparable lower-case words."""
+        return [cls._canon_token(t)
+                for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
+    # Words that describe a sentence rather than a capability. They are struck
+    # out before any *counting* happens, because `and`, `the` and `with` are how
+    # two unrelated names otherwise reach the two-word threshold.
+    _NAME_STOPWORDS = frozenset(
+        "the and for with from into when then your have will does each some more "
+        "this that need tool which what over under than make made used using".split())
+
+    def _lexical_name_hits(self, need: str, items: list[Any]) -> list[str]:
+        """Entries whose *name* is the need's, judged from `/resources` alone.
+
+        Deliberately name-only. The first version of this gate also matched on
+        description words, and on 2026-09-16 that named `host_artifact_scan` and
+        `verify_tool_schema_budget` as overlaps for questions about processes
+        and about ffmpeg -- every one of them a two-word coincidence. Matching a
+        description is not matching a name, and "the same name" is the half of
+        the duplicate check `/resources` can answer. "The same job under
+        different words" is the other half, and `_market_search` answers it.
+
+        Rule: the whole name appears in the need, or a multi-word name shares at
+        least two of its own words with it -- equality after `_canon_token`, not
+        a prefix and not a substring, so `repo` does not match `report`.
+
+        What this deliberately does not catch: an abbreviation. `win` is not
+        `window`, so a need phrased with "windows" does not match
+        `list_agent_processes_win` *by name*. That is what `/search` is for, and
+        on the live shelf it does catch it -- which is the reason the gate asks
+        both questions instead of picking the cheaper one.
+        """
+        need_tokens = list(self._name_tokens(need))
+        need_norm = " ".join(need_tokens)
+        need_content = {t for t in need_tokens
+                        if len(t) >= 3 and t not in self._NAME_STOPWORDS}
+        hits: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            if name.lower().replace("_", " ") in need_norm:
+                hits.append(name)          # the whole name, verbatim
+                continue
+            tokens = {t for t in self._name_tokens(name)
+                      if len(t) >= 3 and t not in self._NAME_STOPWORDS}
+            if not tokens:
+                continue
+            if len(tokens) == 1:
+                if tokens <= need_content:
+                    hits.append(name)
+                continue
+            if len(tokens & need_content) >= 2:
+                hits.append(name)
+        return hits
+
     def _prelookup_market(self, need: str) -> str:
         """Ask the shelf *before* the forge instead of only after it.
 
@@ -955,11 +1106,21 @@ class ForgeAgent:
         principle -- the principle was already in the prompt and changed
         nothing -- it is a lookup on the path the forge actually takes.
 
-        Best-effort by construction. An unreachable market returns "", and
-        an empty string means *no answer*, never *nothing there*: only a
-        lookup that came back and matched nothing licenses a forge.
+        Two lookups, because one of them cannot see the case that matters:
+        `/resources` for *the same name* (see `_lexical_name_hits`), `/search`
+        for *the same job under different words* (see `_market_search`). Both
+        are best-effort, and neither is allowed to fail the forge.
+
+        An unreachable market returns "", and an empty string means *no
+        answer*, never *nothing there*: only a lookup that came back and
+        matched nothing licenses a forge. A market whose `/search` is down
+        while `/resources` answers is a partial answer, and it is reported as
+        partial rather than as either extreme.
         """
-        url = None
+        shelf_size = None
+        lexical_ok = False
+        lexical: list[str] = []
+        payload = None
         try:
             import json as _json
             import os as _os
@@ -968,41 +1129,59 @@ class ForgeAgent:
             req = _url.Request(url.rstrip("/") + "/resources")
             with _url.urlopen(req, timeout=6) as resp:
                 body = resp.read().decode("utf-8", "replace")
-            data = _json.loads(body)
+            payload = _json.loads(body)
+            lexical_ok = True
         except Exception as exc:                          # noqa: BLE001
             self._record("market_prelookup", {"need": need, "ok": False,
                                               "error": "%s: %s" % (type(exc).__name__, exc)})
+        if lexical_ok:
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict):
+                items = payload.get("items") or payload.get("resources") or []
+            else:
+                items = []
+            if not isinstance(items, list):
+                items = []
+            shelf_size = len(items)
+            lexical = self._lexical_name_hits(need, items)[:5]
+            self._record("market_prelookup", {
+                "need": need, "ok": True, "shelf_size": shelf_size,
+                "hits": lexical})
+
+        semantic = self._market_search(need)
+        if not lexical_ok and not semantic:
+            # Neither lookup came back. No answer -- which is not an answer of
+            # "nothing there", and must never license the forge.
             return ""
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("items") or data.get("resources") or []
-        else:
-            items = []
-        if not isinstance(items, list):
-            items = []
-        words = {w for w in need.lower().replace("_", " ").split() if len(w) > 3}
-        hits = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("id") or "")
-            desc = str(item.get("description") or "")
-            hay = (name + " " + desc).lower().replace("_", " ")
-            overlap = sum(1 for w in words if w in hay)
-            if overlap >= 2 or (name and name in need):
-                hits.append((overlap, name))
-        self._record("market_prelookup", {"need": need, "ok": True,
-                                          "shelf_size": len(items),
-                                          "hits": [n for _, n in hits[:5]]})
-        if not hits:
+
+        labelled: list[tuple[str, list[str]]] = []
+        index: dict[str, list[str]] = {}
+        for name, why in ([(h["name"], "synonym") for h in semantic]
+                          + [(n, "name") for n in lexical]):
+            if name not in index:
+                index[name] = []
+                labelled.append((name, index[name]))
+            if why not in index[name]:
+                index[name].append(why)
+        rendered = ", ".join("%s (%s)" % (n, "+".join(w)) for n, w in labelled[:5])
+        where = "/resources" if lexical_ok else "/resources (unreachable)"
+        where += (" + /search" if semantic else
+                  " + /search (no answer or no confident hit)")
+        if not labelled:
+            if not lexical_ok:
+                return ""                 # unreachable shelf is not an answer
+            tail = (", and the semantic search agreed" if semantic else
+                    "; /search did not answer, so an entry that does this job "
+                    "under different words cannot be ruled out")
             return ("Tool-market pre-lookup: the shelf answered and carries no "
-                    "entry matching this need, so this forge is not a duplicate.")
-        hits.sort(reverse=True)
+                    "entry matching this need (%s, %s entries%s) -- this forge "
+                    "is not a duplicate."
+                    % (where, "?" if shelf_size is None else shelf_size, tail))
         return ("Tool-market pre-lookup: the shelf already carries entries that "
                 "overlap this need: %s. Do not re-forge one of these -- if one "
-                "serves the need, say which and use it instead."
-                % ", ".join(n for _, n in hits[:5]))
+                "serves the need, say which and use it instead. (Looked up via "
+                "%s.)" % (rendered, where))
 
     def _sync_to_market(self, spec: Any) -> dict[str, Any]:
         """Publish a freshly forged tool to the sibling tool-market.

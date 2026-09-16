@@ -9,6 +9,14 @@ not a gate.
 These tests pin the gate, not the prose: the lookup happens on the path the
 forge takes, it runs before `pipeline.forge`, and -- the subtle half -- a
 market that cannot answer is NOT read as "the shelf does not have it".
+
+The gate has two halves, because one of them cannot see the case that
+matters. `/resources` answers "is this name already on the shelf"; the
+market's hybrid `/search` answers "is this job already on the shelf under
+other words". Both are exercised below, along with the noise each half was
+measured to produce before it was tightened: description-word coincidences
+(`host_artifact_scan` for a question about processes) and prefix matches
+(`report` for `repo`).
 """
 from __future__ import annotations
 
@@ -27,24 +35,43 @@ def _agent() -> ForgeAgent:
     return ForgeAgent(MockLLMClient(), policy=FULL_FREEDOM)
 
 
-def _shelf(items):
-    class _Resp:
-        def __init__(self, payload):
-            self._b = io.BytesIO(json.dumps(payload).encode("utf-8"))
+class _Resp:
+    def __init__(self, payload):
+        raw = payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode("utf-8")
+        self._b = io.BytesIO(raw)
 
-        def read(self):
-            return self._b.read()
+    def read(self):
+        return self._b.read()
 
-        def __enter__(self):
-            return self
+    def __enter__(self):
+        return self
 
-        def __exit__(self, *a):
-            return False
+    def __exit__(self, *a):
+        return False
 
-    def _open(req, timeout=None):
-        return _Resp(items)
 
-    return _open
+def _open(payload):
+    def _u(req, timeout=None):
+        return _Resp(payload)
+    return _u
+
+
+def _router(resources=None, search=None, resources_raise=False, search_raise=False):
+    """Answer `/resources` and `/search` separately, as the real market does."""
+    def _u(req, timeout=None):
+        url = getattr(req, "full_url", None) or str(req)
+        if "/search" in url:
+            if search_raise:
+                raise OSError("connection refused")
+            return _Resp(search if search is not None else {"results": []})
+        if resources_raise:
+            raise OSError("connection refused")
+        return _Resp(resources if resources is not None else [])
+    return _u
+
+
+def _hits(pairs):
+    return {"results": [{"name": n, "score": s} for n, s in pairs]}
 
 
 class TestPreLookupRunsAndIsHonest:
@@ -59,13 +86,13 @@ class TestPreLookupRunsAndIsHonest:
             "an unreachable shelf must not be read as permission to forge: " + repr(out))
 
     def test_empty_shelf_says_so(self, monkeypatch):
-        monkeypatch.setattr(urllib.request, "urlopen", _shelf([]))
+        monkeypatch.setattr(urllib.request, "urlopen", _open([]))
         out = _agent()._prelookup_market("read the last lines of a board file")
-        assert "no entry" in out.lower() or "no" in out.lower()
+        assert "no" in out.lower()
         assert "duplicate" in out.lower()
 
     def test_overlapping_entry_is_named(self, monkeypatch):
-        monkeypatch.setattr(urllib.request, "urlopen", _shelf([
+        monkeypatch.setattr(urllib.request, "urlopen", _open([
             {"id": "tool:read_bus_ndjson", "name": "read_bus_ndjson",
              "description": "Read the last N lines of an agent-bus ndjson board file"},
         ]))
@@ -75,7 +102,7 @@ class TestPreLookupRunsAndIsHonest:
 
     def test_lookup_lands_before_the_forge(self, monkeypatch):
         """The point of the whole change: it is on the forge path."""
-        monkeypatch.setattr(urllib.request, "urlopen", _shelf([]))
+        monkeypatch.setattr(urllib.request, "urlopen", _open([]))
         a = _agent()
         seen = {}
 
@@ -88,3 +115,149 @@ class TestPreLookupRunsAndIsHonest:
         a.registry.get("forge_tool").fn("read the last lines of a board file")
         assert "Tool-market pre-lookup" in seen.get("context", ""), (
             "the shelf was never consulted on the forge path: " + repr(seen))
+
+    def test_a_down_market_does_not_block_the_forge(self, monkeypatch):
+        """Best-effort by construction: the gate reports, it never refuses."""
+        def _boom(req, timeout=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+        a = _agent()
+        seen = {}
+
+        def _fake_forge(need, context=None, should_abort=None, **kw):
+            seen["called"] = True
+            seen["context"] = context or ""
+            return SimpleNamespace(ok=False, aborted=False, rounds=1, spec=None)
+
+        a.pipeline = SimpleNamespace(forge=_fake_forge)
+        out = a.registry.get("forge_tool").fn("read the last lines of a board file")
+        assert seen.get("called"), "a dead market stopped the forge"
+        assert "pre-lookup" not in seen["context"].lower()
+
+
+class TestSameNameHalf:
+    def test_a_description_coincidence_is_not_a_name_match(self, monkeypatch):
+        """`host_artifact_scan` was named for a need about processes.
+
+        The words `running` and `processes` were in its description. That is a
+        coincidence of English, not a duplicate, and naming it teaches the agent
+        to ignore the gate.
+        """
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "host_artifact_scan",
+                        "description": "Scan the host for running processes, ports and temp files"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("count the running processes on this windows machine")
+        assert "host_artifact_scan" not in out
+        assert "no entry" in out.lower() or "not a duplicate" in out.lower()
+
+    def test_stopwords_do_not_count_toward_the_threshold(self, monkeypatch):
+        """`and`/`the`/`with` are how two unrelated names reach two words."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "inspect_repo_the_and_gitignore_dir",
+                        "description": "x"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("transcode the video and report the bitrate")
+        assert "inspect_repo" not in out
+
+    def test_a_prefix_is_not_a_word(self, monkeypatch):
+        """`repo` must not match `report`, which is how it named a gitignore tool."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "inspect_repo_gitignore_and_systemdrive_dir",
+                        "description": "Report on a repository's ignore file"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("transcode a video with ffmpeg and report the bitrate")
+        assert "inspect_repo" not in out
+
+    def test_two_shared_words_in_the_name_are_a_match(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "list_agent_processes",
+                        "description": "List the agent processes on this host"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("list the agent processes running here")
+        assert "list_agent_processes" in out
+        assert "(name)" in out
+
+    def test_an_abbreviation_is_left_to_the_semantic_half(self, monkeypatch):
+        """`win` is not `window`. Pinned as a known, covered-elsewhere gap.
+
+        The name half answers "is this name the need's"; it is not a
+        spell-checker, and stretching it into one is how `repo` matched
+        `report`. The semantic half is what catches this, and asserting the gap
+        here means the day someone widens the rule they see what it was
+        protecting.
+        """
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "list_agent_processes_win",
+                        "description": "List agent processes on Windows"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("count the running processes on this windows machine")
+        assert "list_agent_processes_win" not in out
+
+    def test_the_whole_name_verbatim_always_matches(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "read_bus_ndjson", "description": "x"}],
+            search={"results": []}))
+        out = _agent()._prelookup_market("read_bus_ndjson")
+        assert "read_bus_ndjson" in out
+
+
+class TestSameJobHalf:
+    """The half `/resources` cannot see: the same job under different words."""
+
+    def test_a_synonym_with_no_shared_name_words_is_named(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[{"name": "list_agent_processes_win", "description": "unrelated text"}],
+            search=_hits([("list_agent_processes_win", 0.99), ("tail_board_file", 0.97)])))
+        out = _agent()._prelookup_market("count the running processes on this windows machine")
+        assert "list_agent_processes_win" in out
+        assert "synonym" in out
+
+    def test_a_low_score_also_ran_is_not_reported_as_a_synonym(self, monkeypatch):
+        """Measured on the live shelf: correct answer 0.10, runner-up 0.038."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[], search=_hits([("list_agent_processes_win", 0.1003),
+                                        ("powershell_run", 0.0154)])))
+        out = _agent()._prelookup_market("count the running processes on this windows machine")
+        assert "list_agent_processes_win" in out
+        assert "powershell_run" not in out
+
+    def test_the_markets_own_confidence_verdict_is_obeyed(self, monkeypatch):
+        """It says `confident: false`; taking it at its word is the honest read."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[],
+            search={"results": [{"name": "scan_skills_library", "score": 0.9}],
+                    "confidence": {"confident": False, "threshold": 0.01}}))
+        out = _agent()._prelookup_market("transcode a video with ffmpeg")
+        assert "scan_skills_library" not in out
+
+    def test_search_down_is_a_partial_answer_not_silence(self, monkeypatch):
+        """`/resources` answered. That is an answer, and a partial one."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[], search_raise=True))
+        out = _agent()._prelookup_market("transcode a video with ffmpeg and report the bitrate")
+        assert out != "", "a partial answer must not collapse to no answer"
+        assert "/search" in out
+        assert "cannot be ruled out" in out
+
+    def test_both_halves_down_is_still_no_answer(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources_raise=True, search_raise=True))
+        assert _agent()._prelookup_market("anything at all") == ""
+
+    def test_a_malformed_search_payload_does_not_raise(self, monkeypatch):
+        """The market is another process; its failures are not ours to crash on."""
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[], search={"results": "not a list"}))
+        out = _agent()._prelookup_market("read the last lines of a board file")
+        assert isinstance(out, str) and out
+
+    def test_the_ledger_records_both_lookups(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", _router(
+            resources=[], search=_hits([("tail_board_file", 0.9)])))
+        a = _agent()
+        a._prelookup_market("read the last lines of a board file")
+        kinds = {e.get("kind") for e in a.trace}
+        assert "market_prelookup" in kinds
+        assert "market_semantic_lookup" in kinds
