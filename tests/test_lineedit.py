@@ -528,22 +528,145 @@ def test_ctrl_c_is_not_a_copy():
     assert editor.selection() == (2, 6)      # untouched, still there to delete
 
 
-def test_the_mouse_can_be_left_to_the_console():
-    """`AUTOFORGE_MOUSE=0` is the way out for a console's own drag-to-copy."""
+def test_the_mouse_belongs_to_the_console_by_default():
+    """The wheel and drag-to-copy work unless someone asks otherwise.
+
+    Taking the mouse away fixes a real thing -- a drag over the middle of the
+    line then Delete used to delete the last character -- but it costs the
+    whole session its scrolling, and that trade was reported as worse than
+    the bug: "the mouse is dead, the wheel does nothing". So the console
+    keeps it, and the editor selects on the keys instead.
+    """
     import os as _os
     from autoforge.core import lineedit as le
 
     old = _os.environ.get("AUTOFORGE_MOUSE")
-    _os.environ["AUTOFORGE_MOUSE"] = "0"
+    _os.environ.pop("AUTOFORGE_MOUSE", None)
     try:
         assert le.mouse_enabled() is False
         editor, term, _ = build([], columns=40)
         assert term.mouse is False            # nothing was taken
     finally:
+        if old is not None:
+            _os.environ["AUTOFORGE_MOUSE"] = old
+
+
+def test_the_editor_can_still_ask_for_the_mouse():
+    """`AUTOFORGE_MOUSE=1` hands it over, for anyone who prefers that."""
+    import os as _os
+    from autoforge.core import lineedit as le
+
+    old = _os.environ.get("AUTOFORGE_MOUSE")
+    _os.environ["AUTOFORGE_MOUSE"] = "1"
+    try:
+        assert le.mouse_enabled() is True
+        editor, term, _ = build([], columns=40)
+        assert term.mouse is True             # and it was taken
+    finally:
         if old is None:
             _os.environ.pop("AUTOFORGE_MOUSE", None)
         else:
             _os.environ["AUTOFORGE_MOUSE"] = old
+
+
+# -- selecting with the keys, which is what replaced the mouse ---------
+def test_shift_arrow_selects_and_delete_removes_the_span():
+    """The gesture that has to survive without the mouse.
+
+    Shift+Left walks back over the line, and it is what a person uses to say
+    "these characters, not one" once the console owns the drag again.
+    """
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    for _ in range(3):
+        editor._consume("\x1b[1;2D")          # shift+left
+    assert editor.selection() == (5, 8)        # "fgh"
+    editor._consume("\x1b[3~")                # delete
+    assert "".join(editor._buf) == "abcde"
+    assert editor.selection() is None
+
+
+def test_shift_home_selects_to_the_start_of_the_line():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    editor._consume("\x1b[1;2H")              # shift+home
+    assert editor.selection() == (0, 8)
+    editor._consume("\x7f")                   # backspace eats the span
+    assert "".join(editor._buf) == ""
+
+
+def test_shift_end_selects_to_the_end_of_the_line():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    editor._cursor = 2
+    editor._consume("\x1b[1;2F")              # shift+end
+    assert editor.selection() == (2, 8)
+
+
+def test_a_second_shift_arrow_extends_the_same_selection():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    editor._consume("\x1b[1;2D")
+    editor._consume("\x1b[1;2D")
+    assert editor.selection() == (6, 8)
+
+
+def test_a_plain_arrow_drops_the_selection():
+    """An unshifted move must not leave a highlight lying to the next key."""
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    editor._consume("\x1b[1;2D")
+    assert editor.selection() is not None
+    editor._consume("\x1b[D")                 # plain left
+    assert editor.selection() is None
+
+
+def test_shift_then_plain_arrow_in_one_burst_still_drops_it():
+    """A fast typist produces both in one read; the gesture is still two."""
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    editor._consume("\x1b[1;2D\x1b[D")
+    assert editor.selection() is None
+    assert editor._cursor == 6
+
+
+def test_copy_acts_on_a_keyboard_selection_too():
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "",
+                         clipboard_write=lambda text: True)
+    editor._consume("abcdefgh")
+    for _ in range(3):
+        editor._consume("\x1b[1;2D")
+    editor._consume("\x1b[2;5~")              # Ctrl+Insert
+    assert "".join(editor._buf) == "abcdefgh"
+    assert editor.selection() is None
+
+
+def test_a_shift_arrow_is_recognised_from_a_console_record():
+    """The decoder must spell the shift, or the key arrives as a plain move.
+
+    A console puts the modifier in the record's key state and the same
+    virtual key carries both meanings, so this is the join that decides
+    whether Shift+Left selects or just moves.
+    """
+    from autoforge.core.lineedit import _console_records, _record_text
+
+    INPUT_RECORD, _ = _console_records()
+
+    def record(vk, shift):
+        r = INPUT_RECORD()
+        r.EventType = 1
+        r.Event.KeyEvent.bKeyDown = 1
+        r.Event.KeyEvent.wRepeatCount = 1
+        r.Event.KeyEvent.wVirtualKeyCode = vk
+        r.Event.KeyEvent.uChar = "\x00"
+        r.Event.KeyEvent.dwControlKeyState = 0x10 if shift else 0
+        return r
+
+    assert _record_text(record(0x25, True)) == "\x1b[1;2D"     # shift+left
+    assert _record_text(record(0x25, False)) == "\x1b[D"      # left
+    assert _record_text(record(0x24, True)) == "\x1b[1;2H"     # shift+home
+    assert _record_text(record(0x23, True)) == "\x1b[1;2F"     # shift+end
+    assert _record_text(record(0x27, True)) == "\x1b[1;2C"     # shift+right
 
 
 def test_paste_inserts_the_clipboard_at_the_cursor():

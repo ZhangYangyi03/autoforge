@@ -47,15 +47,23 @@ cursor still sitting at the end of the line, which is why selecting four
 characters in the middle and pressing Delete deleted the last one instead.
 The selection was made, and invisible to the only code that could act on it.
 
-This module takes the mouse away from the console, asks for mouse reports,
-and keeps the selection itself: an anchor plus a cursor, the characters
-between them drawn in reverse video. Backspace, Delete and ^X remove exactly
-that span, ^C copies it, ^V/^Y and a right-click put the clipboard back in,
-and the console has no say in any of it. On Windows all of that reads the
-console *input records* directly rather than the ANSI sequences a
-`?1006h`-style request would produce, and that is deliberate: those escape
-sequences take the console's line editing and its ^C handling away with
-them, and both are things this editor must not lose.
+The editor *can* take the mouse and keep the selection itself -- an anchor
+plus a cursor drawn in reverse video, with Backspace, Delete and ^X removing
+exactly that span. It does not do so by default, because the price is the
+whole session's mouse and not just the gesture: `ENABLE_QUICK_EDIT_MODE` off
+means the console stops selecting *and stops scrolling on the wheel*, so a
+person who wanted to read back through what the agent printed found the
+terminal had stopped listening. That is worse than the bug it fixes, and it
+was reported as exactly that. `AUTOFORGE_MOUSE=1` asks for it anyway.
+
+What replaced it costs nobody their scrolling: Shift+arrows and
+Shift+Home/End make a selection on the keys, Ctrl+Insert copies it,
+Ctrl+Delete cuts it, Shift+Insert and ^V/^Y paste, and Delete, Backspace and
+^K/^U/^W remove exactly the selected span. Where the mouse *is* taken, the
+console's records are read directly rather than the ANSI sequences a
+`?1006h`-style request would produce, and that is still deliberate: those
+escape sequences take the console's line editing and its ^C handling away
+with them, and both are things this editor must not lose.
 
 Not every terminal can be driven this way — a pipe, a dumb `TERM`, a `stdin`
 whose `fileno()` is not a tty. `available` is False there, and `Steering` falls
@@ -137,6 +145,13 @@ _KEYS = {
     "\x1bOH": "home",
     "\x1bOF": "end",
     "\x1b[3~": "delete",
+    # Shift+arrow and Shift+Home/End select, the way they do in every editor
+    # a person already uses. They are what replaces the mouse gesture, so the
+    # editor keeps the ability to select without taking the console's wheel.
+    "\x1b[1;2D": "sel_left",
+    "\x1b[1;2C": "sel_right",
+    "\x1b[1;2H": "sel_home",
+    "\x1b[1;2F": "sel_end",
     "\x1b[2;5~": "copy",     # Ctrl+Insert
     "\x1b[3;5~": "cut",      # Ctrl+Delete
     "\x1b[2;2~": "paste",    # Shift+Insert
@@ -465,6 +480,16 @@ _WIN_VK = {
     0x2D: "\x1b[2~",  # insert
 }
 
+#: Keys whose *Shift* form means "extend the selection". A console reports
+#: the modifier in the record's key state, not in the key, so the same virtual
+#: key has to be spelled two ways and the decoder picks between them.
+_WIN_VK_SHIFT = {
+    0x25: "\x1b[1;2D",   # shift+left
+    0x27: "\x1b[1;2C",   # shift+right
+    0x24: "\x1b[1;2H",   # shift+home
+    0x23: "\x1b[1;2F",   # shift+end
+}
+
 #: A console mouse event, reduced to the handful of gestures that mean
 #: something. `dwEventFlags` says whether a button is held down and moving,
 #: and `dwButtonState` says which button; the pair is what tells a drag from
@@ -492,15 +517,31 @@ _SHIFT = 0x0010
 def mouse_enabled() -> bool:
     """Whether the editor may take the mouse away from the console.
 
-    On by default, because a console that keeps the selection is a console
-    where selecting the middle of the line and pressing Delete deletes the
-    last character. `AUTOFORGE_MOUSE=0` is the way out for anyone who would
-    rather keep the console's own drag-to-copy and its mouse-wheel
-    scrolling: with it set, nothing about the mouse is changed and the
-    editor behaves as it did before.
+    OFF by default, and that is a reversal with a reported cost behind it.
+    Taking the mouse fixes a real thing -- a drag over the middle of the
+    line followed by Delete used to delete the last character, because the
+    console painted the selection, kept it, and delivered none of it. But the
+    price is paid for the whole session, not for the moment of the gesture:
+    the console's drag-to-copy stops working, the arrow keys still move the
+    line but *the wheel no longer scrolls anything*, and a person who wanted
+    to scroll back through what the agent printed -- the ordinary reason to
+    touch the mouse in a terminal -- finds the terminal has stopped
+    listening. That is a worse trade than the bug it fixes, and it was
+    reported as exactly that: "the mouse is dead, the wheel does nothing,
+    nothing can be selected".
+
+    So the mouse stays the console's, and the editor offers the same ability
+    on the keys instead, where it costs nobody their scrolling: Shift+arrows
+    and Shift+Home/End make a selection, Ctrl+Insert copies it, Ctrl+Delete
+    cuts it, Shift+Insert pastes, and Delete, Backspace and ^K/^U/^W remove
+    exactly the selected span.
+
+    `AUTOFORGE_MOUSE=1` (or `on`/`true`/`yes`) hands the mouse to the editor
+    instead, for anyone who would rather have its selection and give up the
+    console's.
     """
     value = os.environ.get("AUTOFORGE_MOUSE", "").strip().lower()
-    return value not in ("0", "off", "false", "no")
+    return value in ("1", "on", "true", "yes")
 
 
 def _mouse_report(event) -> str:
@@ -630,6 +671,8 @@ def _record_text(record) -> str:
         return "\x1b[3;5~"
     if vk == 0x2D and shift:
         return "\x1b[2;2~"
+    if shift and vk in _WIN_VK_SHIFT:
+        return _WIN_VK_SHIFT[vk]
     text = _WIN_VK.get(vk)
     if text is None:
         ch = key.uChar
@@ -775,10 +818,11 @@ class _RawTerminal:
     def _set_input_mode(self, mouse: bool) -> bool:
         """Own the console line, and take the mouse if asked for it.
 
-        With `mouse` False the console keeps its own quick-edit selection,
-        which is what `AUTOFORGE_MOUSE=0` asks for: the editor will then not
-        hear about a selection, and the console's drag-to-copy and wheel
-        scrolling go on working as they always did.
+        With `mouse` False -- the default -- the console keeps its own
+        quick-edit, so its drag-to-copy and its wheel scrolling go on working
+        and the editor hears nothing about a selection. That is the trade the
+        default makes on purpose: the editor's own selection costs the session
+        its scrolling, and selecting on the keys costs it nothing.
         """
         import ctypes
 
@@ -1596,18 +1640,34 @@ class LineEditor:
         return self._as_paste(line)
 
     def _apply_key(self, name: str) -> None:
+        if name.startswith("sel_"):
+            # Shift+arrow / Shift+Home / Shift+End extend a selection. The
+            # anchor is set on the first one, at wherever the cursor stood, so
+            # the selection starts where the person was looking -- and it is
+            # only set once, so a second Shift+arrow extends the same
+            # selection instead of starting a new one.
+            if self._anchor is None:
+                self._anchor = self._cursor
+            name = name[4:]
+        elif name in ("left", "right", "home", "end"):
+            # An *unshifted* movement drops the selection, as it does in every
+            # editor: a highlight left behind under a moving cursor lies about
+            # what the next key will act on. Only movement does that. Delete,
+            # copy, cut and paste are precisely the keys that act *on* the
+            # selection, and clearing the anchor for them would delete one
+            # character where a highlighted span was meant. No state is needed
+            # to tell shift from no-shift -- a console reports the modifier in
+            # the record and the decoder spells it in the sequence, so the key
+            # already says which gesture it is, even inside one burst.
+            self._anchor = None
         if name == "left":
             self._cursor = max(0, self._cursor - 1)
-            self._anchor = None
         elif name == "right":
             self._cursor = min(len(self._buf), self._cursor + 1)
-            self._anchor = None
         elif name == "home":
             self._cursor = 0
-            self._anchor = None
         elif name == "end":
             self._cursor = len(self._buf)
-            self._anchor = None
         elif name == "copy":
             self._copy_selection()
         elif name == "cut":
