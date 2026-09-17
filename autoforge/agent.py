@@ -1301,6 +1301,87 @@ class ForgeAgent:
                 hits.append(name)
         return hits
 
+    # A need arrives as a sentence; the registry's `search` is conjunctive.
+    # Measured 2026-09-17: "pdf merge", "github issues", "web scrape" and
+    # "send email" all returned 0 servers, while "pdf" and "github" alone
+    # returned 8 each. So the sentence is reduced to one content word. Longest
+    # first, because in "count running processes on this windows box" the
+    # informative word is `processes` and the longest-word rule finds it without
+    # a dictionary. Two words are tried at most, so the worst case is two
+    # requests, not one per word.
+    _DISCOVER_WORDS_AT_MOST = 2
+
+    def _discover_upstream(self, need: str) -> list[dict[str, Any]]:
+        """Ask the market to look in the public MCP registry, and report what it found.
+
+        The third leg of the pre-forge lookup. `/resources` finds the same name,
+        `/search` finds the same job under different words -- both only over the
+        153 resources *we* hold. Neither of them can answer "does a tool for this
+        exist anywhere", and on 2026-09-17 that was the difference between an
+        agent that forges what already exists and one that uses it.
+
+        Best-effort, like the other two: `[]` means *no answer*, never *nothing
+        there*. A market that is down, a registry that times out, or a feature
+        turned off all return `[]`, and the forge proceeds -- the caller must not
+        read a broken lookup as an empty world.
+        """
+        words = [w for w in re.split(r"[^a-z0-9]+", need.lower())
+                 if len(w) > 2 and w not in self._LEXICAL_STOPWORDS]
+        # Deduplicate while keeping order, then longest-first: a long word is
+        # more likely to name the capability than a short one that every need
+        # happens to contain.
+        seen: list[str] = []
+        for w in words:
+            if w not in seen:
+                seen.append(w)
+        ranked = sorted(seen, key=lambda w: -len(w))[: self._DISCOVER_WORDS_AT_MOST]
+        if not ranked:
+            return []
+
+        try:
+            import json as _json
+            import os as _os
+            import urllib.request as _url
+        except Exception:                                   # noqa: BLE001
+            return []
+        url = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
+
+        found: list[dict[str, Any]] = []
+        for word in ranked:
+            try:
+                body = _json.dumps({"q": word, "limit": 8}).encode("utf-8")
+                req = _url.Request(url.rstrip("/") + "/discover", data=body,
+                                   headers={"Content-Type": "application/json"})
+                with _url.urlopen(req, timeout=25) as resp:
+                    data = _json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception as exc:                        # noqa: BLE001
+                self._record("market_discover", {
+                    "need": need, "q": word, "ok": False,
+                    "error": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            # A market too old to have `/discover` answers 404 with a JSON body,
+            # which parses cleanly and would otherwise be recorded as a
+            # successful lookup that found nothing -- the exact confusion this
+            # whole method exists to avoid. A response without `results` is a
+            # *malformed* answer, not an empty one, and says so in the ledger.
+            if not isinstance(data, dict) or "results" not in data:
+                self._record("market_discover", {
+                    "need": need, "q": word, "ok": False,
+                    "error": "malformed /discover response (is the market too "
+                             "old for this endpoint?): %s"
+                             % str(data)[:160]})
+                continue
+            hits = [h for h in (data.get("results") or [])
+                    if isinstance(h, dict) and h.get("name")]
+            self._record("market_discover", {
+                "need": need, "q": word, "ok": True,
+                "found": data.get("found"), "inserted": data.get("inserted"),
+                "hits": [h["name"] for h in hits]})
+            if hits:
+                found = hits
+                break
+        return found
+
     def _prelookup_market(self, need: str) -> str:
         """Ask the shelf *before* the forge instead of only after it.
 
@@ -1361,10 +1442,21 @@ class ForgeAgent:
             # "nothing there", and must never license the forge.
             return ""
 
+        # Third leg, and only when the first two agree there is nothing: the
+        # shelf holds 153 resources, all of them either forged here or pushed by
+        # a sibling, so "not on the shelf" and "does not exist" were the same
+        # sentence -- and for anything outside this agent's own history they
+        # were not. The public MCP registry holds thousands of servers and is
+        # searchable server-side; `/discover` on the market asks it and registers
+        # the hits here as DRAFT. Cheap when it hits, one bounded request when it
+        # does not, and skipped entirely when the shelf already answered yes.
+        upstream = [] if (lexical or semantic) else self._discover_upstream(need)
+
         labelled: list[tuple[str, list[str]]] = []
         index: dict[str, list[str]] = {}
         for name, why in ([(h["name"], "synonym") for h in semantic]
-                          + [(n, "name") for n in lexical]):
+                          + [(n, "name") for n in lexical]
+                          + [(u["name"], "upstream") for u in upstream]):
             if name not in index:
                 index[name] = []
                 labelled.append((name, index[name]))
@@ -1374,6 +1466,26 @@ class ForgeAgent:
         where = "/resources" if lexical_ok else "/resources (unreachable)"
         where += (" + /search" if semantic else
                   " + /search (no answer or no confident hit)")
+        if upstream:
+            # Reported before the "nothing on the shelf" branch, because it is a
+            # different answer: the shelf was empty and the world was not.
+            lines = ["Tool-market pre-lookup: nothing on the local shelf, but the "
+                     "public MCP registry has entries for this need, now "
+                     "registered here as DRAFT resources:"]
+            for u in upstream[:5]:
+                how = ("callable over the network" if u.get("callable")
+                       else "needs its package launched first -- it is a pointer, "
+                            "not a callable tool")
+                lines.append("  - %s [%s, %s] %s"
+                             % (u["name"], u.get("state", "draft"), how,
+                                (u.get("description") or "")[:110]))
+            lines.append("Do not re-forge one of these blindly. If one serves the "
+                         "need, say which and use it; if none does, say why not in "
+                         "the forge context, then forge. A remote MCP entry is "
+                         "called through the tool-market (its contract speaks "
+                         "JSON-RPC to the server) and does NOT run local code.")
+            return "\n".join(lines)
+
         if not labelled:
             if not lexical_ok:
                 return ""                 # unreachable shelf is not an answer

@@ -261,3 +261,155 @@ class TestSameJobHalf:
         kinds = {e.get("kind") for e in a.trace}
         assert "market_prelookup" in kinds
         assert "market_semantic_lookup" in kinds
+
+
+class TestUpstreamHalf:
+    """The third leg: the shelf is 153 resources, the world is not.
+
+    `/resources` finds the same name, `/search` finds the same job under other
+    words -- both only over what *we* hold. On 2026-09-17 that made "not on the
+    shelf" and "does not exist" the same sentence, which is how an agent forges
+    what it could have used. This leg asks the market to look in the public MCP
+    registry (`POST /discover`) and reports what came back.
+    """
+
+    @staticmethod
+    def _router(resources, search, discover):
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                return _Resp(discover)
+            if "/search" in url:
+                return _Resp(search)
+            return _Resp(resources)
+        return _u
+
+    def test_it_is_asked_only_when_the_shelf_has_nothing(self, monkeypatch):
+        """A shelf that already answered yes does not need the internet."""
+        calls = {"discover": 0}
+
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                calls["discover"] += 1
+                return _Resp({"results": []})
+            if "/search" in url:
+                return _Resp(_hits([("tail_board_file", 0.9)]))
+            return _Resp([{"name": "tail_board_file", "description": "x"}])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        _agent()._prelookup_market("read the last lines of a board file")
+        assert calls["discover"] == 0
+
+    def test_upstream_hits_are_reported_as_draft_not_as_callable_tools(self, monkeypatch):
+        discover = {"found": 2, "inserted": 2, "results": [
+            {"name": "mcp_x_pdf", "state": "draft", "callable": True,
+             "requires_launch": False, "description": "merge pdfs",
+             "origin": "x/pdf"},
+            {"name": "mcp_x_pkg", "state": "draft", "callable": False,
+             "requires_launch": True, "description": "a package",
+             "origin": "x/pkg"}]}
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            self._router([], {"results": []}, discover))
+        out = _agent()._prelookup_market("merge two pdf files into one")
+        assert "mcp_x_pdf" in out and "mcp_x_pkg" in out
+        assert "public MCP registry" in out
+        # The two kinds must not read the same: one is callable, one is a pointer.
+        assert "callable over the network" in out
+        assert "needs its package launched" in out
+        assert "DRAFT" in out
+        assert "Do not re-forge" in out
+
+    def test_a_need_is_reduced_to_one_content_word(self, monkeypatch):
+        """The registry's search is conjunctive -- measured 2026-09-17:
+        "pdf merge" and "github issues" returned 0, "pdf" and "github" returned
+        8 each. A sentence has to become a word before it is worth sending."""
+        seen = []
+
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                seen.append(json.loads(req.data.decode("utf-8"))["q"])
+                return _Resp({"results": []})
+            if "/search" in url:
+                return _Resp({"results": []})
+            return _Resp([])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        _agent()._prelookup_market("count the running processes on this windows box")
+        assert seen, "the registry was never asked"
+        assert seen[0] == "processes", (
+            "the longest content word is the informative one: " + repr(seen))
+        assert all(" " not in q for q in seen)
+
+    def test_it_sends_at_most_two_queries(self, monkeypatch):
+        seen = []
+
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                seen.append(json.loads(req.data.decode("utf-8"))["q"])
+                return _Resp({"results": []})
+            if "/search" in url:
+                return _Resp({"results": []})
+            return _Resp([])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        _agent()._prelookup_market(
+            "transcode an enormous video file with hardware acceleration")
+        assert 1 <= len(seen) <= 2, seen
+
+    def test_a_need_with_no_content_word_does_not_query(self, monkeypatch):
+        calls = {"n": 0}
+
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                calls["n"] += 1
+            if "/search" in url:
+                return _Resp({"results": []})
+            return _Resp([])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        out = _agent()._prelookup_market("do it")
+        assert calls["n"] == 0
+        assert "no entry" in out.lower() or "not a duplicate" in out.lower()
+
+    def test_a_market_without_the_endpoint_is_not_recorded_as_found_nothing(self, monkeypatch):
+        """A 404 body parses cleanly. Reading it as an answer would turn
+        "this market is too old" into "the world has nothing"."""
+        monkeypatch.setattr(urllib.request, "urlopen", self._router(
+            [], {"results": []}, {"detail": "Not Found"}))
+        a = _agent()
+        assert a._discover_upstream("merge two pdf files into one") == []
+        events = [e for e in a.trace if e.get("kind") == "market_discover"]
+        assert events and events[0].get("ok") is False
+        assert "malformed" in str(events[0].get("error", "")) or \
+               "results" in str(events[0].get("error", ""))
+
+    def test_upstream_failure_leaves_the_no_entry_answer_intact(self, monkeypatch):
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", None) or str(req)
+            if "/discover" in url:
+                raise OSError("connection refused")
+            if "/search" in url:
+                return _Resp({"results": []})
+            return _Resp([])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        out = _agent()._prelookup_market("merge two pdf files into one")
+        assert out != ""
+        assert "no entry" in out.lower() or "not a duplicate" in out.lower()
+
+    def test_the_ledger_records_what_upstream_answered(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "urlopen", self._router(
+            [], {"results": []},
+            {"found": 1, "inserted": 1, "results": [
+                {"name": "mcp_x_pdf", "state": "draft", "callable": True,
+                 "description": "merge pdfs", "origin": "x/pdf"}]}))
+        a = _agent()
+        a._discover_upstream("merge two pdf files into one")
+        events = [e for e in a.trace if e.get("kind") == "market_discover"]
+        assert events and events[0]["ok"] is True
+        assert events[0]["found"] == 1 and events[0]["inserted"] == 1
+        assert events[0]["hits"] == ["mcp_x_pdf"]
