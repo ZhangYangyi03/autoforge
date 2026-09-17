@@ -1310,7 +1310,7 @@ def cmd_mission(args: argparse.Namespace) -> int:
     # inside it -- and a note of "done --file C:\...\autoforge.db" is a trap
     # that reads as data corruption later. Pull the known flags back out
     # instead of documenting an argument order nobody will remember.
-    for flag in ("--file", "--parent", "-p", "--next-step"):
+    for flag in ("--file", "--parent", "-p", "--next-step", "--waiting-on"):
         while flag in rest:
             i = rest.index(flag)
             value = rest[i + 1] if i + 1 < len(rest) else ""
@@ -1322,6 +1322,8 @@ def cmd_mission(args: argparse.Namespace) -> int:
                     pass
             elif flag == "--next-step":
                 args.next_step = value
+            elif flag == "--waiting-on":
+                args.waiting_on = value
             else:
                 store = MissionStore(value)
 
@@ -1330,6 +1332,54 @@ def cmd_mission(args: argparse.Namespace) -> int:
             return None
         t = text.strip().lstrip("Mm")
         return int(t) if t.isdigit() else None
+
+    if action == "sweep":
+        # The rule, applied on demand from a shell with no model in it. This is
+        # the path someone uses while deciding what to work on, so it must not
+        # need an API key to answer.
+        idle_hours = float(getattr(args, "idle_hours", 0) or 0)
+        out = store.sweep(idle_s=idle_hours * 3600.0 if idle_hours else 0.0)
+        if out.get("assumed"):
+            print("presumed complete: " + ", ".join(f"M{i}" for i in out["assumed"]))
+        if out.get("hardened"):
+            print("closed after a week of silence: "
+                  + ", ".join(f"M{i}" for i in out["hardened"]))
+        if out.get("waiting"):
+            print("left alone, waiting on something: "
+                  + ", ".join(f"M{i}" for i in out["waiting"]))
+        if out.get("skipped_parents"):
+            print("left alone, sub-missions still owed: "
+                  + ", ".join(f"M{i}" for i in out["skipped_parents"]))
+        if not (out.get("assumed") or out.get("hardened")):
+            print("nothing moved.")
+        return 0
+
+    if action == "wake":
+        mid = _id_or_none(rest[0]) if rest else None
+        if mid is None:
+            print("usage: auto mission wake <id> <why it is owed again>")
+            return 2
+        try:
+            m = store.wake(mid, note=" ".join(rest[1:]))
+        except MissionError as exc:
+            print(f"not woken: {exc}")
+            return 1
+        print(f"M{m.id} is owed again ({m.status}).")
+        return 0
+
+    if action == "assumed":
+        rows = store.assumption_report()
+        if not rows:
+            print("nothing is being presumed complete.")
+            return 0
+        for r in rows:
+            print(f"M{r['id']} silent {r['idle_hours']}h, assumed "
+                  f"{r['assumed_hours_ago']}h ago, closes in "
+                  f"{r['days_until_closed']}d: {r['text'][:70]}")
+            if r["next_step"]:
+                print(f"     next: {r['next_step'][:90]}")
+        print("mission_note M<id> or mission wake M<id> takes any of them back.")
+        return 0
 
     if action == "add":
         if not rest:
@@ -1343,7 +1393,8 @@ def cmd_mission(args: argparse.Namespace) -> int:
         if "--next-step" in rest:
             next_step = rest[rest.index("--next-step") + 1]
         try:
-            m = store.open(text, parent=parent, next_step=next_step)
+            m = store.open(text, parent=parent, next_step=next_step,
+                           blocked_on=(getattr(args, "waiting_on", "") or ""))
         except MissionError as exc:
             print(f"not recorded: {exc}")
             return 1
@@ -1357,9 +1408,11 @@ def cmd_mission(args: argparse.Namespace) -> int:
         if mid is None:
             print("usage: auto mission note <id> <note>")
             return 2
+        waiting = getattr(args, "waiting_on", None)
         try:
             m = store.note(mid, note=" ".join(rest[1:]),
-                           next_step=(getattr(args, "next_step", "") or None))
+                           next_step=(getattr(args, "next_step", "") or None),
+                           blocked_on=waiting)
         except MissionError as exc:
             print(exc)
             return 1
@@ -1444,10 +1497,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
     mi = sub.add_parser("mission", help="what is owed: open, note, close, list")
     mi.add_argument("mission_action", nargs="?", default="list",
-                    help="list (default) | all | add | note | close | drop | show | focus")
+                    help="list (default) | all | add | note | close | drop | show | "
+                         "focus | sweep | wake | assumed")
     mi.add_argument("--file", help="mission store (default: the same db as the tool store)")
     mi.add_argument("--parent", type=int, default=0, help="open a sub-mission under this id")
     mi.add_argument("--next-step", dest="next_step", default="", help="the next action")
+    mi.add_argument("--waiting-on", dest="waiting_on", default="",
+                    help="what this mission is waiting for; exempts it from the "
+                         "24h presumption of completion")
+    mi.add_argument("--idle-hours", dest="idle_hours", type=float, default=0.0,
+                    help="for sweep: override the 24h threshold")
     mi.add_argument("rest", nargs=argparse.REMAINDER,
                     help="free text for the action (id, note, mission sentence)")
 

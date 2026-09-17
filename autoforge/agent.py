@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import threading
 import textwrap
 import time
 from dataclasses import dataclass, field, replace
@@ -234,6 +235,21 @@ one is gone"):
   with what you were about to do, say so in one line -- the block is the record of
   what the operator asked for, and the conversation is the newer thing.
 
+Silence is read as done (operator rule, 2026-09-17: a task with no request to continue
+for more than 24 hours is ASSUMED complete):
+- A mission nobody has touched for 24 hours is presumed complete, and I say so out
+  loud rather than leaving it owed forever. The sweep runs at the start of every run;
+  mission_sweep shows the decision, mission_wake or mission_note overturns it.
+- Presumed is not finished. The mission stays in the report marked as an assumption,
+  and the operator contradicting it costs one word. Assuming is cheap on purpose;
+  what is not allowed is assuming AND closing in the same step, because that is just
+  a deletion with extra words. The real close waits a further week of silence and its
+  note says it was an assumption -- so 'the work finished' and 'nobody spoke for eight
+  days' can never be read as the same fact afterwards.
+- The one case where silence is NOT read as done: a mission with a sub-mission still
+  owed. Never presume the whole finished under a piece that is open.
+- If I know a mission is still wanted, I say so with mission_note before it goes
+  quiet. Silence is a claim now, and this rule makes it my claim to get right.
 Answering beats evidence-gathering (operator rule, 2026-09-15: three times in a row
 he interrupted a 'simple' task because it took minutes):
 - When what I ask is a QUESTION (what is it / what have we done / can you / which one)
@@ -1136,6 +1152,20 @@ class ForgeAgent:
         if self.store:
             self.store.save_baseline(baseline)
 
+    def _operator_should_yield(self) -> bool:
+        """The *cheap* question: should a model call give way so they get a reply?
+
+        ForgeAgent's own long steps deliberately do not ask this. They ask
+        `_operator_wants_the_floor`, which now means only "a real /stop", so a
+        question cannot destroy a forge that is minutes into its work.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+        except Exception:                     # noqa: BLE001 - reads as "no"
+            return False
+
     def _operator_wants_the_floor(self) -> bool:
         """Whether the operator has said something the forge has not consumed.
 
@@ -1739,7 +1769,11 @@ class ForgeAgent:
             if shelf:
                 over = (over + "\n\n" + shelf) if over else shelf
             res = self.pipeline.forge(
-                need, context=over, should_abort=self._operator_wants_the_floor,
+                need, context=over,
+                # Only a real /stop may kill a forge. A question typed
+                # while it runs used to arrive here as an abort and threw the
+                # whole round away -- see `_operator_said_something`.
+                should_abort=self._operator_wants_the_floor,
             )
             self._record("forge", {"need": need, "ok": res.ok})
             if res.aborted:
@@ -2774,6 +2808,87 @@ class ForgeAgent:
             self._missions = st
         return st
 
+    def _sweep_missions(self) -> dict[str, Any]:
+        """Apply the 24h rule once per run, and write what it assumed.
+
+        Called at the top of `_effective_prompt`, which is the one moment every
+        run passes through, so the projection cannot go stale behind a long
+        session that never re-reads the store.
+
+        It is deliberately NOT called from `MissionStore.report`: that method is
+        the read the prompt is built from, and a report that wrote would take the
+        store's write lock on every turn -- and, worse, would silently flip the
+        mission list mid-conversation with no event on the ledger saying who
+        decided that. An assumption about a person's silence is a decision, and a
+        decision goes on the record.
+
+        Absence of a store, or a store too old to know about this rule, must not
+        cost a turn: the whole point is that the prompt is never the fragile part.
+        """
+        out = {"assumed": [], "hardened": []}
+        if self.store is None:
+            return out
+        try:
+            store = self._mission_store()
+            if not hasattr(store, "sweep"):
+                return out
+            out = store.sweep(harden=True)
+        except Exception as exc:                    # noqa: BLE001 - never eat a turn
+            self._record("mission_sweep_failed", {"error": str(exc)[:200]},
+                         durable=False)
+            return out
+        # Ledger events only when something actually moved: a sweep that records
+        # itself every turn would grow the ledger by the turn count and read as
+        # activity in `my_history` when nothing happened.
+        for mid in out.get("assumed", []):
+            self._record("mission_assumed", {"id": mid})
+        for mid in out.get("hardened", []):
+            self._record("mission_closed_by_assumption", {"id": mid})
+        if out.get("assumed") or out.get("hardened"):
+            # On a thread, because SMTP is the one thing here that talks to a
+            # machine nobody controls: a 20-second stall at the top of a run
+            # would make the prompt the slow part, which is the exact failure
+            # this rule exists to avoid -- a rule nobody dares run.
+            try:
+                text = self._assumption_notice(out, store)
+
+                def _notify(msg: str = text) -> None:
+                    # A missing or broken channel is a fact about the notice, not
+                    # about the assumption: the store has already been changed and
+                    # the ledger already carries the event, so an exception here --
+                    # on a thread nobody is watching -- must stop at this line.
+                    try:
+                        self.notifier.send(
+                            msg, subject="autoforge: missions presumed complete")
+                    except Exception:               # noqa: BLE001
+                        pass
+
+                threading.Thread(target=_notify, daemon=True,
+                                 name="mission-notice").start()
+            except Exception:                       # noqa: BLE001
+                pass
+        return out
+
+    def _assumption_notice(self, out: dict[str, Any], store: Any) -> str:
+        """The operator is told what was assumed in his name.
+
+        A rule that quietly closes his work on a timer, with no message, is a
+        rule that loses work he never abandoned -- and he would have no way to
+        know which day it happened.
+        """
+        lines = ["autoforge: missions untouched for a day are now presumed complete."]
+        for mid in out.get("assumed", []):
+            try:
+                m = store.get(mid)
+                lines.append(f"  M{mid} presumed complete: {m.text[:120]}")
+            except Exception:                       # noqa: BLE001
+                lines.append(f"  M{mid} presumed complete")
+        for mid in out.get("hardened", []):
+            lines.append(f"  M{mid} closed for real after a week of silence")
+        lines.append("Say the word for any of them and it is owed again "
+                     "(mission_note M<id>).")
+        return "\n".join(lines)
+
     def _memory_lines(self) -> list[str]:
         """The facts the agent chose to keep, carried into every request.
 
@@ -3387,9 +3502,10 @@ class ForgeAgent:
             return self._mission_store()
 
         def mission_open(text: str, parent: int = 0, next_step: str = "",
-                         focus: bool = False) -> str:
+                         focus: bool = False, blocked_on: str = "") -> str:
             try:
-                m = _store().open(text, parent=parent, next_step=next_step)
+                m = _store().open(text, parent=parent, next_step=next_step,
+                                  blocked_on=blocked_on)
             except MissionError as exc:
                 return f"Not recorded. {exc}"
             if focus or not _store().focused():
@@ -3419,9 +3535,11 @@ class ForgeAgent:
                 out += [c.line(1) for c in getattr(m, "children", [])]
             return "\n".join(out)
 
-        def mission_note(mid: int, note: str = "", next_step: str | None = None) -> str:
+        def mission_note(mid: int, note: str = "", next_step: str | None = None,
+                         blocked_on: str | None = None) -> str:
             try:
-                m = _store().note(mid, note=note, next_step=next_step)
+                m = _store().note(mid, note=note, next_step=next_step,
+                                  blocked_on=blocked_on)
             except MissionError as exc:
                 return str(exc)
             self._record("mission_note", {"id": mid})
@@ -3459,6 +3577,54 @@ class ForgeAgent:
             except MissionError as exc:
                 return str(exc)
 
+        def mission_wake(mid: int, note: str = "") -> str:
+            try:
+                m = _store().wake(mid, note=note)
+            except MissionError as exc:
+                return f"Not woken. {exc}"
+            self._record("mission_wake", {"id": mid})
+            return (f"M{m.id} is owed again. The assumption of completion is "
+                    f"overturned -- a real close stays closed.")
+
+        def mission_sweep(idle_hours: float = 0.0, now_epoch: float = 0.0) -> str:
+            """Run the 24h rule on demand, and say exactly what it did."""
+            try:
+                st = _store()
+            except MissionError as exc:
+                return str(exc)
+            kwargs: dict[str, Any] = {}
+            if idle_hours:
+                kwargs["idle_s"] = float(idle_hours) * 3600.0
+            if now_epoch:
+                # Injecting time is how the rule is tested without waiting a
+                # day, and how a session can replay a gap. Reported back, so a
+                # synthetic sweep is never mistaken for a real one.
+                kwargs["now"] = float(now_epoch)
+            out = st.sweep(**kwargs)
+            for mid in out.get("assumed", []):
+                self._record("mission_assumed", {"id": mid})
+            for mid in out.get("hardened", []):
+                self._record("mission_closed_by_assumption", {"id": mid})
+            lines = ["Swept."
+                     + (f" (idle threshold {idle_hours}h)" if idle_hours else "")]
+            if out["assumed"]:
+                lines.append("  presumed complete: "
+                             + ", ".join(f"M{i}" for i in out["assumed"]))
+            if out["hardened"]:
+                lines.append("  closed after the week of silence: "
+                             + ", ".join(f"M{i}" for i in out["hardened"]))
+            if out.get("skipped_parents"):
+                lines.append("  left alone (still have sub-missions owed): "
+                             + ", ".join(f"M{i}" for i in out["skipped_parents"]))
+            if out.get("waiting"):
+                lines.append("  left alone (waiting on something, so silence is "
+                             "not idleness): "
+                             + ", ".join(f"M{i}" for i in out["waiting"]))
+            if not (out["assumed"] or out["hardened"]):
+                lines.append("  nothing moved: no mission has been silent long "
+                             "enough, or none is open.")
+            return "\n".join(lines)
+
         self._add(ToolSpec(
             name="mission_open",
             description=(
@@ -3468,7 +3634,11 @@ class ForgeAgent:
                 "answer to 'what am I for right now'. A request from the "
                 "operator is a mission before it is a task -- open it first, "
                 "then work. Pass parent to hang a sub-task under an existing "
-                "mission instead of replacing it."
+                "mission instead of replacing it. Note the house rule: a "
+                "mission with no activity for 24h is PRESUMED complete. That is "
+                "not a close -- mission_note brings it back -- but it means "
+                "silence is read as 'done', so if the work is still owed, say "
+                "so with mission_note."
             ),
             parameters={"type": "object", "properties": {
                 "text": {"type": "string", "description": "what is owed, one sentence"},
@@ -3477,6 +3647,9 @@ class ForgeAgent:
                 "next_step": {"type": "string", "description": "the very next action"},
                 "focus": {"type": "boolean",
                           "description": "make this the focus even if one is set"},
+                "blocked_on": {"type": "string",
+                               "description": "what it is waiting for, if anything "
+                                              "(exempts it from the 24h rule)"},
             }, "required": ["text"]},
             fn=mission_open, source="builtin", tags=["meta", "mission"],
             effect_signature="local_write",
@@ -3506,6 +3679,8 @@ class ForgeAgent:
                 "mid": {"type": "integer", "description": "mission id, e.g. 3 for M3"},
                 "note": {"type": "string", "description": "what happened"},
                 "next_step": {"type": "string", "description": "the next action"},
+                "blocked_on": {"type": "string",
+                               "description": "set what it waits on ('' clears it)"},
             }, "required": ["mid"]},
             fn=mission_note, source="builtin", tags=["meta", "mission"],
             effect_signature="local_write",
@@ -3549,6 +3724,98 @@ class ForgeAgent:
             }, "required": ["mid"]},
             fn=mission_focus, source="builtin", tags=["meta", "mission"],
         ))
+
+        self._add(ToolSpec(
+            name="mission_wake",
+            description=(
+                "Bring back a mission that was presumed complete from silence. "
+                "Only an assumption can be overturned -- a real close stays "
+                "closed, because the record of finishing something must not be "
+                "reversible. Use this, or mission_note, the moment the operator "
+                "says the work is still wanted."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer", "description": "mission id"},
+                "note": {"type": "string", "description": "why it is owed again"},
+            }, "required": ["mid"]},
+            fn=mission_wake, source="builtin", tags=["meta", "mission"],
+        ))
+
+        def mission_block(mid: int, waiting_on: str | None = None) -> str:
+            """Say what a mission is waiting for, or that it waits for nothing.
+
+            Without this, the 24h rule presumes complete every mission that is
+            simply blocked -- on a download, a credential, an answer from a
+            person -- which is most live missions most of the time. Naming the
+            dependency is the operator claiming it aloud, and the rule reads that
+            as the one thing it cannot infer from silence.
+
+            `waiting_on=None` means "leave it as it is"; only an explicit empty
+            string clears the exemption. A default of "" would make the harmless
+            call -- read it back, ask what it waits on -- the one that silently
+            un-exempts the mission, and that failure would land a day later as a
+            presumption of completion.
+            """
+            if waiting_on is None:
+                try:
+                    m = _store().get(mid)
+                except MissionError as exc:
+                    return str(exc)
+                if not (m.blocked_on or "").strip():
+                    return (f"M{m.id} is not marked as waiting on anything, so it "
+                            f"is subject to the 24h rule.")
+                return f"M{m.id} is waiting on: {m.blocked_on}"
+            try:
+                m = _store().note(mid, blocked_on=waiting_on)
+            except MissionError as exc:
+                return str(exc)
+            self._record("mission_block", {"id": mid, "blocked_on": waiting_on[:200]})
+            if not (waiting_on or "").strip():
+                return (f"M{m.id} is no longer marked as waiting on anything, so "
+                        f"it is subject to the 24h rule again.")
+            return (f"M{m.id} is waiting on: {waiting_on}. Silence on it is now "
+                    f"read as 'still blocked', not as 'done'.")
+
+        self._add(ToolSpec(
+            name="mission_block",
+            description=(
+                "Record what a mission is waiting for -- a download, an "
+                "authorisation, an answer from someone. A mission marked this "
+                "way is EXEMPT from the 24h presumption of completion, because "
+                "silence on it is not idleness. Call it with an empty string to "
+                "clear the exemption once the thing it waited on arrives."
+            ),
+            parameters={"type": "object", "properties": {
+                "mid": {"type": "integer", "description": "mission id"},
+                "waiting_on": {"type": "string",
+                               "description": "what it is waiting for; omit to read "
+                                              "it back, pass '' to clear it"},
+            }, "required": ["mid"]},
+            fn=mission_block, source="builtin", tags=["meta", "mission"],
+        ))
+
+
+        self._add(ToolSpec(
+            name="mission_sweep",
+            description=(
+                "Apply the house rule now: a mission with no activity for 24 "
+                "hours is presumed complete, and one presumed complete for a "
+                "whole week is closed with a note saying it was assumed. Two "
+                "steps on purpose -- the first loses nothing and is shown in the "
+                "report, the second only leaves the projection and is therefore "
+                "gated behind a further week of silence. Runs by itself at the "
+                "start of every run; call it to see the decision without waiting "
+                "for one, or with idle_hours to tighten the rule for a sweep."
+            ),
+            parameters={"type": "object", "properties": {
+                "idle_hours": {"type": "number",
+                               "description": "override the 24h threshold (0 = default)"},
+                "now_epoch": {"type": "number",
+                              "description": "sweep as of this unix time (0 = now)"},
+            }, "required": []},
+            fn=mission_sweep, source="builtin", tags=["meta", "mission"],
+        ))
+
 
     def _tool_schedule(self) -> None:
         """A durable agenda: the agent deciding what it owes, and when.
@@ -4072,7 +4339,7 @@ class ForgeAgent:
             # the verifier, so a timeout written onto it would outlive the call
             # that asked for it and rewrite someone else's budget.
             box = replace(self.sandbox, timeout=cap,
-                          abort_check=self._operator_wants_the_floor)
+                          abort_check=self._operator_wants_the_floor)   # only a /stop kills a run
             try:
                 res = box.run(wrapped, "main")
             except Exception as exc:                              # noqa: BLE001
@@ -4849,6 +5116,7 @@ class ForgeAgent:
         amended its own prompt — and so the host block describes the sandbox
         this process will actually fork, not the machine the agent imagines.
         """
+        self._sweep_missions()
         facts = "\n".join(host_facts(self.sandbox))
         kept = "\n".join(self._memory_lines())
         menu = "\n".join(self.skills.menu())
