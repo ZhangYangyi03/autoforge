@@ -580,6 +580,64 @@ def _k32():
     return k
 
 
+def _record_is_text(record) -> bool:
+    """Would this console input record put something on the input line?
+
+    The distinction that matters is the one between a key going down and the
+    same key coming up. Both are records, both are events, and a console
+    produces them in pairs for every keystroke. Only the first carries text.
+
+    A record the editor would turn into nothing -- a key coming up, a bare
+    modifier, a mouse movement with no button held, a resize -- is not input,
+    and a reader that counts it as input makes the wrong decision about the
+    input it just read. So it is not a second opinion: it is the same decoder
+    the reader uses, asked whether it would produce anything.
+    """
+    return bool(_record_text(record))
+
+
+def _record_text(record) -> str:
+    """The text one console input record contributes. Empty means nothing.
+
+    This is the single place a console record is turned into input. The
+    reader feeds every record through it, and "is there more input?" is the
+    same question asked of the records sitting in the buffer, so the two can
+    never disagree about what counts.
+    """
+    if record.EventType == 0x0002:                # MOUSE_EVENT
+        # A movement the editor would draw nothing for is not input: a mouse
+        # reporting every pixel would otherwise swallow every Enter typed
+        # while it rests on the window.
+        return _mouse_report(record.Event.MouseEvent)
+    if record.EventType != 0x0001:                # KEY_EVENT
+        # WINDOW_BUFFER_SIZE_EVENT and FOCUS_EVENT carry no text.
+        return ""
+    key = record.Event.KeyEvent
+    if not key.bKeyDown:
+        return ""
+    repeat = max(1, min(int(key.wRepeatCount), 64))
+    vk = int(key.wVirtualKeyCode)
+    ctrl = bool(int(key.dwControlKeyState) & (_LEFT_CTRL | _RIGHT_CTRL))
+    shift = bool(int(key.dwControlKeyState) & _SHIFT)
+    # Ctrl+Insert copies, Ctrl+Delete cuts, Shift+Insert pastes: the three
+    # gestures a Windows console has always had for the clipboard. They are
+    # separate keys rather than an overload of ^C on purpose -- ^C has to keep
+    # stopping a run, and a terminal that can copy but cannot be interrupted
+    # is a terminal nobody can get out of.
+    if vk == 0x2D and ctrl:
+        return "\x1b[2;5~"
+    if vk == 0x2E and ctrl:
+        return "\x1b[3;5~"
+    if vk == 0x2D and shift:
+        return "\x1b[2;2~"
+    text = _WIN_VK.get(vk)
+    if text is None:
+        ch = key.uChar
+        if ch and (ch >= " " or ch in _CONTROL_CHARS):
+            text = ch * repeat
+    return text or ""
+
+
 def _console_records():
     """The two console structures, laid out as the console lays them out."""
     import ctypes
@@ -999,57 +1057,69 @@ class _RawTerminal:
             return None
         parts: list[str] = []
         for n in range(read.value):
-            record = batch[n]
-            if record.EventType == 0x0001:            # KEY_EVENT
-                key = record.Event.KeyEvent
-                if not key.bKeyDown:
-                    continue
-                repeat = max(1, min(int(key.wRepeatCount), 64))
-                vk = int(key.wVirtualKeyCode)
-                ctrl = bool(int(key.dwControlKeyState) & (_LEFT_CTRL | _RIGHT_CTRL))
-                shift = bool(int(key.dwControlKeyState) & _SHIFT)
-                # Ctrl+Insert copies, Ctrl+Delete cuts, Shift+Insert pastes:
-                # the three gestures a Windows console has always had for the
-                # clipboard. They are separate keys rather than an overload of
-                # ^C on purpose -- ^C has to keep stopping a run, and a
-                # terminal that can copy but cannot be interrupted is a
-                # terminal nobody can get out of.
-                if vk == 0x2D and ctrl:
-                    text = "\x1b[2;5~"
-                elif vk == 0x2E and ctrl:
-                    text = "\x1b[3;5~"
-                elif vk == 0x2D and shift:
-                    text = "\x1b[2;2~"
-                else:
-                    text = _WIN_VK.get(vk)
-                if text is None:
-                    ch = key.uChar
-                    if ch and (ch >= " " or ch in _CONTROL_CHARS):
-                        text = ch * repeat
-                if text:
-                    parts.append(text)
-            elif record.EventType == 0x0002:          # MOUSE_EVENT
-                report = _mouse_report(record.Event.MouseEvent)
-                if report:
-                    parts.append(report)
+            text = _record_text(batch[n])
+            if text:
+                parts.append(text)
         if not parts:
             return b""
         return "".join(parts).encode("utf-8", "replace")
+
+    def _text_pending(self) -> bool:
+        """Is there buffered input that would produce text?
+
+        Not `GetNumberOfConsoleInputEvents(...) > 0`. A Windows console leaves
+        TWO records behind for every keystroke -- the key going down and the
+        same key coming up -- and both are events. So the count is never zero
+        in the moment after a key, and a reader that reads a non-empty buffer
+        as "more is coming" answers yes for the very Enter it just handled.
+
+        That is not a corner. Measured 2026-09-17 on a real console, with keys
+        injected one record at a time as a keyboard sends them: `_consume` saw
+        the burst `'hi\r'`, asked `_more_coming`, got True, and filed the
+        Enter as a break inside a paste. The line never submitted -- `hi` and
+        its Enter sat in the buffer while the prompt looked empty and the
+        ledger recorded nothing. It is reported from the outside as a session
+        that starts and then ignores you, and every session launched after
+        16:18 behaved that way: the release-timing rule this check implements
+        arrived in `34f637f` with the mouse work, verified through
+        `WriteConsoleInput` batched into one call, where no key-up record is
+        left behind to be seen.
+
+        So the question is asked of the records rather than of the count: a
+        key going down, or a gesture the editor would turn into a report. A
+        key coming up is the echo of a key already handled, and it is not
+        input.
+        """
+        import ctypes
+
+        k = _k32()
+        INPUT_RECORD, _ = _console_records()
+        handle = ctypes.c_void_p(self._input_handle)
+        count = ctypes.c_uint()
+        if not k.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
+            return False
+        if not count.value:
+            return False
+        batch = (INPUT_RECORD * int(min(count.value, 64)))()
+        read = ctypes.c_uint()
+        if not k.PeekConsoleInputW(handle, ctypes.byref(batch), len(batch),
+                                   ctypes.byref(read)):
+            # Cannot look. Answering "something is there" is the safer way to
+            # be wrong: it costs one grace period, where the other answer
+            # turns a paste into an interrupted line.
+            return True
+        for n in range(read.value):
+            if _record_is_text(batch[n]):
+                return True
+        return False
 
     def ready(self, timeout: float) -> bool:
         """Is more input already buffered? Used to gather a paste burst."""
         if os.name == "nt":
             if self._input_handle:
-                import ctypes
-
-                k = _k32()
-                count = ctypes.c_uint()
                 deadline = time.monotonic() + timeout
                 while True:
-                    if not k.GetNumberOfConsoleInputEvents(
-                            ctypes.c_void_p(self._input_handle), ctypes.byref(count)):
-                        return False
-                    if count.value:
+                    if self._text_pending():
                         return True
                     if time.monotonic() >= deadline:
                         return False
