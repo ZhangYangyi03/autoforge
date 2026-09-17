@@ -878,7 +878,7 @@ class ForgeAgent:
         if self.compactor is None:
             self.compactor = Compactor(
                 summarizer=LLMSummarizer(
-                    self.llm, should_abort=self._operator_wants_the_floor),
+                    self.llm, should_abort=self._operator_should_yield),
                 fallback=DeterministicSummarizer(),
                 log_path=default_log_path(),
             )
