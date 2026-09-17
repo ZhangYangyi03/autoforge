@@ -556,7 +556,20 @@ class OpenAICompatClient(LLMClient):
                     allowed += 1
                     continue
 
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                # The one that got away. A 503 that survives the whole retry
+                # ladder leaves the loop through `raise_for_status`, NOT through
+                # the transport handler above -- so translating only the transport
+                # path meant an exhausted-retry 503 escaped as a raw HTTPError and
+                # a failover chain above it never fired. Observed live: a forge
+                # round died on "forge error: HTTPError: 503" while a healthy
+                # fallback endpoint sat unused one line below in the chain.
+                raise LLMError(
+                    f"{self.name}: HTTP {resp.status_code} after {attempt} "
+                    f"attempt(s): {(resp.text or '')[:200]!r}"
+                ) from exc
             try:
                 body = resp.json()
             except ValueError as exc:

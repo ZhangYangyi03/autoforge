@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 
 from autoforge.core.llm import (FailoverClient, LLMAborted, LLMError, LLMResponse,
-                                LLMResponseError)
+                                LLMResponseError, OpenAICompatClient)
 from autoforge.core.message import Message
 
 
@@ -223,3 +223,56 @@ def test_config_fallbacks_are_read_and_one_provider_inherits_the_key(tmp_path):
     assert "api.other.example" in src.get("fallbacks_dropped", ""), (
         "a different host without its own key must be dropped and SAID SO, not "
         "silently handed the wrong credential")
+
+
+# -- the path a 503 actually takes ---------------------------------------
+def test_an_exhausted_retry_ladder_surfaces_as_LLMError_not_a_raw_HTTPError():
+    """Found live, after the chain was already in place and did nothing.
+
+    A 503 that survives the whole retry ladder leaves the client through
+    ``raise_for_status``, not through the transport handler -- so translating
+    only the transport path meant the raw ``requests.HTTPError`` escaped, the
+    ``except LLMError`` in the chain never matched, and a healthy fallback
+    endpoint sat unused one line below it. A real forge round died on
+    "forge error: HTTPError: 503" exactly this way.
+    """
+    from autoforge.core import llm as llm_mod
+
+    class Resp503:
+        status_code = 503
+        text = '{"code":503,"msg":"Service Unavailable"}'
+
+        def json(self):                       # pragma: no cover - never reached
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            raise llm_mod.requests.HTTPError("503 Server Error", response=self)
+
+    real_post = llm_mod.requests.post
+    llm_mod.requests.post = lambda *a, **k: Resp503()
+    try:
+        client = OpenAICompatClient(model="m", base_url="http://x.invalid/v1",
+                                    api_key="k", timeout=5, max_attempts=2,
+                                    retry_backoff=0.01, retry_max_delay=0.02,
+                                    default_max_tokens=256)
+        with pytest.raises(LLMError) as ei:
+            client.chat(_msgs())
+        assert "503" in str(ei.value)
+        assert "2 attempt" in str(ei.value)
+    finally:
+        llm_mod.requests.post = real_post
+
+
+def test_the_chain_catches_that_error_and_uses_the_fallback():
+    """The point of the translation: one thing to catch, and it does fire."""
+    dead = FakeClient("dead-503", raises=LLMError("HTTP 503 after 5 attempt(s)"))
+    live = FakeClient("live", answer="from the fallback")
+    chain = FailoverClient([dead, live], cooldown=300.0)
+    assert chain.chat(_msgs()).content == "from the fallback"
+    assert dead.calls == 1
+
+
+def test_a_non_json_2xx_body_is_still_a_response_error():
+    """The malformation path keeps its own type: a gateway answering 200 with an
+    HTML page is a different failure from a gateway refusing to answer."""
+    assert issubclass(LLMResponseError, LLMError)
