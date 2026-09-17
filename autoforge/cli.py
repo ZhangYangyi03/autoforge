@@ -38,12 +38,13 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from . import __version__, configfile, setup_wizard
 from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
-from .core.llm import DEFAULT_MAX_TOKENS, OpenAICompatClient
+from .core.llm import DEFAULT_MAX_TOKENS, FailoverClient, OpenAICompatClient
 from .core.steering import Steering
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
@@ -179,9 +180,52 @@ def _resolve(args: argparse.Namespace, *, strict: bool = True) -> tuple[dict, di
         max_tokens = int(pick("max_tokens", None, "AUTOFORGE_MAX_TOKENS",
                               default=DEFAULT_MAX_TOKENS))
 
+    # A chain, not one endpoint. `fallbacks` in the config is the list of
+    # endpoints to try when the primary is down, each as {base_url, model,
+    # api_key}; a fallback inherits the primary's model and key when it names
+    # neither, because the common case is the same model behind a second
+    # route. The primary stays first, and the chain is only ever consulted on
+    # failure -- so a healthy gateway is never quietly swapped for a different
+    # model.
+    endpoints = [{"base_url": base, "model": model, "api_key": key}]
+    dropped: list[str] = []
+    fallbacks = saved.get("fallbacks")
+    primary_host = urlparse(base).netloc.lower()
+    if isinstance(fallbacks, list):
+        for item in fallbacks:
+            if not isinstance(item, dict):
+                continue
+            fb_base = str(item.get("base_url") or "").strip()
+            if not fb_base:
+                continue
+            fb_host = urlparse(fb_base).netloc.lower()
+            same_provider = fb_host == primary_host
+            fb_key = str(item.get("api_key") or "").strip()
+            # The credential is inherited ONLY within one provider. This is not
+            # tidiness: the run that handed a DeepSeek endpoint the aiping key
+            # came back 401, and the failure named neither the endpoint nor the
+            # key -- the base_url had changed and the credential had not. A
+            # fallback on another host without a key of its own is therefore
+            # dropped and said out loud, rather than quietly given the wrong key.
+            if not fb_key:
+                if not same_provider:
+                    dropped.append(f"{fb_base} (different host, no api_key of its own)")
+                    continue
+                fb_key = key
+            endpoints.append({
+                "base_url": fb_base,
+                "model": str(item.get("model") or model),
+                "api_key": fb_key,
+            })
+    src["fallbacks"] = ("config" if len(endpoints) > 1
+                        else ("config (all unusable)" if dropped else "none configured"))
+    if dropped:
+        src["fallbacks_dropped"] = "; ".join(dropped)
+
     policy_name, policy_src = _resolve_policy(args, saved, src)
     return ({"base": base, "model": model, "key": key, "proxy": use_proxy,
-             "fast": fast, "max_tokens": max_tokens, "policy": policy_name}, src)
+             "fast": fast, "max_tokens": max_tokens, "policy": policy_name,
+             "endpoints": endpoints}, src)
 
 
 POLICIES = {"full": FULL_FREEDOM, "supervised": SUPERVISED}
@@ -286,11 +330,33 @@ class _TerminalConfirmer:
         return reply in ("y", "yes")
 
 
-def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
-    llm = OpenAICompatClient(
-        model=cfg["model"], base_url=cfg["base"], api_key=cfg["key"], timeout=600,
+def _client_for(cfg: dict, endpoint: dict) -> OpenAICompatClient:
+    """One endpoint as a client, with the settings the run already resolved."""
+    return OpenAICompatClient(
+        model=endpoint["model"], base_url=endpoint["base_url"],
+        api_key=endpoint["api_key"], timeout=600,
         proxies=PROXIES if cfg["proxy"] else None,
     )
+
+
+def _build_llm(cfg: dict):
+    """The model client for a run: one endpoint, or a chain if configured.
+
+    A threshold rather than a wrapper always: with no fallbacks configured this
+    returns the plain client, because a one-element FailoverClient would only add
+    a layer between the run and its usage counters for nothing. The chain exists
+    for the measured failure -- a gateway that is up, fast and correct for six
+    calls and then 503 for minutes -- and for that, the retry ladder underneath
+    is not enough on its own.
+    """
+    endpoints = cfg.get("endpoints") or [
+        {"base_url": cfg["base"], "model": cfg["model"], "api_key": cfg["key"]}]
+    clients = [_client_for(cfg, e) for e in endpoints]
+    return clients[0] if len(clients) == 1 else FailoverClient(clients)
+
+
+def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
+    llm = _build_llm(cfg)
     sandbox = Sandbox(timeout=30.0)
     verifier = ToolVerifier(
         llm, sandbox=sandbox,
@@ -330,10 +396,7 @@ def _build_mode(cfg: dict, mode: str = "standard"):
     if mode == "minimal":
         from .modes import MinimalAgent
 
-        llm = OpenAICompatClient(
-            model=cfg["model"], base_url=cfg["base"], api_key=cfg["key"],
-            timeout=600, proxies=PROXIES if cfg["proxy"] else None,
-        )
+        llm = _build_llm(cfg)
         # The control group carries a policy too, so an A/B against standard
         # compares like with like. Under the default preset nothing changes:
         # bash stays ungated, which is what the comparison depends on.
@@ -364,9 +427,19 @@ def _build_mode(cfg: dict, mode: str = "standard"):
 
 
 def _describe(cfg: dict, agent: ForgeAgent) -> None:
+    # The chain is printed when there is one, because a run that silently
+    # answered from its second endpoint is indistinguishable afterwards from one
+    # that answered from its first -- and "which model actually wrote this" is
+    # not a question to reconstruct from a log.
+    chain = ""
+    endpoints = cfg.get("endpoints") or []
+    if len(endpoints) > 1:
+        chain = ("  |  chain " + " -> ".join(
+            f"{e['model']}@{urlparse(e['base_url']).netloc}" for e in endpoints))
     print(_c(_D, f"model {cfg['model']}  |  {cfg['base']}  |  "
                  f"{'FAST' if cfg['fast'] else 'full'} checks  |  "
-                 f"proxy={cfg['proxy']}  |  policy={cfg.get('policy', 'full')}"))
+                 f"proxy={cfg['proxy']}  |  policy={cfg.get('policy', 'full')}"
+                 f"{chain}"))
 
 
 # ----------------------------------------------------------------------

@@ -64,7 +64,19 @@ def account_usage(totals: dict[str, int], resp: LLMResponse) -> dict[str, int]:
     return totals
 
 
-class LLMResponseError(RuntimeError):
+class LLMError(RuntimeError):
+    """One name for "this endpoint did not work", whatever the transport said.
+
+    ``requests`` has six exception types that all mean the same thing to a
+    caller: connection refused, timeout, proxy failure, TLS failure, truncated
+    body. Catching them by name at every call site is how one gets forgotten,
+    and a forgotten one turns a down endpoint into an unhandled traceback in
+    the middle of a run. Failing over needs one thing to catch; so does the
+    message "the gateway is down, and here is what it said".
+    """
+
+
+class LLMResponseError(LLMError):
     """The endpoint answered 2xx with a body that is not a completion.
 
     Raised instead of letting the malformation surface later as
@@ -510,9 +522,20 @@ class OpenAICompatClient(LLMClient):
                 # would re-ask the question the operator just changed. Let it
                 # out to the loop, which folds their line in and asks again.
                 raise
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 if final:
-                    raise
+                    # Transport failures are translated, not re-raised as
+                    # themselves, and this is the reason: `requests` raises
+                    # ConnectionError, Timeout, ProxyError, SSLError and
+                    # ChunkedEncodingError, and a caller that wants to fail over
+                    # or to report "the endpoint is down" would have to catch
+                    # every one of them by name. Miss one and a dead endpoint
+                    # looks like a crash in the loop.
+                    if isinstance(exc, LLMError):
+                        raise
+                    raise LLMError(
+                        f"{self.name}: {type(exc).__name__}: {exc}"
+                    ) from exc
                 self._wait_before_retry(attempt, None)
                 continue
 
@@ -565,6 +588,133 @@ class OpenAICompatClient(LLMClient):
 #: value read from one place, because three independent copies is exactly how the
 #: original 3000 outlived the failure that condemned it.
 DEFAULT_MAX_TOKENS: int | None = OpenAICompatClient.DEFAULT_MAX_TOKENS
+
+class FailoverClient(LLMClient):
+    """Several endpoints behind one client, tried in the order they still work.
+
+    The problem this exists for is not hypothetical and not fixable at the
+    provider: a gateway that answers 200 six times in a row can answer 503 for
+    three minutes, and a forge round is the unit of budget -- one blip inside it
+    costs the whole tool, whatever the retry ladder underneath does. Retrying
+    rides out a short burst; it cannot ride out an outage. A second endpoint can.
+
+    Three decisions worth their reasons:
+
+    *Health is remembered, not recomputed.* An endpoint that failed is skipped
+      for `cooldown` seconds instead of being tried first again, so a down
+      primary costs one timeout per cooldown rather than one per call. The
+      arithmetic is the argument: at three minutes per failed attempt, trying
+      the dead endpoint first on every call is the outage.
+
+    *The order is sticky, not round-robin.* Whoever answered last is tried
+      first, so a working endpoint stays in use and the prompt prefix stays on
+      one provider -- which is what prompt caching needs. Round-robin would
+      spread the same conversation across providers and pay full price for the
+      prefix every time.
+
+    *`LLMAborted` is never a reason to fail over.* The operator asking to stop
+      is a decision, not an outage; re-asking the same question on another
+      endpoint is exactly what `should_abort` exists to prevent.
+
+    The failure is reported as one error listing every endpoint and what it
+    said, because "all of them are down" and "the one you configured is wrong"
+    need different fixes and a bare exception cannot tell them apart.
+    """
+
+    def __init__(self, clients: "Sequence[LLMClient]", *,
+                 cooldown: float = 120.0, clock: Callable[[], float] = time.monotonic
+                 ) -> None:
+        if not clients:
+            raise ValueError("FailoverClient needs at least one client")
+        self.clients = list(clients)
+        self.cooldown = float(cooldown)
+        self._clock = clock
+        #: When each client may be tried again. Parallel to `clients`; a client
+        #: that has never failed is open from the start.
+        self._open_at = [0.0] * len(self.clients)
+        self._abort_check: Callable[[], bool] | None = None
+        self.name = "failover(" + " | ".join(c.name for c in self.clients) + ")"
+
+    # -- the run attaches its predicate here; every endpoint must honour it --
+    @property
+    def abort_check(self) -> Callable[[], bool] | None:
+        return self._abort_check
+
+    @abort_check.setter
+    def abort_check(self, predicate: Callable[[], bool] | None) -> None:
+        self._abort_check = predicate
+        for client in self.clients:
+            client.abort_check = predicate
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Aggregate, not the first client's: the number answers "is the prefix
+        stable enough to cache", and with a failover chain that is a question
+        about all the endpoints that served it."""
+        prompt = sum(getattr(c, "usage_total", {}).get("prompt_tokens", 0)
+                     for c in self.clients)
+        cached = sum(getattr(c, "usage_total", {}).get("cached_tokens", 0)
+                     for c in self.clients)
+        return cached / prompt if prompt else 0.0
+
+    def order(self) -> list[int]:
+        """Which endpoints to try, in order, right now.
+
+        Healthy ones first, in their CONFIGURED order -- the primary is the
+        primary for a reason (quality, price, key quota), and a failover chain
+        that quietly promotes the backup to primary forever is a different
+        system from the one that was configured. Cooling ones after, oldest
+        cooldown first.
+
+        This is also what keeps the prompt prefix on one provider: while the
+        primary is up it is tried first on every call, so the same endpoint
+        serves the whole conversation and its cache stays warm. The alternative
+        -- reordering by whoever answered last -- would look clever and would
+        mean a recovered primary never comes back.
+
+        If everything is cooling the call still happens, against the endpoint
+        closed longest: refusing to call at all would turn a failover chain into
+        an outage of its own.
+        """
+        now = self._clock()
+        open_now = [i for i in range(len(self.clients)) if self._open_at[i] <= now]
+        cooling = sorted((i for i in range(len(self.clients)) if i not in open_now),
+                         key=lambda i: self._open_at[i])
+        return open_now + cooling
+
+    def chat(self, messages, tools=None, **kwargs) -> LLMResponse:
+        errors: list[str] = []
+        last: Exception | None = None
+        order = self.order()
+        for i in order:
+            client = self.clients[i]
+            try:
+                parsed = client.chat(messages, tools=tools, **kwargs)
+            except LLMAborted:
+                raise
+            except LLMError as exc:
+                last = exc
+                # Every endpoint failure -- refused connection, 503, truncated
+                # body, non-JSON page from a gateway -- is a reason to try
+                # elsewhere. `LLMError` and not `Exception` on purpose: a
+                # TypeError in the payload is a bug in the caller, and hiding it
+                # behind "every endpoint failed" would make this class the place
+                # where real defects go to look like network weather.
+                self._open_at[i] = self._clock() + self.cooldown
+                errors.append(f"{client.name}: {type(exc).__name__}: {exc}")
+                continue
+            # Succeeded: it is healthy again, and the configured order stands.
+            self._open_at[i] = 0.0
+            return parsed
+        # One error type, naming every endpoint and what it said, with the last
+        # failure chained as __cause__. Re-raising the last exception as itself
+        # would preserve the type and lose the summary -- and the summary is the
+        # whole point when the answer to "why did the run stop" is "the primary
+        # rejected the key and the backup timed out", which no single endpoint's
+        # message says.
+        raise LLMError(
+            "every endpoint failed:\n  " + "\n  ".join(errors)) from last
+
 
 class MockLLMClient(LLMClient):
     """Deterministic client for tests and offline demos.
