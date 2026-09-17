@@ -600,6 +600,98 @@ class SkillLibrary:
 
 __all__ = [
     "Skill", "SkillLibrary", "SkillError", "default_skill_dirs",
+    "port_tars_skills", "TARS_SKILL_TAG",
     "render_skill_text", "split_frontmatter", "valid_name",
     "parse_tags", "SKILL_SUFFIX", "ARCHIVE_DIR", "MENU_BUDGET_CHARS",
 ]
+
+# ---------------------------------------------------------------------------
+# borrowed procedures: the tars port
+# ---------------------------------------------------------------------------
+#: Every skill that came in from outside carries this word in its tags, so
+#: "which of these did I work out myself?" stays answerable after the fact. A
+#: fact that arrived from a stranger is not the same kind of thing as one that
+#: was learned here, and the only moment that distinction is cheap to record is
+#: the moment of the copy -- a year later nobody can reconstruct it.
+TARS_SKILL_TAG = "ported"
+TARS_ORIGIN = "tars (intelligence-indeed), Apache-2.0, vendored"
+
+
+def port_tars_skills(home: str | None = None, *, overwrite_body: bool = True,
+                     library: "SkillLibrary | None" = None,
+                     store: Any = None) -> dict[str, Any]:
+    """Copy the vendored tars domain skills into this agent's own library.
+
+    Why this exists at all: the borrowed part of Intelligence Indeed that is
+    actually worth having is not its harness (an AWS VM, an OSWorld grader, an
+    Anthropic key) -- it is nine hand-written procedures about driving desktop
+    applications, which took somebody real effort to learn and which cost
+    nothing to keep. They are in the tree under ``vendor/tars`` as a verbatim
+    copy; this function is what makes them *mine* rather than a checkout
+    sitting next to me.
+
+    Three decisions, each with a reason:
+
+    *Flat, in the user's own skills directory, under a ``tars-`` prefix.* The
+      prefix is not cosmetic: it is how a reader of the menu can tell a
+      procedure that arrived from a stranger from one this agent learned here.
+      Flat rather than a subdirectory because ``SkillLibrary.scan`` finds flat
+      files and ``<category>/<name>/SKILL.md`` packages, and inventing a third
+      layout to hold borrowed files would be a scanner bug waiting to happen.
+    *The body is copied unchanged, behind one provenance line.* The prefix line
+      is the licence and the source, in the file itself, so a copy that got
+      separated from ``ORIGIN.txt`` still says where it came from. Editing the
+      body would be "improving" a procedure whose whole value is that somebody
+      else ran it -- and this agent has not run it once.
+    *Idempotent, and it does not reset usage.* Re-running rewrites the text and
+      leaves ``loads`` alone (``SkillLibrary.write`` carries the counter over),
+      so a re-port cannot be mistaken for a fresh, unproven procedure.
+
+    Returns a small report so the caller can see what happened rather than
+    trusting that it did.
+    """
+    from .tars_port import PortedSkillSystem, provenance
+
+    lib = library
+    if lib is None:
+        # `store` is threaded through rather than left None on purpose: the
+        # usage counters live in the database, and a write through a library
+        # with no store indexes the file without the counts that make the menu
+        # rank by behaviour. Nine skills silently reset to "never loaded" is
+        # the kind of loss nothing reports.
+        lib = SkillLibrary(store, dirs=[("user", os.path.join(
+            home or _default_home(), "skills"))])
+    lib.scan()
+    prov = provenance()
+    written: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    try:
+        tars = PortedSkillSystem()
+    except Exception as exc:                      # missing vendor tree, or broken
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "written": [], "skipped": [], "origin": prov["upstream"]}
+
+    for meta in tars.registry.list_meta():
+        name = "tars-" + meta.name
+        body = tars.body(meta.name)
+        if not overwrite_body and lib.get(name) is not None:
+            skipped.append({"name": name, "why": "already present"})
+            continue
+        header = ("<!-- Copied verbatim from " + prov["upstream"] + " ("
+                  + str(prov["licence"]) + "). Body unchanged. Re-port with "
+                  "skills.port_tars_skills(). -->")
+        lib.write(
+            name=name,
+            description=meta.description,
+            when_to_use=meta.description,
+            body=header + "\n\n" + body,
+            tags=["tars", TARS_SKILL_TAG, "desktop-gui"],
+            scope="user",
+        )
+        written.append(name)
+
+    return {"ok": True, "written": written, "skipped": skipped,
+            "origin": prov["upstream"], "licence": prov["licence"],
+            "dir": os.path.join(home or _default_home(), "skills")}
+

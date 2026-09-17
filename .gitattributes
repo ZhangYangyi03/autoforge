@@ -6,3 +6,10 @@
 auto      text eol=lf
 auto.cmd  text eol=crlf
 *.sh      text eol=lf
+
+# The vendored tars tree is a VERBATIM copy of somebody else's code, and a
+# licence obligation is easier to honour when the bytes on a fresh clone
+# are the bytes that were copied. Without this, git normalises LF to CRLF
+# on checkout and every file in vendor/ differs from upstream in every
+# line -- which makes 'copied verbatim' a claim a diff would contradict.
+autoforge/vendor/** -text

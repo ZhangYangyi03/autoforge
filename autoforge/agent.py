@@ -76,7 +76,8 @@ from .vision import VisionError, vision_from_config
 from .route.router import BehaviourRouter, RoutingWeights
 from .schedule import Schedule, ScheduleError, as_clock
 from .schedule import install_system_task as _install_system_task
-from .skills import SkillError, SkillLibrary
+from .skills import (SkillError, SkillLibrary, TARS_SKILL_TAG,
+                    port_tars_skills)
 from .store import ToolStore
 from .tools.registry import ToolRegistry
 from .tools.spec import ToolSpec, ToolState
@@ -552,6 +553,14 @@ BUILTIN_SCOPES: dict[str, str] = {
     "skill_errors": "read_only",
     "skill_write": "local_write",
     "skill_forget": "local_write",
+    # The tars port. Both reads: one inspects the vendored tree and this host
+    # without writing anything, the other only reads the vendor metadata and
+    # in-memory prompt shapes. The write lives in `port_borrowed_skills`, kept
+    # separate on purpose -- a read that quietly rewrote a directory would make
+    # "what does this touch?" unanswerable from its name.
+    "tars_probe": "read_only",
+    "tars_skills": "read_only",
+    "tars_port_skills": "local_write",
     # Self-modification writes the agent's own policy, prompt or store.
     "amend_self": "local_write",
     "import_package": "system",
@@ -638,6 +647,18 @@ BUILTIN_SCOPES: dict[str, str] = {
     # it off (see modes.py's `_gated_bash` for the same reading).
     "run_python": "system",
 }
+
+
+def _tars_port():
+    """The tars adapter module, imported on demand.
+
+    On demand because importing it reads a vendored file off disk, and this
+    helper is called from a tool body -- i.e. only when a run actually asks
+    what was borrowed. A top-level import would put a filesystem read in front
+    of every start, to answer a question most runs never ask.
+    """
+    from . import tars_port as tp
+    return tp
 
 
 def _main_body(code: str) -> str:
@@ -905,6 +926,7 @@ class ForgeAgent:
         self._tool_history()
         self._tool_memory()
         self._tool_skills()
+        self._tool_tars()
         self._tool_mcp()
         self._tool_gpu()
         self._tool_cpu()
@@ -2405,6 +2427,187 @@ class ForgeAgent:
             fn=forget, source="builtin", tags=["meta"], effect_signature="local_write",
         ))
 
+    # ------------------------------------------------------------------
+    # borrowed procedures: the tars port, reachable from the loop
+    # ------------------------------------------------------------------
+    def _tool_tars(self) -> None:
+        """The code ported from Intelligence Indeed, as three callable tools.
+
+        A port that nothing can call is a file in a tree, not a capability:
+        `vendor/tars` would sit there being true and useless. These are the
+        three questions worth exposing --
+
+          tars_probe         what did I borrow, and does it still work HERE
+          tars_skills        which borrowed procedures exist, and read one
+          tars_port_skills   turn them into skills this agent can load
+
+        -- and the split between the last one and the first two is the point.
+        Reading the vendored tree changes nothing; turning its SKILL.md files
+        into entries in my own library creates files under the skills
+        directory. A tool named like a read that quietly minted nine of them
+        would make `effect_signature` a lie, and that signature is what the
+        autonomy gate keys off.
+
+        `tars_probe` is the interesting one, because it is where the port stops
+        being a copy. Upstream probes a clean Ubuntu VM for installed app
+        versions -- it has never seen that VM. This agent has been running on
+        this host for weeks, so the questions actually open are: is the
+        borrowed code on disk and importable, is the store reachable, are the
+        skill directories where they should be, is the market up, does DNS
+        resolve. Same mechanism (one read-only pass, its result pasted into the
+        next prompt as flat lines), this host's facts. Read-only by
+        construction, so it is safe to run before deciding anything, which is
+        the whole point of a gate.
+        """
+
+        def tars_probe() -> str:
+            """One read-only pass over the borrowed code and this host."""
+            try:
+                tp = _tars_port()
+            except Exception as exc:                      # noqa: BLE001
+                return (f"tars port unavailable: {type(exc).__name__}: {exc}")
+            out = {"provenance": tp.provenance(),
+                   "probe": tp.probe_host(),
+                   "index_chars": len(tp.PortedSkillSystem().index())}
+            self._record("tars_probe", {"ok": True, "origin": out["provenance"]["origin"]})
+            lines = ["tars port — " + str(out["provenance"]["upstream"])]
+            lines.append("  licence: " + str(out["provenance"]["licence"]))
+            lines.append("  vendored at: " + str(out["provenance"]["vendored_at"]))
+            lines.append("  copied verbatim: " + ", ".join(
+                out["provenance"]["copied_verbatim"]))
+            lines.append("  not copied: " + ", ".join(out["provenance"]["not_copied"]))
+            lines.append("  why: " + str(out["provenance"]["why"]))
+            lines.append("")
+            lines.append("Host probe (read-only, this run):")
+            lines += ["  - " + l for l in out["probe"]]
+            lines.append("")
+            lines.append(f"Upstream skill index is {out['index_chars']} chars of "
+                         "metadata; bodies are read only when chosen.")
+            return "\n".join(lines)
+
+        def tars_skills(name: str = "") -> str:
+            """The borrowed procedures: the index, or one body in full.
+
+            Two behaviours in one tool because they are the same question at
+            two depths, and because progressive disclosure is exactly this
+            split: the names and one line each by default, the body only when
+            a name is given.
+            """
+            try:
+                tp = _tars_port()
+                sys_tars = tp.PortedSkillSystem()
+            except Exception as exc:                      # noqa: BLE001
+                return f"tars port unavailable: {type(exc).__name__}: {exc}"
+            if not name:
+                metas = sys_tars.registry.list_meta()
+                lines = [f"{len(metas)} borrowed procedure(s) from "
+                         f"{tp.provenance()['upstream']} (Apache-2.0):"]
+                for m in sorted(metas, key=lambda x: x.name):
+                    lines.append(f"  {m.name}  ->  mine as 'tars-{m.name}'")
+                    lines.append(f"      {m.description}")
+                lines.append("")
+                lines.append("tars_skills(name) reads one whole; "
+                             "tars_port_skills() copies them into my own library.")
+                return "\n".join(lines)
+            resolved = sys_tars.resolve(name) or sys_tars.resolve(
+                name[5:] if name.startswith("tars-") else name)
+            if resolved is None:
+                near = [m.name for m in sys_tars.registry.list_meta()
+                        if name.lower() in m.name.lower()]
+                hint = f" Closest: {', '.join(near)}." if near else ""
+                return f"No borrowed procedure named {name!r}.{hint}"
+            body = sys_tars.body(resolved)
+            self._record("tars_skills", {"name": resolved, "chars": len(body)},
+                         durable=False)
+            meta = next(m for m in sys_tars.registry.list_meta() if m.name == resolved)
+            return (f"# {resolved}  (borrowed, verbatim; {len(body)} chars)\n"
+                    f"{meta.description}\n\n{body}")
+
+        def tars_port_skills() -> str:
+            """Copy the borrowed procedures into my own skill library."""
+            try:
+                res = port_tars_skills(store=self.store)
+            except Exception as exc:                      # noqa: BLE001
+                return f"Nothing ported: {type(exc).__name__}: {exc}"
+            if not res.get("ok"):
+                return f"Nothing ported: {res.get('error')}"
+            self._record("tars_port_skills", {"written": len(res["written"])})
+            lines = [f"{len(res['written'])} borrowed procedure(s) written into "
+                     f"{res['dir']}:"] if res["written"] else [
+                     "Nothing to write — every borrowed procedure is already here."]
+            lines += [f"  {n}" for n in res["written"]]
+            if res["skipped"]:
+                lines += [f"  skipped {s['name']}: {s['why']}" for s in res["skipped"]]
+            lines.append("")
+            lines.append("Each carries a provenance line and the tags "
+                         f"'tars, {TARS_SKILL_TAG}'; the bodies are unedited, "
+                         "because a procedure whose value is that somebody else "
+                         "ran it should not be 'improved' by me first.")
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="tars_probe",
+            description=(
+                "The code I ported from Intelligence Indeed (tars), and whether "
+                "it still works on THIS host: what was copied verbatim, what was "
+                "deliberately not, and one read-only pass over the vendored "
+                "tree, the store, the skill directories, the market and DNS. "
+                "Read-only, so it is safe before any decision."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=tars_probe, source="builtin", tags=["meta", "tars"],
+        ))
+        self._add(ToolSpec(
+            name="tars_skills",
+            description=(
+                "The procedures borrowed from Intelligence Indeed: with no "
+                "argument, the index (name, what it is for, what it is called "
+                "in my own library); with a name, that procedure in full. "
+                "Progressively disclosed on purpose."
+            ),
+            parameters={"type": "object", "properties": {
+                "name": {"type": "string",
+                         "description": "a borrowed procedure, e.g. skill-chrome; "
+                                        "omit for the index"},
+            }},
+            fn=tars_skills, source="builtin", tags=["meta", "tars"],
+        ))
+        self._add(ToolSpec(
+            name="tars_port_skills",
+            description=(
+                "Copy the borrowed tars procedures into my own skill library as "
+                "'tars-<name>', bodies unedited and tagged as ported. Idempotent "
+                "-- re-running refreshes the text and leaves load counts alone."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=tars_port_skills, source="builtin", tags=["meta", "tars"],
+        ))
+
+    def _host_probe_lines(self) -> list[str]:
+        """One read-only pass over this host, ported from tars' feasibility gate.
+
+        Upstream runs the pass on a VM it has never seen, to find out what the
+        executor will be up against. Here the machine is not a stranger -- this
+        agent has been running on it for weeks -- so the pass is not about
+        discovering the host, it is about *not re-deriving facts this session
+        already paid for*: the vendored tree on disk, the store, the skill
+        directories, the market, DNS. Cheap enough to run once per run, and it
+        is exactly the evidence a plan needs before it is made.
+
+        Never raises and never writes. A probe that failed to answer still
+        produces a line saying so, because "network is down" is a fact about
+        the run worth having in the prompt, and an empty section would read as
+        "everything is fine".
+        """
+        try:
+            from . import tars_port as tp
+            lines = tp.probe_host()
+        except Exception as exc:                      # noqa: BLE001
+            return [f"PROBE — unavailable: {type(exc).__name__}: {exc}"]
+        out = ["PROBE (one read-only pass, this run — ported from tars' gate):"]
+        out += ["    " + line for line in lines]
+        return out
+
     def _mission_lines(self) -> list[str]:
         """What I owe, carried into every request next to what I know.
 
@@ -2850,6 +3053,19 @@ class ForgeAgent:
             lines.append(
                 "- Skills: none written yet — a procedure I write down with "
                 "skill_write is offered to me next session.")
+        # What was borrowed from outside, as a count of what is actually in the
+        # library now -- not a claim that a checkout exists somewhere. A port
+        # that only lives in vendor/ is a file; the number that matters is how
+        # many borrowed procedures this agent can load by name this turn.
+        ported = [s.name for s in self.skills.all()
+                  if TARS_SKILL_TAG in s.tags]
+        if ported:
+            lines.append(
+                f"- Borrowed: {len(ported)} procedure(s) ported from "
+                f"Intelligence Indeed (tars, Apache-2.0) are in my library, "
+                f"bodies unedited and tagged '{TARS_SKILL_TAG}'. tars_skills "
+                f"lists them; tars_probe says whether the ported code still "
+                f"runs on this host.")
         if sk["unreadable"] or sk["shadowed"]:
             lines.append(
                 f"- Skills skipped: {len(sk['unreadable'])} unusable file(s), "
@@ -4453,9 +4669,22 @@ class ForgeAgent:
         # different question. `kept` is what I know, this is what I owe --
         # and it is the one that gets lost first when a session has many
         # requests, because every new request looks like a new prompt.
-        mission = self._mission_lines()
+        # `"\n".join`, like `facts`/`menu`/`kept` above it. It was not joined,
+        # and the MISSION block -- the one thing this section exists to keep in
+        # front of me -- has therefore been rendered as a Python list literal
+        # every turn since it was written: correct information in the wrong
+        # shape, which reads as noise and gets skimmed. Found while wiring the
+        # probe in beside it; fixed rather than reported.
+        mission = "\n".join(self._mission_lines())
+        # What this host says about itself, measured now, before the work: the
+        # whole point of the ported gate is that a finding from before a task
+        # starts beats one discovered at step forty. It goes *after* the skills
+        # menu and *before* the kept facts only because that is where the
+        # stable-to-volatile order puts it -- it changes only when the machine
+        # does, so it cannot re-bill the menu behind it.
+        probe = "\n".join(self._host_probe_lines())
         out = (f"{self.system_prompt}\n\n{facts}\n\n{menu}\n\n"
-               f"{kept}\n\n{mission}\n\n{self._self_report()}")
+               f"{probe}\n\n{kept}\n\n{mission}\n\n{self._self_report()}")
         if self.role_brief:
             # Last, and separately labelled: a role narrows what this run is
             # for, and the point of putting it after the general instructions is
