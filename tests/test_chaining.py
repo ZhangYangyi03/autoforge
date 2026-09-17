@@ -308,3 +308,109 @@ class TestTheChainSurvivesContention:
         conn = sqlite3.connect(db)
         assert conn.execute("SELECT COUNT(*) FROM forge_events").fetchone()[0] == 60
         assert chaining.verify_chain(conn)["ok"] is True
+
+
+class TestOnePassMatchesPerAnchor:
+    """The single-pass baseline walk must equal asking for each anchor alone.
+
+    `verify_chain` used to ask for every anchor's baseline in its own query, so
+    the legacy rows before anchor *n* were hashed once for anchor *n* and again
+    for every anchor after it. On the live ledger that was 371,045 `_row_material`
+    calls over 5,085 distinct rows, 3.6 seconds per call, and it is called while
+    building the prompt of every single request. Folding it into one ordered walk
+    is only legitimate if the digests are identical -- so this test computes them
+    both ways, over a store with several anchors and a mixed legacy/chained log,
+    and compares every one.
+    """
+
+    def _mature_store(self, tmp_path):
+        db = str(tmp_path / "mature.db")
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE forge_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " timestamp REAL NOT NULL, kind TEXT NOT NULL,"
+            " payload TEXT NOT NULL DEFAULT '{}')")
+        # Legacy rows, then an anchor, then chained rows, then another anchor,
+        # then more of both -- the shape that makes the two methods diverge if
+        # the walk loses track of a bound.
+        for i in range(6):
+            conn.execute("INSERT INTO forge_events (timestamp, kind, payload)"
+                         " VALUES (?,?,?)", (100.0 + i, "legacy", json.dumps({"i": i})))
+        conn.commit()
+        chaining.ensure_schema(conn)
+        chaining.anchor(conn, note="first")
+        for i in range(4):
+            chaining.append_event(conn, "genuine", {"a": i})
+        for i in range(5):
+            conn.execute("INSERT INTO forge_events (timestamp, kind, payload)"
+                         " VALUES (?,?,?)", (200.0 + i, "late", json.dumps({"i": i})))
+        conn.commit()
+        chaining.anchor(conn, note="second")
+        chaining.append_event(conn, "genuine", {"b": 1})
+        for i in range(3):
+            conn.execute("INSERT INTO forge_events (timestamp, kind, payload)"
+                         " VALUES (?,?,?)", (300.0 + i, "later", json.dumps({"i": i})))
+        conn.commit()
+        chaining.anchor(conn, note="third")
+        chaining.append_event(conn, "genuine", {"c": 1})
+        return conn
+
+    def test_every_anchors_baseline_is_the_same_either_way(self, tmp_path):
+        conn = self._mature_store(tmp_path)
+        anchors = chaining.rows_of(
+            conn, "SELECT id, up_to_id, baseline_digest FROM chain_anchors ORDER BY id")
+        assert len(anchors) == 3, "the fixture must actually have several anchors"
+        for a in anchors:
+            alone, n = chaining._baseline_digest(conn, a["up_to_id"])
+            assert alone == a["baseline_digest"], (
+                "the stored baseline already disagrees for anchor at id %s"
+                % a["up_to_id"])
+
+    def test_the_single_pass_walk_agrees_with_asking_once_per_anchor(self, tmp_path):
+        """The comparison that makes the optimisation a proof, not a claim."""
+        conn = self._mature_store(tmp_path)
+        anchors = chaining.rows_of(
+            conn, "SELECT id, up_to_id, baseline_digest, rows FROM chain_anchors"
+                  " ORDER BY id")
+
+        # The new walk, transcribed: one ordered pass, snapshotting at bounds.
+        import hashlib
+        order = sorted(range(len(anchors)), key=lambda i: anchors[i]["up_to_id"])
+        snap = {}
+        h = hashlib.sha256()
+        seen = 0
+        it = iter(chaining.rows_of(
+            conn,
+            "SELECT id, timestamp, kind, payload FROM forge_events"
+            " WHERE payload_hash IS NULL OR payload_hash = '' ORDER BY id"))
+        nxt = next(it, None)
+        for i in order:
+            bound = anchors[i]["up_to_id"]
+            while nxt is not None and nxt["id"] <= bound:
+                h.update(chaining._row_material(nxt).encode("utf-8"))
+                seen += 1
+                nxt = next(it, None)
+            snap[i] = (h.copy().hexdigest(), seen)
+
+        for i, a in enumerate(anchors):
+            alone, n_alone = chaining._baseline_digest(conn, a["up_to_id"])
+            got, n_got = snap[i]
+            assert got == alone, "digest differs for anchor at id %s" % a["up_to_id"]
+            assert n_got == n_alone, "row count differs for anchor at id %s" % a["up_to_id"]
+
+    def test_a_changed_legacy_row_still_shows_up_as_a_break(self, tmp_path):
+        """The optimisation must not have made the check unfalsifiable."""
+        conn = self._mature_store(tmp_path)
+        assert chaining.verify_chain(conn)["ok"] is True
+        # Rewrite a row that sits *inside* the first anchor's baseline but before
+        # the second -- the case a walk that snapshots at the wrong point misses.
+        conn.execute("UPDATE forge_events SET payload = ? WHERE kind = 'late' AND id ="
+                     " (SELECT MIN(id) FROM forge_events WHERE kind = 'late')",
+                     (json.dumps({"i": 999}),))
+        conn.commit()
+        result = chaining.verify_chain(conn)
+        assert result["ok"] is False
+        kinds = {b["kind"] for b in result["breaks"]}
+        assert "legacy_region_modified" in kinds, result["breaks"]

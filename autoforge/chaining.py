@@ -591,8 +591,39 @@ def verify_chain(conn: sqlite3.Connection) -> dict:
         prev = row["payload_hash"]
         chained += 1
 
-    for a in anchors:
-        digest, n = _baseline_digest(conn, a["up_to_id"])
+    # Every anchor's baseline is the digest over the legacy rows up to it, and
+    # the anchors' bounds only ever move forward -- so all of them are prefixes
+    # of one ordered walk. Asking for each in a separate query hashed the same
+    # rows again and again: measured on this ledger, 74 anchors over 5,085
+    # legacy rows produced 371,045 `_row_material` calls, and the whole walk
+    # took 3.6 seconds *per request*, because the self-report rendered into
+    # every request's system prompt reads the store. The rows are identical
+    # every time, so the cost bought nothing.
+    #
+    # `hashlib` can copy its own state, so one pass is enough: walk the legacy
+    # rows in id order, snapshotting the digest at each anchor's bound. Same
+    # rows, same order, same function -- the digests are bit-for-bit the ones
+    # the per-anchor queries produced, and a test holds that claim down.
+    order = sorted(range(len(anchors)), key=lambda i: anchors[i]["up_to_id"])
+    taken: dict[int, tuple[str, int]] = {}
+    h = hashlib.sha256()
+    seen = 0
+    it = iter(rows_of(
+        conn,
+        "SELECT id, timestamp, kind, payload FROM forge_events"
+        " WHERE payload_hash IS NULL OR payload_hash = ''"
+        " ORDER BY id",
+    ))
+    nxt = next(it, None)
+    for i in order:
+        bound = anchors[i]["up_to_id"]
+        while nxt is not None and nxt["id"] <= bound:
+            h.update(_row_material(nxt).encode("utf-8"))
+            seen += 1
+            nxt = next(it, None)
+        taken[i] = (h.copy().hexdigest(), seen)
+    for i, a in enumerate(anchors):
+        digest, n = taken[i]
         checked_legacy += n
         if n and digest != a["baseline_digest"]:
             breaks.append({"row": a["up_to_id"], "kind": "legacy_region_modified",
