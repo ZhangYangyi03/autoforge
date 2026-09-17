@@ -393,3 +393,257 @@ def test_wide_chars_never_overflow_a_row(cols):
     assert col >= _visible_len('> '), repr(col)
 
 
+
+
+# -- the selection -----------------------------------------------------
+def sgr(code, col, row, release=False):
+    """A mouse report as the editor reads it: `\x1b[<code;col;rowM|m`."""
+    return f"\x1b[<{code};{col};{row}{'m' if release else 'M'}"
+
+
+def cell(editor, index, top):
+    """The screen cell a buffer position occupies, 1-based, absolute.
+
+    `top` is the physical row the input area starts on. A real console
+    reports the cursor's physical row and the editor turns it back into a
+    cell by subtraction, so a test has to invent one: any number will do, as
+    long as every report in a gesture is measured from the same row.
+    """
+    from autoforge.core.lineedit import _visible_len
+
+    rows, starts, prefixes, _leading, _row, _col = editor._layout_detail()
+    r = 0
+    for n, start in enumerate(starts):
+        if index >= start:
+            r = n
+    col = _visible_len(prefixes[r]) + (index - starts[r]) + 1
+    return top + r + 1, col
+
+
+def select(editor, a, b, top=10):
+    """Drag from buffer position a to b, the way a person would.
+
+    Two reports: a press, then motion with the button held -- the pair that
+    tells the editor a selection is being made rather than two clicks. Each
+    report carries the row the cursor is on *at that moment*, because the
+    editor redraws between the two and the console's cursor moves with it.
+    """
+    rows, _s, _p, _l, crow, _c = editor._layout_detail()
+    editor._term.screen_row = top + crow
+    y, x = cell(editor, a, top)
+    editor._consume(sgr(0, x, y))
+    rows, _s, _p, _l, crow, _c = editor._layout_detail()
+    editor._term.screen_row = top + crow
+    y, x = cell(editor, b, top)
+    editor._consume(sgr(32, x, y))
+
+
+def test_selecting_the_middle_and_pressing_delete_removes_the_selection():
+    """The failure this whole feature exists for.
+
+    A drag over four characters in the middle of the line, then Delete: it
+    used to delete the last character, because the key reached a cursor that
+    was still at the end and the console kept the selection to itself.
+    """
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)                     # "cdef"
+    editor._consume("\x1b[3~")               # delete
+    assert "".join(editor._buf) == "abgh"
+    assert editor._cursor == 2
+    assert editor.selection() is None
+
+
+def test_backspace_removes_the_selection_instead_of_one_character():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x7f")                 # backspace
+    assert "".join(editor._buf) == "abgh"
+
+
+def test_typing_over_a_selection_replaces_it():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("XY")
+    assert "".join(editor._buf) == "abXYgh"
+
+
+def test_the_selection_is_drawn_in_reverse_video():
+    editor, _, out = build([], columns=40)
+    editor._consume("abcdef")
+    out.parts.clear()
+    select(editor, 1, 4)
+    drawn = out.getvalue()
+    assert "\x1b[7mbcd\x1b[27m" in drawn
+
+
+def test_cut_puts_the_selection_on_the_clipboard_and_removes_it():
+    copied = []
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "",
+                         clipboard_write=lambda text: copied.append(text) or True)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x18")                 # ^X
+    assert copied == ["cdef"]
+    assert "".join(editor._buf) == "abgh"
+
+
+def test_copy_keeps_the_text_and_drops_the_highlight():
+    """Ctrl+Insert, not ^C: ^C has to keep stopping a run."""
+    copied = []
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "",
+                         clipboard_write=lambda text: copied.append(text) or True)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x1b[2;5~")            # Ctrl+Insert
+    assert copied == ["cdef"]
+    assert "".join(editor._buf) == "abcdefgh"       # text untouched
+    assert editor.selection() is None               # and nothing to delete next
+
+
+def test_ctrl_delete_cuts_and_shift_insert_pastes():
+    copied = []
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "QQ",
+                         clipboard_write=lambda text: copied.append(text) or True)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x1b[3;5~")            # Ctrl+Delete
+    assert copied == ["cdef"]
+    assert "".join(editor._buf) == "abgh"
+    editor._consume("\x1b[2;2~")            # Shift+Insert
+    assert "".join(editor._buf) == "abQQgh"
+
+
+def test_ctrl_c_is_not_a_copy():
+    """A terminal that copies but cannot be interrupted cannot be left."""
+    copied = []
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "",
+                         clipboard_write=lambda text: copied.append(text) or True)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x03")                 # ^C
+    assert copied == []
+    assert editor.selection() == (2, 6)      # untouched, still there to delete
+
+
+def test_the_mouse_can_be_left_to_the_console():
+    """`AUTOFORGE_MOUSE=0` is the way out for a console's own drag-to-copy."""
+    import os as _os
+    from autoforge.core import lineedit as le
+
+    old = _os.environ.get("AUTOFORGE_MOUSE")
+    _os.environ["AUTOFORGE_MOUSE"] = "0"
+    try:
+        assert le.mouse_enabled() is False
+        editor, term, _ = build([], columns=40)
+        assert term.mouse is False            # nothing was taken
+    finally:
+        if old is None:
+            _os.environ.pop("AUTOFORGE_MOUSE", None)
+        else:
+            _os.environ["AUTOFORGE_MOUSE"] = old
+
+
+def test_paste_inserts_the_clipboard_at_the_cursor():
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "ZZ",
+                         clipboard_write=lambda text: True)
+    editor._consume("ab")
+    editor._consume("\x16")                 # ^V
+    assert "".join(editor._buf) == "abZZ"
+
+
+def test_paste_replaces_the_selection():
+    editor, _, _ = build([], columns=40, clipboard_read=lambda: "ZZ",
+                         clipboard_write=lambda text: True)
+    editor._consume("abcdef")
+    select(editor, 1, 4)
+    editor._consume("\x16")
+    assert "".join(editor._buf) == "aZZef"
+
+
+def test_a_click_without_a_drag_just_places_the_cursor():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdef")
+    editor._term.screen_row = editor._rows - 1
+    editor._consume(sgr(0, 5 + 3 + 1, editor._term.screen_row + 1))
+    assert editor._cursor == 3
+    assert editor.selection() is None        # an empty range is not a selection
+
+
+def test_moving_with_the_arrow_keys_drops_the_selection():
+    """Otherwise the next keystroke deletes a span the person has left behind."""
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x1b[D")               # left, from the selection's end
+    assert editor.selection() is None
+    assert editor._cursor == 5
+    editor._consume("\x7f")
+    assert "".join(editor._buf) == "abcdfgh"        # one character, not the span
+
+
+def test_a_selection_survives_a_heartbeat():
+    editor, _, out = build([], columns=40)
+    editor._consume("abcdef")
+    select(editor, 1, 4)
+    editor.tick("  ~ turn 1")
+    editor.write("  -> bash")
+    assert editor.selection() == (1, 4)
+    assert "\x1b[7mbcd\x1b[27m" in out.getvalue()
+
+
+def test_selecting_backwards_works_the_same():
+    editor, _, _ = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 6, 2)                     # drag right to left
+    assert editor.selection() == (2, 6)
+    editor._consume("\x1b[3~")
+    assert "".join(editor._buf) == "abgh"
+
+
+def test_a_selection_that_spans_a_wrapped_row_is_drawn_on_both():
+    editor, _, out = build([], columns=22)
+    editor._consume("x" * 24)
+    out.parts.clear()
+    select(editor, 10, 20)          # 16 characters fit a row, so 10-20 spans both
+    drawn = out.getvalue()
+    # The last draw is the one that is on the screen: two rows carry a
+    # reversed run, and the reversal is closed on each of them. Counted on
+    # the final draw rather than the whole stream, because the press and the
+    # drag each drew once and each of those draws is complete in itself.
+    last = drawn.rsplit("\r\x1b[J", 1)[-1]
+    assert last.count("\x1b[7m") == 2
+    assert last.count("\x1b[27m") == 2
+
+
+def test_deleting_a_selection_clears_the_highlight_from_the_screen():
+    editor, _, out = build([], columns=40)
+    editor._consume("abcdefgh")
+    select(editor, 2, 6)
+    editor._consume("\x1b[3~")
+    assert out.screen().lines()[-1] == "you> abgh"
+
+
+def test_a_mouse_report_never_lands_in_the_buffer():
+    """The escape sequence is decoded, not typed: a stray `\x1b[<0;7;3M` in a
+    steering message would be a strange thing to send the model."""
+    editor, _, _ = build([], columns=40)
+    editor._consume("ab")
+    select(editor, 0, 2)
+    assert "".join(editor._buf) == "ab"
+
+
+def test_the_clipboard_pair_survives_a_clipboard_that_cannot_answer():
+    """A locked or absent clipboard must not stop the editor working."""
+    def boom(*_a, **_k):
+        raise RuntimeError("clipboard busy")
+
+    editor, _, _ = build([], columns=40, clipboard_read=boom, clipboard_write=boom)
+    editor._consume("abc")
+    select(editor, 0, 1)
+    editor._consume("\x16")                 # ^V with a clipboard that throws
+    assert "".join(editor._buf) == "abc"
+    editor._consume("\x18")                 # ^X, same
+    assert "".join(editor._buf) == "bc"

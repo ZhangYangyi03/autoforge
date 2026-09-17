@@ -104,6 +104,11 @@ class FakeTerm:
         self.columns = columns
         self.ok = False
         self.closed = False
+        self.mouse = False
+        #: What `cursor_row()` answers. A test sets it to the row the editor
+        #: believes its cursor is on, which is what a real console reports and
+        #: what a mouse report is measured against.
+        self.screen_row = None
 
     def open(self):
         self.ok = True
@@ -112,6 +117,15 @@ class FakeTerm:
     def close(self):
         self.ok = False
         self.closed = True
+
+    def mouse_on(self):
+        self.mouse = True
+
+    def mouse_off(self):
+        self.mouse = False
+
+    def cursor_row(self):
+        return self.screen_row
 
     def read_chunk(self):
         if not self.chunks:

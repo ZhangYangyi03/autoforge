@@ -167,6 +167,33 @@ with `/` as text. Paste a block and it collapses to a one-line
 `[Pasted text #1: 40 lines → …]` placeholder — the text is kept on disk and
 expanded again before it reaches the model.
 
+### Selecting part of a line
+
+The editor keeps the selection itself, so `Delete` and `Backspace` act on what
+is highlighted rather than on the last character:
+
+```
+you> check the empty file case
+        └──────┘  Ctrl+Insert copies, Ctrl+Delete cuts
+```
+
+Drag to select, and the span is drawn in reverse video. `Ctrl+Insert` copies
+it, `Ctrl+Delete` cuts it, `Shift+Insert` and a right-click paste, and
+`Backspace`, `Delete`, `^K`, `^U` and `^W` remove the selection when there is
+one. Typing over a selection replaces it. `^C` is left alone: it still stops
+the run, because a terminal that can copy but cannot be interrupted cannot be
+left.
+
+The keys an X terminal has always had keep working: `Ctrl+A`/`Ctrl+E` for the
+ends of the line, `Ctrl+W` for the previous word, `Ctrl+U`/`Ctrl+K` to kill to
+either end.
+
+This costs the console's own drag-to-copy and its mouse-wheel scrolling, which
+is why it is done by the process rather than by the terminal — on Windows the
+console has to be asked to give the selection up before the process can hear
+about it. `AUTOFORGE_MOUSE=0` leaves the mouse entirely with the console, and
+then everything above reverts to how it was.
+
 The behaviour degrades honestly: a pipe, a redirect, or a test gets the plain
 cooked-mode reader and no heartbeat, because there is no terminal to own.
 
