@@ -549,6 +549,7 @@ BUILTIN_SCOPES: dict[str, str] = {
     # Procedures. Reading one is a read; writing or retiring one edits a file
     # under the skills directories and the index row that points at it.
     "skill_list": "read_only",
+    "skill_port": "local_write",
     "skill_view": "read_only",
     "skill_errors": "read_only",
     "skill_write": "local_write",
@@ -2897,6 +2898,55 @@ class ForgeAgent:
             self._record("skill_forget", {"name": name, "archived_to": dest})
             return f"Retired '{name}' — archived at {dest}, no longer offered."
 
+        def skill_port(source: str = "openclaw", overwrite_body: bool = True,
+                       include_other_os: bool = False) -> str:
+            """Copy another agent's skills into mine, verbatim, and say what happened.
+
+            Asked for directly by the operator: "openclaw 52 技能 + 41 扩展是
+            产品化你直接拿去复制粘贴". What is copied is the *method* -- which
+            command, in which order, with which pitfall -- not the reach. A
+            copied procedure that drives `gh` is useful here only because `gh`
+            exists here; the skill count is not a capability.
+
+            Two deliberate restraints:
+
+            *Only what can run on this OS.* openclaw declares its platforms,
+              and the eight skills declaring `os: [darwin]` are skipped and
+              REPORTED rather than copied. Skipping silently would make the port
+              look complete while quietly shipping procedures that cannot run.
+
+            *It says where each one came from.* The provenance line goes into
+              the file, and the tags carry the source, because "did I learn this
+              or did I copy it" is a question that stays worth asking, and the
+              only cheap moment to answer it is the moment of the copy.
+            """
+            from .skills import SkillError as _SkillError, port_openclaw_skills
+            if source == "tars":
+                from .skills import port_tars_skills
+                rep = port_tars_skills(overwrite_body=overwrite_body,
+                                       library=self.skills, store=self.store)
+            elif source == "openclaw":
+                rep = port_openclaw_skills(
+                    overwrite_body=overwrite_body,
+                    include_other_os=include_other_os,
+                    library=self.skills, store=self.store)
+            else:
+                return f"unknown source {source!r} (have: openclaw, tars)"
+            if not rep.get("ok"):
+                return f"port failed: {rep.get('error')}"
+            self._record("skill_port", {"source": source,
+                                        "written": len(rep.get("written") or []),
+                                        "skipped": len(rep.get("skipped") or [])})
+            lines = [f"Porting from {source}: {len(rep.get('written') or [])} "
+                     f"skill(s) written, {len(rep.get('skipped') or [])} skipped."]
+            for w in (rep.get("written") or [])[:60]:
+                lines.append(f"  + {w['name']}")
+            for k in (rep.get("skipped") or [])[:60]:
+                lines.append(f"  - {k['name']}: {k['why']}")
+            lines.append("Re-running is idempotent and does not reset how often "
+                         "each skill has been loaded.")
+            return "\n".join(lines)
+
         def skill_errors() -> str:
             """Why a skill file is not being offered, when one is not."""
             self.skills.scan()
@@ -2912,6 +2962,30 @@ class ForgeAgent:
                 lines += [f"  {n} — keeping {p}" for n, p in self.skills.shadowed]
             return "\n".join(lines)
 
+        self._add(ToolSpec(
+            name="skill_port",
+            description=(
+                "Copy another agent's skills into mine, verbatim, with a "
+                "provenance line: source='openclaw' reads the installed openclaw "
+                "package's SKILL.md files (52 core + extension skills), "
+                "source='tars' the vendored Intelligence Indeed set. Skills that "
+                "declare another OS are skipped and reported. Idempotent; does "
+                "not reset load counts."
+            ),
+            parameters={"type": "object", "properties": {
+                "source": {"type": "string", "enum": ["openclaw", "tars"],
+                           "description": "which library to copy from"},
+                "overwrite_body": {"type": "boolean",
+                                   "description": "rewrite bodies already present (default true)"},
+                "include_other_os": {"type": "boolean",
+                                     "description": "also copy skills declaring another OS"},
+            }},
+            # `local_write`, not a new label: writing a skill file IS a local
+            # write, and a novel effect signature would fall through
+            # `SCOPE_ALLOWANCES` to "undeclared", which is permissive. Inventing
+            # a scope name to look precise would have made the gate weaker.
+            fn=skill_port, source="builtin", tags=["meta"], effect_signature="local_write",
+        ))
         self._add(ToolSpec(
             name="skill_list",
             description=(

@@ -27,6 +27,7 @@ the index of it.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -603,6 +604,8 @@ __all__ = [
     "port_tars_skills", "TARS_SKILL_TAG",
     "render_skill_text", "split_frontmatter", "valid_name",
     "parse_tags", "SKILL_SUFFIX", "ARCHIVE_DIR", "MENU_BUDGET_CHARS",
+    "port_openclaw_skills", "openclaw_skill_roots", "iter_openclaw_skills",
+    "OPENCLAW_SKILL_ENV", "openclaw_runs_here",
 ]
 
 # ---------------------------------------------------------------------------
@@ -615,6 +618,288 @@ __all__ = [
 #: the moment of the copy -- a year later nobody can reconstruct it.
 TARS_SKILL_TAG = "ported"
 TARS_ORIGIN = "tars (intelligence-indeed), Apache-2.0, vendored"
+
+
+#: Where an installed openclaw keeps its skills, in the order worth checking.
+#: The environment variable wins, for the same reason AUTOFORGE_SKILLS_DIRS
+#: exists: an installation in an unusual place should not require a code change
+#: to be found. The rest are the packaging layouts npm actually uses.
+OPENCLAW_SKILL_ENV = "OPENCLAW_SKILLS_DIR"
+OPENCLAW_SKILL_SUBDIRS = (
+    ("core", os.path.join("openclaw", "skills")),
+    ("extensions", os.path.join("openclaw", "extensions")),
+)
+
+#: Skills whose whole body is a different operating system's tooling. Copied
+#: only when `include_other_os` is asked for: a procedure for driving macOS
+#: `osascript` is not made useful by being written down on Windows, and a menu
+#: that is a third unusable entries is a menu that stops being read. The
+#: detection is deliberately textual and dull -- the point is to *say* something
+#: was skipped and why, not to be clever about it.
+#: Narrow on purpose, and narrowed after measuring: the first draft matched
+#: "macos" anywhere in the body and therefore threw away `xurl` (npm-installable),
+#: `prose` (cross-platform), `obsidian` and `healthcheck` -- four usable
+#: procedures discarded for mentioning the word. A wrongly skipped skill is a
+#: loss nobody notices; a wrongly kept one costs a menu line. So the markers are
+#: things that CANNOT run here: a declaration of darwin in the metadata, and the
+#: handful of binaries that exist only on macOS.
+OPENCLAW_OTHER_OS_MARKERS = (
+    "osascript", "remindctl", "peekaboo", "application support/imessage",
+    "aerospace", "apple silicon",
+)
+
+#: The authoritative signal, and the reason the marker list above is so short:
+#: openclaw's skills DECLARE their platforms, e.g. `"os": ["darwin", "linux"]`
+#: for `tmux` or `["darwin", "linux", "win32"]` for `sherpa-onnx-tts`. Reading
+#: the declaration beats guessing from prose -- the prose said "macos" in
+#: `xurl`, `prose`, `obsidian` and `healthcheck`, which all run here, and said
+#: nothing about Windows at all in the three that do.
+OPENCLAW_OS_RE = re.compile(r'"os"\s*:\s*\[(.*?)\]', re.S)
+
+
+def openclaw_runs_here(text: str, *, here: str = "win32") -> tuple[bool, str]:
+    """Whether a foreign SKILL.md declares a platform this machine has.
+
+    Returns (usable, why-not). Absence of a declaration is treated as usable --
+    most of the 52 declare nothing, and refusing them for silence would throw
+    away the library to avoid four wrong menu lines.
+    """
+    m = OPENCLAW_OS_RE.search(text)
+    if m:
+        declared = {x.strip().strip('"\'').lower() for x in m.group(1).split(",")}
+        if declared and here not in declared:
+            return False, f"declares os={sorted(declared)}, not {here}"
+    low = text.lower()
+    marker = next((x for x in OPENCLAW_OTHER_OS_MARKERS if x in low), "")
+    if marker:
+        return False, f"another OS's tooling (matched {marker!r})"
+    return True, ""
+
+
+def _lenient_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """`name`/`description`/`when_to_use` out of a foreign SKILL.md, or empty.
+
+    Deliberately NOT ``split_frontmatter``. That parser is this library's own
+    contract: it raises on a line that is not ``key: value``, which is right for
+    a file this agent wrote and wrong for one that arrived from openclaw --
+    every one of openclaw's skills carries a nested ``metadata`` block, and a
+    strict reader would have rejected all 52 of them at the door. The rule being
+    followed is: be strict about what I write, be tolerant about what I read.
+
+    Four shapes actually occur in the 52: plain `key: value`; a block scalar
+    (`description: |`) whose lines are indented under it; no frontmatter at all
+    (one skill); and nested YAML braces, which are simply skipped because they
+    are not any of the three keys wanted.
+    """
+    if not text.lstrip().startswith("---"):
+        return {}, text
+    start = text.index("---") + 3
+    end = text.find("\n---", start)
+    if end == -1:
+        return {}, text
+    head, body = text[start:end], text[end + 4:]
+    meta: dict[str, str] = {}
+    lines = head.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$", line)
+        if not m:
+            i += 1
+            continue
+        key, value = m.group(1).lower(), m.group(2).strip()
+        if value in ("|", ">", "|-", ">-", "|+", ">+"):
+            parts: list[str] = []
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip()
+                                      or lines[j].startswith((" ", "\t"))):
+                parts.append(lines[j].strip())
+                j += 1
+            value = " ".join(x for x in parts if x)
+            i = j
+        else:
+            i += 1
+        if key in ("name", "description", "when_to_use") and value:
+            meta.setdefault(key, value.strip().strip('"').strip("'"))
+    return meta, body.lstrip("\n")
+
+
+def _openclaw_skill_roots_doc() -> str:      # pragma: no cover - documentation
+    """Kept next to the parser so the two cannot drift apart in a reader's mind."""
+    return "see openclaw_skill_roots()"
+
+
+def openclaw_skill_roots(explicit: str | None = None) -> list[str]:
+    """Every place an installed openclaw may keep its skills, existing ones only."""
+    roots: list[str] = []
+    env = explicit or os.environ.get(OPENCLAW_SKILL_ENV)
+    if env and os.path.isdir(env):
+        roots.append(env)
+    bases = [
+        os.path.join(os.environ.get("APPDATA", ""), "npm", "node_modules"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "npm", "node_modules"),
+        os.path.join(os.path.expanduser("~"), ".npm-global", "lib", "node_modules"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "npm",
+                     "node_modules"),
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+        os.path.join(os.path.expanduser("~"), ".local", "lib", "node_modules"),
+    ]
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        pkg = os.path.join(base, "openclaw")
+        if not os.path.isdir(pkg):
+            continue
+        core = os.path.join(pkg, "skills")
+        if os.path.isdir(core):
+            roots.append(core)
+        ext = os.path.join(pkg, "extensions")
+        if os.path.isdir(ext):
+            for name in sorted(os.listdir(ext)):
+                sub = os.path.join(ext, name, "skills")
+                if os.path.isdir(sub):
+                    roots.append(sub)
+    # Dedupe, keeping order.
+    seen: set[str] = set()
+    out = []
+    for r in roots:
+        key = os.path.normcase(os.path.abspath(r))
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def iter_openclaw_skills(roots: list[str]) -> list[tuple[str, str, Path]]:
+    """(group, name, SKILL.md path) for every skill package under `roots`."""
+    found: list[tuple[str, str, Path]] = []
+    for root in roots:
+        # A root that does not exist is skipped, not an error: the discovery
+        # function returns only directories it found, but an explicit root can
+        # be anything, and "there is no package here" is an answer the caller
+        # reports -- not a traceback.
+        if not os.path.isdir(root):
+            continue
+        group = ("extensions:" + os.path.basename(os.path.dirname(root))
+                 if os.path.basename(root) == "skills"
+                 and os.path.basename(os.path.dirname(root)) != "openclaw"
+                 else "core")
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            md = os.path.join(d, SKILL_INDEX_NAME)
+            if os.path.isfile(md):
+                found.append((group, name, Path(md)))
+                continue
+            # One level deeper: some packages nest their entry point.
+            for sub, _, files in os.walk(d):
+                if SKILL_INDEX_NAME in files:
+                    found.append((group, name, Path(sub) / SKILL_INDEX_NAME))
+                    break
+    return found
+
+
+def port_openclaw_skills(home: str | None = None, *, overwrite_body: bool = True,
+                         include_other_os: bool = False,
+                         roots: list[str] | None = None,
+                         library: "SkillLibrary | None" = None,
+                         store: Any = None) -> dict[str, Any]:
+    """Copy an installed openclaw's skills into this agent's own library.
+
+    Why: openclaw ships 52 hand-written procedures plus extension packages, each
+    one a `SKILL.md` with a `name`/`description`/`when_to_use` header -- the same
+    shape this library already reads. They are somebody's accumulated knowledge
+    about driving real tools (gh, tmux, whisper, Notion, Obsidian), and reading
+    them costs nothing while re-deriving them costs a session each.
+
+    Read this before treating the count as a win: copying the ACTIONS of another
+    agent is not the same as having its reach. openclaw's skills drive CLIs that
+    are installed on this machine -- `gh`, `tmux`, `ffmpeg` -- and a copied
+    procedure is only useful where that binary exists. What is genuinely
+    transferable is the *method*: which command sequence, in which order, with
+    which pitfall. That is what is being kept, and it is worth keeping on those
+    terms alone, not as a claim that this agent can now do what openclaw does.
+
+    Three decisions, each with a reason, and all three inherited from the tars
+    port because the same arguments apply:
+
+    *Flat under an ``openclaw-`` prefix.* The prefix is how a reader of the menu
+      can tell a procedure learned here from one that arrived from a stranger.
+
+    *Body copied verbatim, behind one provenance line.* Editing it would be
+      "improving" a procedure whose value is that somebody else ran it -- and
+      this agent has not run it once. The line carries the source and the
+      licence (MIT, Peter Steinberger) into the file itself, so a copy separated
+      from the package still says where it came from.
+
+    *Other-OS skills are skipped and reported, not copied.* Ten of the 52 are
+      macOS-only. Copying them would be the appearance of borrowing without the
+      possibility of use, and it would bury the usable entries. Pass
+      `include_other_os=True` to keep them anyway.
+
+    Idempotent, and it does not reset usage: re-running rewrites the text and
+    leaves ``loads`` alone, so a re-port cannot look like a fresh, unproven
+    procedure.
+    """
+    lib = library
+    if lib is None:
+        lib = SkillLibrary(store, dirs=[("user", os.path.join(
+            home or _default_home(), "skills"))])
+    lib.scan()
+
+    resolved = list(roots) if roots else openclaw_skill_roots()
+    if not resolved:
+        return {"ok": False, "written": [], "skipped": [],
+                "error": "no openclaw skills directory found; set "
+                         + OPENCLAW_SKILL_ENV + " to the package's skills/ path",
+                "roots": []}
+
+    written: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for group, name, path in iter_openclaw_skills(resolved):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            skipped.append({"name": name, "why": f"unreadable: {exc}"})
+            continue
+        meta, body = _lenient_frontmatter(text)
+        description = (meta.get("description") or "").strip()
+        if not description:
+            # One of the 52 has no frontmatter at all. Its first markdown
+            # heading is the honest description; a skill with no description is
+            # unroutable, and unroutable means never offered.
+            first = next((ln.lstrip("# ").strip() for ln in body.splitlines()
+                          if ln.strip().startswith("#")), "")
+            description = first or ("Copied from openclaw: " + name)
+        when = (meta.get("when_to_use") or description).strip()
+        if not include_other_os:
+            usable, why = openclaw_runs_here(text)
+            if not usable:
+                skipped.append({"name": name, "why": why + "; pass "
+                                "include_other_os=True to keep"})
+                continue
+        target = "openclaw-" + name
+        if not valid_name(target):
+            skipped.append({"name": name, "why": f"unusable name {target!r}"})
+            continue
+        if not overwrite_body and lib.get(target) is not None:
+            skipped.append({"name": name, "why": "already present"})
+            continue
+        header = (f"<!-- Copied verbatim from openclaw {group} skill "
+                  f"{name!r} (MIT, Peter Steinberger / openclaw). Body unchanged. "
+                  f"Re-port with skills.port_openclaw_skills(). -->")
+        lib.write(name=target, description=description, when_to_use=when,
+                  body=header + "\n\n" + body,
+                  tags=["openclaw", TARS_SKILL_TAG, group], scope="user")
+        written.append({"name": target, "group": group,
+                        "description": description[:100]})
+
+    return {"ok": True, "written": written, "skipped": skipped,
+            "roots": resolved, "count": len(written),
+            "skipped_count": len(skipped),
+            "dir": os.path.join(home or _default_home(), "skills")}
 
 
 def port_tars_skills(home: str | None = None, *, overwrite_body: bool = True,
