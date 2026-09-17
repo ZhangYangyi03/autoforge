@@ -62,18 +62,28 @@ class TestTheChannel:
         assert "nothing is running" in ack
         assert "yield" not in ack
 
-    def test_the_reply_promises_a_yield_while_a_run_is_live(self):
+    def test_the_reply_promises_an_answer_without_killing_the_work(self):
+        # The wording changed on 2026-09-17, and the change is the fix. The
+        # reply used to say "the step in progress will yield to it", and making
+        # that sentence true was paid for by aborting whatever was running --
+        # so a question typed at a download killed the download. A long job is
+        # not interrupted now (only /stop is), so the honest reply is that the
+        # line is heard, that an answer is coming, and that the work survives.
         s, printed = _steering()
         s.begin_run()
         s.submit("a note with a run behind it")
-        assert any("heard" in p and "yield" in p for p in printed)
+        ack = " ".join(printed)
+        assert "heard" in ack
+        assert "answer" in ack
+        assert "keeps running" in ack
+        assert "yield" not in ack        # the promise nothing should keep
 
         # And stops promising it the moment the run is over: the gap between
         # runs is exactly when a stale sentence would be read as a live one.
         printed.clear()
         s.end_run()
         s.submit("a note after the run")
-        assert not any("yield" in p for p in printed)
+        assert any("nothing is running" in p for p in printed)
 
     def test_a_nested_run_does_not_end_the_outer_one(self):
         s, _ = _steering()
@@ -256,6 +266,71 @@ class TestTheReaderThread:
 # ======================================================================
 # the loop drains it — a channel nobody reads is not a feature
 # ======================================================================
+
+class TestAQuestionIsNotAStop:
+    """The bug this pins, measured on this host on 2026-09-17.
+
+    `has_pending()` was wired straight into every `should_abort` and
+    `abort_check`, so *any* line from the operator was read as a reason to
+    abort. Four separate long jobs -- a 1.6GB model download, a forge, a
+    transcription -- were recorded as "stopped at the operator's request", and
+    every one of them was killed by a question ("how is it going?", "done
+    yet?"), not by /stop. The operator asked for a status update and lost
+    twenty minutes of work.
+
+    The two questions are now different, and this class fixes the difference:
+
+      cheap steps (a model call)  ask `_operator_should_yield` -- a question
+                                  is reason enough, because nothing is lost;
+      long steps (forge, sandbox) ask `_operator_wants_the_floor` -- only a
+                                  real /stop may kill work in flight.
+    """
+
+    @staticmethod
+    def _agent(steer):
+        a = Agent.__new__(Agent)          # no __init__: this is about one method
+        a.steer = steer
+        return a
+
+    def test_a_question_does_not_abort_a_long_step(self):
+        s, _ = _steering()
+        s.submit("how is it going?")
+        a = self._agent(s)
+        assert a._operator_should_yield() is True      # the model call yields
+        assert a._operator_wants_the_floor() is False  # the download survives
+
+    def test_a_stop_still_aborts_both(self):
+        s, _ = _steering()
+        s.submit("/stop")
+        a = self._agent(s)
+        assert a._operator_wants_the_floor() is True
+        assert a._operator_should_yield() is True
+
+    def test_the_expensive_question_is_never_broader_than_the_cheap_one(self):
+        # The invariant, stated directly: if a long step may abort, a cheap one
+        # may too. The reverse is the bug.
+        for line in ("just asking", "/stop", "carry on"):
+            s, _ = _steering()
+            s.submit(line)
+            a = self._agent(s)
+            if a._operator_wants_the_floor():
+                assert a._operator_should_yield(), line
+
+    def test_no_channel_means_no_abort_and_no_yield(self):
+        a = self._agent(None)
+        assert a._operator_wants_the_floor() is False
+        assert a._operator_should_yield() is False
+
+    def test_a_long_step_is_not_told_to_abort_by_the_channel_it_polls(self):
+        # The wiring, not the wording: the predicate handed to a sandbox as
+        # `abort_check` is the narrow one. A question leaves it False, which is
+        # what stops a running child from being killed mid-download.
+        s, _ = _steering()
+        s.submit("progress?")
+        a = self._agent(s)
+        assert a._operator_wants_the_floor() is False, (
+            "a question was read as a reason to abort a long step")
+
 def _tool_registry(calls: list) -> ToolRegistry:
     reg = ToolRegistry()
 

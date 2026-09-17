@@ -262,7 +262,7 @@ class MinimalAgent:
         if self.compactor is None:
             self.compactor = Compactor(
                 summarizer=LLMSummarizer(
-                    self.llm, should_abort=self._operator_wants_the_floor),
+                    self.llm, should_abort=self._operator_should_yield),
                 fallback=DeterministicSummarizer(),
                 log_path=default_log_path(),
             )
@@ -270,15 +270,18 @@ class MinimalAgent:
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         self.trace.append({"kind": kind, **payload})
 
-    def _operator_wants_the_floor(self) -> bool:
-        """Whether the operator has said something this run has not consumed.
+    def _operator_should_yield(self) -> bool:
+        """Whether the summarizer should give way so the operator hears back.
 
-        The same question `core.agent.Agent` asks of its own long steps, asked
-        here because the compactor is built in `__post_init__` -- before the
-        Agent it belongs to exists. It needs an answer for the same reason that
-        loop does: the summarizer is a model call that can run for minutes, and
-        it fires at a turn boundary, so without this the one long step that
-        could not yield was the one the operator was most likely waiting on.
+        The question the compactor is handed. It used to be
+        `_operator_wants_the_floor`, which now means only "a real /stop" --
+        right for a job that must not be destroyed, wrong for a summarizer,
+        which is a *cheap* step: dropping it costs a summary that can be taken
+        again, and aborting it is how a question gets answered mid-run rather
+        than after the whole turn.
+
+        Asked here rather than on an Agent because the compactor is built in
+        `__post_init__`, before the Agent it belongs to exists.
         """
         if self.steer is None:
             return False

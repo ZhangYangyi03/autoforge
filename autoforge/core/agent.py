@@ -316,6 +316,34 @@ class Agent:
             stopped_by_operator=True, termination_reason="stopped by the operator",
         )
 
+    def _operator_said_something(self) -> bool:
+        """Whether the operator has spoken and the loop has not consumed it.
+
+        This is the *politeness* question, and it is deliberately not the same
+        as `_operator_wants_the_floor`. A line typed while a long step runs --
+        "how is it going?" -- used to arrive as an abort, because the only
+        question asked of the channel was "is there anything pending?", and
+        anything pending was treated as a reason to stop. So asking for a
+        status update killed the download, the forge, the transcription: the
+        one thing the person at the terminal did not ask for.
+
+        Measured on this host on 2026-09-17: four separate long jobs were
+        reported as "stopped at the operator's request" and every one of them
+        was stopped by a question, not by a /stop. A question is not a stop
+        command, and an agent that cannot tell them apart is worse than one
+        that ignores them, because it destroys work while appearing responsive.
+
+        What the answer should buy is the *reply*: the loop folds the line in
+        at the next boundary and answers it (`_answer_the_operator`), without
+        cutting short the step that is producing something.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending())
+        except Exception:                     # noqa: BLE001 - reads as "no"
+            return False
+
     def _operator_wants_the_floor(self) -> bool:
         """Whether the operator has said something the loop has not consumed.
 
@@ -336,8 +364,28 @@ class Agent:
         if self.steer is None:
             return False
         try:
-            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+            return bool(self.steer.stop_requested())
         except Exception:                     # noqa: BLE001 - see docstring
+            return False
+
+    def _operator_should_yield(self) -> bool:
+        """Whether a *cheap* step should give way so the operator gets an answer.
+
+        The model call, not the tool run. Aborting a request costs nothing that
+        cannot be asked again: no tool has run, no message has been appended,
+        and the turn is given back. That is what lets a question land inside a
+        long model call instead of after it.
+
+        The expensive steps ask `_operator_wants_the_floor` instead, which is
+        now strictly narrower: only a real stop. A question must never be the
+        reason a download, a forge or a transcription dies -- see
+        `_operator_said_something` for the measurement behind that.
+        """
+        if self.steer is None:
+            return False
+        try:
+            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+        except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
     def run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
@@ -406,7 +454,10 @@ class Agent:
             try:
                 resp = self.llm.chat(
                     msgs, tools=self.registry.schemas(),
-                    should_abort=self._operator_wants_the_floor,
+                    # The cheap step: a question is reason enough to go round
+                    # again and answer it, because nothing is lost by asking a
+                    # request twice. Long steps ask the narrower question.
+                    should_abort=self._operator_should_yield,
                 )
             except LLMAborted:
                 # They spoke while the answer was in flight. Nothing has been
@@ -427,7 +478,12 @@ class Agent:
                 # loop can actually absorb is worth another turn; anything else
                 # belongs to the caller, which is where the operator's message
                 # is waiting.
-                if not self._operator_wants_the_floor():
+                # Asked with the same predicate the call used. Asking the
+                # narrower one here would re-raise our own question: the call
+                # aborted because there was a line to answer, and the narrow
+                # question ("did they send /stop?") is False, so the line would
+                # be thrown away as somebody else's.
+                if not self._operator_should_yield():
                     raise
                 turn -= 1
                 continue

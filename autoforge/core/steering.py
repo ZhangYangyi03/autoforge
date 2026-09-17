@@ -300,7 +300,14 @@ class Steering:
         # could perform. Whether it is true is decidable, because the loop says
         # so when it starts and when it stops, so ask rather than assume.
         if self.running:
-            self._say(f"✓ heard, and the step in progress will yield to it: {text[:60]}")
+            # Deliberately not "the step in progress will yield to it": that was
+            # written when a pending line aborted whatever was running, and the
+            # price of making it true was that a question killed the download.
+            # A long job is not interrupted now -- only /stop is -- so the
+            # honest sentence is that the line is heard, that it will be
+            # answered, and that the work in flight is safe.
+            self._say(f"✓ heard — you'll get an answer; the job in flight keeps "
+                      f"running: {text[:60]}")
         else:
             self._say("✓ heard — nothing is running right now, so this goes in "
                       f"with your next request: {text[:60]}")
