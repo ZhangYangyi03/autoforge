@@ -2477,6 +2477,14 @@ class ForgeAgent:
                 out["provenance"]["copied_verbatim"]))
             lines.append("  not copied: " + ", ".join(out["provenance"]["not_copied"]))
             lines.append("  why: " + str(out["provenance"]["why"]))
+            check = out["provenance"].get("verbatim_check") or {}
+            lines.append("  byte-for-byte check: " + (
+                "MANIFEST.sha256 missing -- unverified"
+                if not check.get("checked") else
+                f"{check['checked']}/{check['listed']} files match the digest "
+                f"recorded at copy time" + ("" if check.get("ok") else
+                " -- MISMATCH: " + ", ".join(list(check.get("mismatched") or [])
+                                             + list(check.get("missing") or [])))))
             lines.append("")
             lines.append("Host probe (read-only, this run):")
             lines += ["  - " + l for l in out["probe"]]

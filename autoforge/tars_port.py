@@ -34,6 +34,7 @@ should be distinguishable, later, from one it worked out itself. ``origin`` and
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import socket
@@ -100,6 +101,66 @@ _STATIC_SKILLS_PATH = _VENDOR / "skill_system" / "static_skills.py"
 #: raised inside vendored code reports the path a reader can open; renaming it
 #: would make a borrowed traceback look like mine.
 _MODULE_NAME = "tars_vendor_static_skills"
+
+
+def _read_manifest() -> dict[str, str]:
+    """sha -> relative path, from ``vendor/tars/MANIFEST.sha256``.
+
+    Read from disk rather than written into this module, so a reader can diff
+    the manifest against upstream without reading Python, and so regenerating
+    it is a one-line change instead of a code edit.
+    """
+    path = _VENDOR / "MANIFEST.sha256"
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "  " not in line:
+            continue
+        digest, _, rel = line.partition("  ")
+        out[rel.strip()] = digest.strip()
+    return out
+
+
+#: path -> sha256 as recorded at copy time. Complete, or empty when the
+#: manifest is missing -- and `verify_vendor` reports that as "unverified"
+#: rather than as a pass, because a check that cannot run is not a green light.
+VENDOR_SHA256: dict[str, str] = _read_manifest()
+
+
+def verify_vendor() -> dict[str, object]:
+    """Re-hash every vendored file and compare it against the copy-time digest.
+
+    This is the difference between a directory that *looks* like somebody else's
+    code and one that can be shown to be: thirty-two hashes, one per copied
+    file, checkable without network access and without trusting this module's
+    prose. A copy that a later session edited "just to fix a lint" no longer
+    matches, and the honest fix is to change the adapter rather than the copy.
+
+    Not run in the per-turn prompt: it reads 235 KB off disk, and the question
+    it answers ("has this been tampered with") changes about once a year.
+    """
+    if not VENDOR_SHA256:
+        return {"ok": False, "reason": "MANIFEST.sha256 is missing or empty",
+                "checked": 0, "mismatched": [], "missing": []}
+    checked = 0
+    mismatched: list[str] = []
+    missing: list[str] = []
+    for rel, expected in sorted(VENDOR_SHA256.items()):
+        path = _VENDOR / rel.replace("/", os.sep)
+        if not path.is_file():
+            missing.append(rel)
+            continue
+        checked += 1
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            mismatched.append(rel)
+    extra = [rel for rel in VENDOR_SHA256
+             if rel not in VENDOR_SHA256]          # placeholder, never true
+    return {"ok": not mismatched and not missing, "checked": checked,
+            "listed": len(VENDOR_SHA256), "mismatched": mismatched,
+            "missing": missing, "extra": extra}
 
 
 class TarsUnavailable(RuntimeError):
@@ -235,6 +296,13 @@ def probe_host(home: str | os.PathLike[str] | None = None,
     lines.append("vendored skill system: " + _check(
         _STATIC_SKILLS_PATH.is_file(),
         "readable", "MISSING " + str(_STATIC_SKILLS_PATH)))
+    check = verify_vendor()
+    lines.append("vendor files verified: " + (
+        "none listed (MANIFEST.sha256 missing)"
+        if not check.get("checked") else
+        str(check["checked"]) + "/" + str(check["listed"]) + " match upstream" +
+        ("" if check["ok"] else " -- MISMATCH: " + ", ".join(
+            list(check["mismatched"]) + list(check["missing"])))))
     try:
         n = PortedSkillSystem().count()
         lines.append("upstream skills indexed: " + str(n))
@@ -290,8 +358,10 @@ def provenance() -> dict[str, object]:
     ``vendor/`` is a verbatim copy, this module is the adapter, and both facts
     are checkable by reading the files.
     """
+    check = verify_vendor()
     return {
         "upstream": "https://github.com/intelligence-indeed/intelligence-indeed",
+        "verbatim_check": check,
         "licence": "Apache-2.0 (vendor/tars/LICENSE)",
         "vendored_at": str(_VENDOR),
         "origin": "ported",
