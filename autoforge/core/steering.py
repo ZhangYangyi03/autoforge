@@ -108,6 +108,12 @@ class Steering:
     ) -> None:
         self.stream = stream if stream is not None else sys.stdin
         self.printer = printer or (lambda text: print(text, flush=True))
+        #: Set by `with_editor`. The point of taking one from outside is that the
+        #: editor is also the *producer* of a paste: the same object that reads
+        #: the line is the one that knows a picture was pasted into it, and only
+        #: it can hand those bytes on. A channel that built its own editor would
+        #: be routing around the very object doing the reading.
+        self._pending_editor: LineEditor | None = None
         self.status = status
         self.editor = editor if editor is not None else LineEditor(stream=self.stream)
         self._pending: queue.Queue[str] = queue.Queue()
@@ -164,10 +170,17 @@ class Steering:
             if self._run_depth:
                 self._run_depth -= 1
 
+    def with_editor(self, editor: LineEditor | None) -> "Steering":
+        """Adopt `editor` (if any) as the terminal owner, before :meth:`start`."""
+        self._pending_editor = editor
+        return self
+
     def start(self) -> "Steering":
         """Start reading the stream, if there is a person on the other end."""
         if self._thread is not None:
             return self
+        if self.interactive and self._pending_editor is not None:
+            self.editor = self._pending_editor
         if self.interactive and self.editor.start():
             self._thread = threading.Thread(target=self._read_keys, daemon=True)
         elif self.interactive:
@@ -233,6 +246,11 @@ class Steering:
     def submit(self, line: str) -> None:
         """Route one typed line: a command, or something to tell the agent."""
         text = line.rstrip("\r\n")
+        # Printed before the line is routed, and before the early return below:
+        # a paste that was then submitted as an empty line -- which is what
+        # pressing Enter on an attached screenshot alone does -- still gets its
+        # receipt. Silence there reads as a paste that failed.
+        self._receipt()
         if not text.strip():
             return
         # A leading space is an escape hatch: " /usr/bin/env is missing" is
@@ -326,6 +344,15 @@ class Steering:
             self._tail = merged
         return True
 
+    def _receipt(self) -> None:
+        """Print the receipt for the last paste, if there is one."""
+        try:
+            notice = self.take_notice()
+        except Exception:                 # noqa: BLE001 - a receipt is not a gate
+            return
+        if notice:
+            self._say(notice)
+
     def _say(self, text: str) -> None:
         try:
             self.printer(text)
@@ -341,6 +368,28 @@ class Steering:
             return f"(no snapshot: {type(exc).__name__}: {exc})"
 
     # -- what the loop consumes ----------------------------------------
+    def take_notice(self) -> str:
+        """The receipt for the last paste, or "" -- printed back at the terminal.
+
+        The person pasting has no other way to know it took: the line editor
+        writes a placeholder into the input area, and a screenshot pasted while
+        the agent is running scrolls away with the progress line. The queued
+        "heard" receipt is not it either, because that one answers the *line*.
+        """
+        take = getattr(self.editor, "take_notice", None)
+        return take() if callable(take) else ""
+
+    def take_images(self) -> list[str]:
+        """Image placeholders attached to everything pending, oldest first.
+
+        Read separately from the lines because the two are consumed by
+        different things: the text goes into the message list, the pictures go
+        into the next request's parts. An editor that is not running answers
+        with nothing, which is the honest answer for a pipe.
+        """
+        take = getattr(self.editor, "take_images", None)
+        return list(take()) if callable(take) else []
+
     def take_supplements(self) -> list[str]:
         """Everything the operator said since the last check, ready for the model."""
         out: list[str] = []

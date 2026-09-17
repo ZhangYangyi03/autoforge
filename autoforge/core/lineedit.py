@@ -91,6 +91,14 @@ except Exception:
 __all__ = [
     "LineEditor",
     "mouse_enabled",
+    "read_clipboard_png",
+    "read_clipboard_files",
+    "collapse_paths",
+    "describe_path",
+    "kind_of",
+    "collapse_image",
+    "image_paths",
+    "to_data_url",
     "read_clipboard",
     "write_clipboard",
     "collapse_paste",
@@ -209,6 +217,335 @@ _REVERSE_OFF = "\x1b[27m"
 
 
 _CF_UNICODETEXT = 13
+_CF_PNG = 498
+
+
+_CF_HDROP = 15
+
+#: What a pasted path is, by extension. Named rather than sniffed because the
+#: bytes of a 4 GB archive are not going to be read to find out, and the
+#: extension is what the person who made the file meant it to be. `other` is a
+#: real answer: it is what tells the model "this is an opaque file, ask for what
+#: you need from it" instead of it guessing from a name.
+_KIND_BY_SUFFIX: dict[str, str] = {}
+for _kind, _suffixes in {
+    "image": (".png .jpg .jpeg .gif .bmp .webp .tif .tiff .ico .svg .heic .avif"),
+    "audio": (".wav .mp3 .flac .ogg .m4a .aac .wma .opus .aiff"),
+    "video": (".mp4 .mkv .mov .avi .webm .wmv .flv .m4v .mpg .mpeg"),
+    "archive": (".zip .7z .rar .tar .gz .tgz .bz2 .xz .zst .iso .cab"),
+    "document": (".pdf .doc .docx .xls .xlsx .ppt .pptx .odt .ods .epub .md .rtf"),
+    "text": (".txt .log .csv .tsv .json .jsonl .yaml .yml .toml .ini .cfg .xml .html .py .js .ts .c .h .cpp .rs .go .java .sh .ps1 .sql"),
+    "notebook": (".ipynb .rmd .qmd"),
+}.items():
+    for _suffix in _suffixes.split():
+        _KIND_BY_SUFFIX[_suffix] = _kind
+
+
+def kind_of(path: Path | str) -> str:
+    """What sort of thing a path is: image, audio, video, archive, ... or other."""
+    return _KIND_BY_SUFFIX.get(Path(path).suffix.lower(), "other")
+
+
+def human_size(n: int) -> str:
+    """Bytes the way a person reads them, because a count of bytes is a number
+    nobody can size at a glance and the model should not have to divide."""
+    step = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if step < 1024 or unit == "TB":
+            return f"{step:.0f} {unit}" if unit == "B" else f"{step:.1f} {unit}"
+        step /= 1024
+    return f"{n} B"
+
+
+def _read_clipboard_files() -> list[str]:
+    """Paths copied in Explorer, as a list, or [] when there are none.
+
+    CF_HDROP is the format a file copy uses: a DROPFILES header and then a
+    double-NUL-terminated block of UTF-16 paths. This is why a copied folder
+    can be attached at all -- the *text* format an Explorer copy also carries
+    is ambiguous (a list of names, no paths, no idea whether it is one file or
+    six), while this one is the paths themselves.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+    except Exception:                          # noqa: BLE001
+        return []
+    try:
+        user32, kernel32 = _clipboard_api()
+        shell32 = ctypes.windll.shell32
+        # DragQueryFileW is the documented way to walk the block: it decodes the
+        # paths, so nothing here has to know how the list is terminated or how
+        # a surrogate pair survives the trip.
+        shell32.DragQueryFileW.argtypes = [wt.HANDLE, wt.UINT, wt.LPWSTR, wt.UINT]
+        shell32.DragQueryFileW.restype = wt.UINT
+        if not _open_clipboard(user32):
+            return []
+        try:
+            handle = user32.GetClipboardData(_CF_HDROP)
+            if not handle:
+                return []
+            count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+            out: list[str] = []
+            for i in range(count):
+                need = shell32.DragQueryFileW(handle, i, None, 0)
+                buffer = ctypes.create_unicode_buffer(need + 1)
+                shell32.DragQueryFileW(handle, i, buffer, need + 1)
+                if buffer.value:
+                    out.append(buffer.value)
+            return out
+        finally:
+            user32.CloseClipboard()
+    except Exception:                          # noqa: BLE001 - a clipboard that cannot answer
+        return []
+
+
+def describe_path(path: str) -> str:
+    """One bracketed line naming a pasted path, its kind and its size.
+
+    The same shape a collapsed paste gets, and for the same reason: the line
+    has to stay short enough to read and edit, while everything the model needs
+    to decide what to do with the file travels with it. A directory says how
+    many entries it holds, because that is the number that decides whether to
+    list it or to read it.
+    """
+    where = Path(path)
+    kind = kind_of(where)
+    try:
+        if where.is_dir():
+            try:
+                count = sum(1 for _ in where.iterdir())
+            except OSError:
+                count = -1
+            detail = f"directory, {'? entries' if count < 0 else str(count) + ' entries'}"
+        else:
+            detail = f"{kind}, {human_size(where.stat().st_size)}"
+    except OSError:
+        detail = kind
+    return f"[Attached: {where} ({detail})]"
+
+
+def collapse_paths(paths: list[str], *, directory: Path | str | None = None) -> list[str]:
+    """Bracketed lines for the paths on the clipboard.
+
+    A directory is deliberately *not* expanded into its contents: a paste of a
+    folder the agent may not even be allowed to walk would turn into a thousand
+    lines on the input line, and the listing is one tool call away when the
+    model decides it needs it.
+    """
+    out: list[str] = []
+    for path in paths:
+        if not path:
+            continue
+        # A picture copied as a file is attached as an *image*, not as a path:
+        # the bytes are what a vision model can be given, and a path to a PNG is
+        # something it can only be told about.
+        if kind_of(path) == "image":
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                data = b""
+            if data:
+                ref = collapse_image(data, directory=directory)
+                if ref:
+                    out.append(ref)
+                    continue
+        out.append(describe_path(path))
+    return out
+_CF_DIB = 8
+
+
+
+def _win_dib_dpi() -> float:
+    """The clipboard DIB's own resolution, for a machine with a scaled display.
+
+    A screenshot lands on the clipboard as a bitmap with no pixel-density of
+    its own, and Windows reads it back at the *display's* scale. On a machine
+    running at 150% that inflates it by half, so the image the model is asked
+    about is not the image that was on screen. The header carries the density
+    it was captured at, and believing it is what keeps that from happening.
+    """
+    try:
+        import ctypes
+        user32, kernel32 = _clipboard_api()
+        if not _open_clipboard(user32):
+            return 0.0
+        try:
+            handle = user32.GetClipboardData(_CF_DIB)
+            if not handle:
+                return 0.0
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                return 0.0
+            try:
+                header = ctypes.string_at(ptr, 28)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+    except Exception:                          # noqa: BLE001 - a density, not a gate
+        return 0.0
+    # biXPelsPerMeter sits at byte 24 of a BITMAPINFOHEADER -- after the header
+    # size, the width, the height, the planes, the bit depth, the compression and
+    # the image size. Reading it at byte 4 reads the *width* instead, which on a
+    # screenshot is a plausible-looking number in the thousands and would scale
+    # the picture by whatever the window happened to be wide.
+    if len(header) < 28 or int.from_bytes(header[0:4], "little") < 40:
+        return 0.0
+    ppm = int.from_bytes(header[24:28], "little")
+    if ppm <= 0 or ppm > 100000:
+        return 0.0
+    return ppm / 39.3700787
+
+
+def _read_clipboard_png(dpi: float = 0.0) -> bytes:
+    """A picture on the clipboard as PNG bytes, or b"" when there is none.
+
+    Why a second reader and not a flag on the text one: the clipboard holds
+    formats, and a screenshot holds no text at all. Asking for the text format
+    first is what made "I copied an image" indistinguishable from "the
+    clipboard is empty" -- both came back as an empty string. The picture
+    formats are tried first for the same reason: a copied image often carries a
+    text rendition alongside it (a file path, a URL), and the picture is the
+    thing the person meant.
+
+    The format is asked for rather than hoped for. CF_PNG is tried first
+    because it is already PNG and needs no conversion; CF_DIB is what an
+    ordinary PrtScr leaves behind, and is turned into PNG here.
+    """
+    try:
+        # `io` is not imported at module scope: this is the only place in the
+        # file that needs an in-memory file, and a missing import here would be
+        # swallowed by the handler below into "there was no picture" -- which is
+        # exactly the failure that reads as "paste did nothing".
+        import ctypes
+        import io
+        from PIL import Image
+    except Exception:                          # noqa: BLE001 - no Pillow, no images
+        return b""
+    try:
+        user32, kernel32 = _clipboard_api()
+        if not _open_clipboard(user32):
+            return b""
+        try:
+            png = b""
+            handle = user32.GetClipboardData(_CF_PNG)
+            if handle:
+                ptr = kernel32.GlobalLock(handle)
+                if ptr:
+                    try:
+                        png = ctypes.string_at(ptr, kernel32.GlobalSize(handle))
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+            if png.startswith(b"\x89PNG"):
+                return png
+            raw = b""
+            handle = user32.GetClipboardData(_CF_DIB)
+            if handle:
+                ptr = kernel32.GlobalLock(handle)
+                if ptr:
+                    try:
+                        raw = ctypes.string_at(ptr, kernel32.GlobalSize(handle))
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+    except Exception:                          # noqa: BLE001 - a clipboard that cannot answer
+        return b""
+    if not raw:
+        return b""
+    try:
+        # A DIB with no file header is what Pillow's BMP reader expects once a
+        # 14-byte file header is put in front of it: the pixel offset is that
+        # header plus the size of the info header, which the DIB states in its
+        # own first four bytes.
+        size = int.from_bytes(raw[0:4], "little") if len(raw) >= 4 else 0
+        offset = 14 + size
+        bmp = (b"BM" + (14 + len(raw)).to_bytes(4, "little") + b"\x00\x00\x00\x00"
+               + offset.to_bytes(4, "little") + raw)
+        image = Image.open(io.BytesIO(bmp))
+        image.load()
+        if image.mode not in ("RGB", "RGBA", "L"):
+            image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+        buffer = io.BytesIO()
+        # Let Pillow write the resolution rather than rescaling by hand: the
+        # value has to travel inside the file, because that is where the far
+        # end reads it from.
+        image.save(buffer, format="PNG", dpi=(dpi, dpi) if dpi > 0 else None)
+        return buffer.getvalue()
+    except Exception:                          # noqa: BLE001 - a clipboard that cannot answer
+        return b""
+
+
+def collapse_image(data: bytes, *, directory: Path | str | None = None) -> str:
+    """Write clipboard bytes to a PNG and return the placeholder naming it.
+
+    The same bargain a long paste gets: the input line stays short, the message
+    does not. A path travels the whole way to the model untouched, which is the
+    difference between an image this harness can describe and one only a person
+    could.
+    """
+    if not data:
+        return ""
+    where = Path(directory) if directory is not None else paste_dir()
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+        index = _next_index(where)
+        path = where / f"paste_{index}_{time.strftime('%H%M%S')}.png"
+        path.write_bytes(data)
+    except OSError:
+        return ""
+    return f"[Image #{index}: {len(data)} bytes \u2192 {path}]"
+
+
+IMAGE_MARK = "[Image #"
+IMAGE_REF_RE = re.compile(r"\[Image #(\d+): \d+ bytes \u2192 (.+?)\]")
+
+
+def image_paths(text: str) -> list[str]:
+    """Every image a line refers to, by path, in the order it names them.
+
+    For the side that has to *send* the picture: paste expansion is what the
+    model reads, and an image cannot be spelled in words no matter how the line
+    is written.
+    """
+    if not isinstance(text, str) or IMAGE_MARK not in text:
+        return []
+    return [m.group(2) for m in IMAGE_REF_RE.finditer(text)]
+
+
+def to_data_url(path: str) -> str:
+    """A data URL for an image file, or "" if it cannot be read.
+
+    Empty rather than raising: a picture that vanished is a line with one fewer
+    picture in it, not a run that dies on the way to the model.
+    """
+    import base64
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    from ..vision import sniff_media_type
+    media = sniff_media_type(data) or "image/png"
+    return f"data:{media};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def read_clipboard_png() -> bytes:
+    """A picture on the clipboard as PNG bytes, or b"" when there is none.
+
+    Windows only: the bitmap and PNG clipboard formats are Win32 APIs with no
+    general equivalent, and this host is where the terminal is.
+    """
+    if os.name != "nt":
+        return b""
+    return _read_clipboard_png(_win_dib_dpi())
+
+
+def read_clipboard_files() -> list[str]:
+    """Paths copied in Explorer, or [] when the clipboard holds none."""
+    if os.name != "nt":
+        return []
+    return _read_clipboard_files()
 
 
 def read_clipboard() -> str:
@@ -277,6 +614,8 @@ def _clipboard_api():
     # 64-bit process -- and the memmove that follows then writes somewhere
     # that is not the block at all. That is an access violation at best.
     kernel32.GlobalLock.restype = wt.LPVOID
+    kernel32.GlobalSize.argtypes = [wt.HGLOBAL]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
     kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
     kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
     return user32, kernel32
@@ -1228,6 +1567,15 @@ class LineEditor:
         self._mouse_live = False
         self._mouse_ok = mouse_enabled()
         self._clip_read = clipboard_read or read_clipboard
+        #: Held until the line is *submitted*: a placeholder that vanished on the
+        #: next keystroke would delete a picture by accident, which is worse
+        #: than one that has to be deleted on purpose.
+        self._pending_images: list[str] = []
+        #: The last thing a paste attached, for the session to print back. A
+        #: paste that leaves no visible trace is indistinguishable from one that
+        #: did nothing, and the person at the terminal is the one who has to
+        #: know which happened.
+        self.notice = ""
         self._clip_write = clipboard_write or write_clipboard
 
     # -- lifecycle -----------------------------------------------------
@@ -1382,10 +1730,86 @@ class LineEditor:
             except Exception:                 # noqa: BLE001 - a clipboard that cannot answer
                 return False
         if not text:
-            return False
+            # No text on the clipboard is not the same as nothing on it. A
+            # screenshot lives in the picture formats; a file or a folder copied
+            # in Explorer lives in CF_HDROP. Both are tried, in that order,
+            # because a burst of text is the common case and it has already been
+            # answered by the two lines above.
+            return self.paste_image() or self.paste_files()
         self._delete_selection()
         self._insert(text.replace("\r\n", "\n").replace("\r", "\n"))
         return True
+
+    def paste_image(self) -> bool:
+        """Put the clipboard's picture on the input line as a placeholder.
+
+        True when one was there. The bytes go to a file and the line gets only
+        its name -- the line has to stay something a person can read and edit,
+        while the message has to carry the picture itself.
+        """
+        try:
+            data = read_clipboard_png()
+        except Exception:                     # noqa: BLE001 - a clipboard that cannot answer
+            return False
+        if not data:
+            return False
+        try:
+            ref = collapse_image(data, directory=self._paste_to)
+        except Exception:                     # noqa: BLE001 - same
+            return False
+        if not ref:
+            return False
+        self._pending_images.append(ref)
+        self._delete_selection()
+        self._insert(ref)
+        self.notice = f"\u2713 attached a picture: {ref}"
+        return True
+
+    def paste_files(self) -> bool:
+        """Attach the files or folders copied in Explorer, as bracketed lines.
+
+        Returns True when something was attached. A path is inserted the way a
+        collapsed long paste is: the whole thing, on the input line, so it can
+        be read and edited before it is sent -- and the same line is what the
+        model gets, because for a file the path *is* the content.
+        """
+        try:
+            paths = read_clipboard_files()
+        except Exception:                     # noqa: BLE001 - a clipboard that cannot answer
+            return False
+        if not paths:
+            return False
+        try:
+            refs = collapse_paths(paths, directory=self._paste_to)
+        except Exception:                     # noqa: BLE001 - same
+            return False
+        if not refs:
+            return False
+        for ref in refs:
+            if ref.startswith(IMAGE_MARK):
+                self._pending_images.append(ref)
+        block = "\n".join(refs)
+        self._delete_selection()
+        self._insert(block)
+        head = refs[0] if len(refs) == 1 else f"{len(refs)} items"
+        self.notice = f"\u2713 attached: {head}"
+        return True
+
+    def take_notice(self) -> str:
+        """The receipt for the last paste, once. "" when there was none."""
+        notice, self.notice = self.notice, ""
+        return notice
+
+    def take_images(self) -> list[str]:
+        """The pictures attached to the line just submitted, and forget them.
+
+        At most six, and the reason is the far end rather than the terminal:
+        every image in a request is read again on every follow-up turn, so a
+        long paste-happy session would pay for its whole clipboard history on
+        each turn.
+        """
+        refs, self._pending_images = self._pending_images[-6:], []
+        return refs
 
     def _mouse(self, code: int, x: int, y: int) -> None:
         """One mouse report, in SGR terms: `code`, 1-based column, 1-based row.

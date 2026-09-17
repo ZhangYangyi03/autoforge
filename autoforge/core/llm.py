@@ -483,6 +483,11 @@ class OpenAICompatClient(LLMClient):
         )
         on_wait = kwargs.pop("on_wait", None)
 
+        # `m.to_api()` with no argument: a message that carries a picture answers
+        # with parts by itself, and the client stays ignorant of the fact that
+        # some messages are not only text. Passing the client in here as an
+        # override is what turned it into a message's content once already, and
+        # the failure that produced was a TypeError two layers away from the line.
         payload: dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
             "messages": [m.to_api() for m in messages],

@@ -45,6 +45,7 @@ from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
 from .core.llm import DEFAULT_MAX_TOKENS, FailoverClient, OpenAICompatClient
+from .core.lineedit import LineEditor
 from .core.steering import Steering
 from .forge.generator import LLMToolGenerator
 from .forge.pipeline import ForgeConfig
@@ -881,11 +882,16 @@ HELP_BODY = """commands:
   /reset     forget the conversation (keeps forged tools)
   /quit      exit
 
+a picture on the clipboard: copy it (Win+Shift+S, PrtScr) and press
+  Ctrl+V or Shift+Insert at the prompt — it is pasted as a file and goes
+  with the line you send.
+
 while it is working: type a sentence to add it to the task mid-run,
   /status to ask where it is, /stop to end the run at the next step."""
 
 BANNER = (f"{_c(_C, 'autoforge')} — an agent that writes, verifies and keeps its own tools.\n"
-          f"Type a need in plain language. {_c(_D, '/help for commands, /quit to leave.')}")
+          f"Type a need in plain language. {_c(_D, '/help for commands, /quit to leave.')}\n"
+          f"{_c(_D, 'Paste a screenshot with Ctrl+V (or Shift+Insert) and it goes with the line.')}")
 LIVE_HINT = (f"{_c(_D, 'it does not lock the keyboard: while it runs, type to add to the task, ')}"
              f"{_c(_D, '/status to ask where it is, /stop to end the turn.')}")
 
@@ -924,7 +930,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
     # editor draws the input line, and every line this function prints has to
     # go through `emit` (i.e. above that line) instead of `print` (on top of
     # it). Everything before this point is still an ordinary print.
-    steering = Steering().start()
+    # The editor is built here, not inside Steering, because it is also what
+    # knows a picture was pasted: Ctrl+V on an image leaves no text on the
+    # clipboard, so the line editor is the only object in the process that can
+    # turn that gesture into something the model can be given.
+    editor = LineEditor(stream=sys.stdin)
+    steering = Steering(editor=editor).with_editor(editor).start()
     emit = steering.emit
     agent.steer = steering
     history: list = []
@@ -940,6 +951,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 emit("")
                 break
             line = line.strip()
+            # A pasted picture lives in a file and the line holds only its name.
+            # Putting that name at the front of the message is what attaches it:
+            # the text is still the text the person typed, and the picture rides
+            # along as a part of the same message.
+            refs = steering.take_images()
+            if refs:
+                line = "\n".join(refs) + (("\n" + line) if line else "")
+            notice = steering.take_notice()
+            if notice:
+                emit(notice)
             if not line:
                 continue
 

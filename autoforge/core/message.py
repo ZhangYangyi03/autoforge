@@ -58,9 +58,26 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    #: The same message as wire parts, when it carries something the text
+    #: cannot: a picture the operator pasted. `content` stays the text, so
+    #: compacting, truncating and recording all keep working on a string --
+    #: only the outgoing request sees the parts.
+    images: list[dict[str, Any]] | None = None
 
-    def to_api(self) -> dict[str, Any]:
-        msg: dict[str, Any] = {"role": self.role, "content": self.content}
+    def to_api(self, content: Any = None) -> dict[str, Any]:
+        """The wire form, with parts when this message carries a picture.
+
+        The stored `content` stays the text: compaction, truncation, the ledger
+        and the transcript all keep reading the string they always did, and only
+        the outgoing request sees the parts. The `content` argument is an
+        override for a caller with its own view of the message -- it is not how
+        images get in, and handing it anything but wire content replaces what the
+        model is sent.
+        """
+        if content is None and self.images:
+            content = self.images
+        msg: dict[str, Any] = {"role": self.role,
+                               "content": self.content if content is None else content}
         if self.tool_calls:
             msg["tool_calls"] = [tc.to_api() for tc in self.tool_calls]
         if self.tool_call_id:
@@ -75,8 +92,8 @@ class Message:
         return cls("system", content)
 
     @classmethod
-    def user(cls, content: str) -> "Message":
-        return cls("user", content)
+    def user(cls, content: str, images: list[dict[str, Any]] | None = None) -> "Message":
+        return cls("user", content, images=images)
 
     @classmethod
     def assistant(

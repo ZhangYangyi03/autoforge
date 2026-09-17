@@ -32,6 +32,7 @@ from typing import Any, Callable, Sequence
 
 from .llm import LLMAborted, LLMClient
 from .message import Message
+from . import lineedit
 from .compaction import OUTPUT_MAX_CHARS, bound_output
 
 DEFAULT_SYSTEM = (
@@ -40,6 +41,31 @@ DEFAULT_SYSTEM = (
     "When you have fully completed the task, either answer in plain text or "
     "call terminate with a summary of what you did."
 )
+
+
+
+def image_parts(text: str) -> list[dict[str, Any]] | None:
+    """The wire content for a line, pictures included, or None if there are none.
+
+    A placeholder is what the terminal shows and what the transcript keeps; the
+    picture itself lives in a file the placeholder names. This is the seam where
+    the two get put back together, and it is here -- rather than in the client --
+    because "which file does this line mean" is a question about the operator's
+    line, not about HTTP.
+
+    Returning None when there are no pictures is deliberate: a message that goes
+    to the far end as a plain string is a message that a *text* model can still
+    be given, and a request whose content is a list of one text part is not.
+    """
+    paths = lineedit.image_paths(text)
+    if not paths:
+        return None
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for path in paths:
+        url = lineedit.to_data_url(path)
+        if url:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts if len(parts) > 1 else None
 
 
 @dataclass
@@ -246,7 +272,7 @@ class Agent:
         if self.steer is None:
             return False
         for text in self.steer.take_supplements():
-            msgs.append(Message.user(text))
+            msgs.append(Message.user(text, images=image_parts(text)))
             _notify(self.on_steer, text)
             self._folded += 1
         return bool(self.steer.stop_requested())
@@ -334,7 +360,11 @@ class Agent:
         msgs = list(history or [])
         if not msgs or msgs[0].role != "system":
             msgs.insert(0, Message.system(self.system_prompt))
-        msgs.append(Message.user(task))
+        # Built once, from the words as given, and kept on the message: the
+        # placeholder is expanded for the model's *text* either way, but this is
+        # the multipart form the client is handed, so a line with a picture in it
+        # is read rather than described.
+        msgs.append(Message.user(task, images=image_parts(task)))
 
         used: list[str] = []
         turn = 0
