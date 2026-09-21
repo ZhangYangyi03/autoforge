@@ -41,6 +41,50 @@ import urllib.request
 OK, BAD, WARN = "  ok ", " FAIL", " warn"
 
 
+
+def _call_args(body: str) -> dict:
+    """Build a callable argument set from whatever contract shape the shelf uses.
+
+    Two shapes are in the wild on the same shelf, so a check that assumes one
+    reports the other as broken:
+
+      JSON-Schema-ish   {"parameters": {"type": "object",
+                          "properties": {"sec": {"type": "number"}},
+                          "required": ["sec"]}}
+      flat type map     {"parameters": {"host": "string", "port": "integer"}}
+
+    Required fields are filled from their declared type. The flat form carries
+    no required-list, so every field it describes is passed -- an optional
+    argument costs nothing. The call is deliberately *synthesised*: it exercises
+    the tool's code path rather than asserting anything about the values, and a
+    wrong synthesis is reported as the check's fault, not the peer's.
+    """
+    try:
+        if body[:1] not in "{[":
+            return {}
+        params = (json.loads(body).get("contract") or {}).get("parameters") or {}
+    except ValueError:
+        return {}
+    if not isinstance(params, dict):
+        return {}
+
+    def val(typ):
+        if not isinstance(typ, str):
+            typ = (typ or {}).get("type", "string")
+        return {"number": 1, "integer": 1, "boolean": True,
+                "array": [], "object": {}}.get(typ, "1")
+
+    args: dict = {}
+    if "properties" in params or params.get("type") == "object":
+        props = params.get("properties") or {}
+        for f in (params.get("required") or list(props)):
+            args[f] = val((props.get(f) or {}).get("type", "string"))
+    else:
+        for f, typ in params.items():
+            args[f] = val(typ)
+    return args
+
+
 def _parse_host(url: str):
     u = urllib.parse.urlsplit(url)
     host = u.hostname or ""
@@ -194,11 +238,13 @@ def main() -> int:
     t0 = time.time()
     st, body = get(url, token, "/search?" + qs, timeout=90)
     elapsed = time.time() - t0
-    hits, confident = [], None
+    hits, confident, spec = [], None, {}
     if st == 200:
         try:
             d = json.loads(body)
-            hits = [h.get("name") for h in (d.get("results") or [])]
+            results = d.get("results") or []
+            hits = [h.get("name") for h in results]
+            spec = (results[0] or {}) if results else {}
             conf = d.get("confidence") or {}
             confident = conf.get("confident") if isinstance(conf, dict) else None
         except ValueError:
@@ -210,8 +256,43 @@ def main() -> int:
           f" confident={confident} hits={hits[:4]}{note}")
 
     if a.invoke and hits:
-        st, body = post(url, token, f"/resources/tool:{hits[0]}/invoke", {"arguments": {}})
-        print(f"{OK if st and st < 400 else WARN} invoke {hits[0]}: {st} {body[:180]}")
+        # Call the tools the way they are actually callable.
+        #
+        # This used to post {"arguments": {}} at the top hit and print the
+        # result as a warning line. For any tool with a required argument that
+        # is not a test of the shelf at all -- it is a TypeError produced by the
+        # check itself, and it reads as "the peer's tool is broken". On
+        # 2026-09-21 it cost the KOS agent a paragraph ("the invoke warn is the
+        # CHECK, not the shelf") to talk the operator out of misreading it, which
+        # is the cost of a check that reports its own mistake as the peer's.
+        #
+        # So: read the contract from /resources/{id}, build one argument set with
+        # every required field filled from its type, and call that. A tool that
+        # still fails is failing on its own merits.
+        for name in hits[:3]:
+            st_r, body_r = get(url, token, f"/resources/tool:{urllib.parse.quote(name)}")
+            what = _call_args(body_r)
+            st, body = post(url, token,
+                            f"/resources/tool:{urllib.parse.quote(name)}/invoke",
+                            {"arguments": what})
+            entry = {}
+            if body[:1] == "{":
+                try:
+                    entry = json.loads(body)
+                except ValueError:
+                    entry = {}
+            err = str(entry.get("error") or "")
+            our_fault = "required positional argument" in err
+            mark = OK if (st and st < 400 and entry.get("ok") is True) else WARN
+            if our_fault:
+                tag = (f"   [the check's own call was incomplete -- it synthesised"
+                       f" {what} from the contract; not evidence about the tool]")
+            elif entry.get("ok") is False:
+                tag = "   [the tool itself returned an error]"
+            else:
+                tag = ""
+            print(f"{mark} invoke {name}({', '.join(f'{k}={v!r}' for k, v in what.items())}):"
+                  f" {st} {str(body)[:150]}{tag}")
 
     print("\n--- the question that matters: does the AGENT see this peer? ---")
     try:
