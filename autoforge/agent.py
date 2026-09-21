@@ -1413,6 +1413,163 @@ class ForgeAgent:
                 break
         return found
 
+    @staticmethod
+    def _peer_market_urls() -> list[tuple[str, str]]:
+        """Other machines' shelves, as ``(label, base_url)``.
+
+        A shelf on this host is not the market -- it is one node of it. On
+        2026-09-21 the operator's other machine turned out to be a sibling on the
+        same LAN with a shelf of its own, reachable while this one was up, and
+        the pre-forge lookup could not see it: "is this already made" was being
+        answered about one machine out of two. That is the same failure the
+        lookup itself was built to fix, one level up.
+
+        Configured, never discovered. A sweep of the LAN for open ports is not a
+        lookup, it is a scan, and doing it on every forge is both slow and
+        exactly the shape of thing an intrusion detector is right to flag. So the
+        operator names them::
+
+            AUTOFORGE_PEER_MARKETS="kos=http://192.168.1.108:8000,lab=http://10.0.0.5:8000"
+
+        or, if the peer sits behind the node's authenticated proxy::
+
+            AUTOFORGE_PEER_MARKETS="kos=http://192.168.1.107:8077/market|FILE:C:/path/node.token"
+        """
+        raw = os.environ.get("AUTOFORGE_PEER_MARKETS", "")
+        peers: list[tuple[str, str]] = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" in entry:
+                label, url = entry.split("=", 1)
+            else:
+                label, url = entry, entry
+            url = url.strip().rstrip("/")
+            if url:
+                peers.append((label.strip() or url, url))
+        return peers
+
+    @staticmethod
+    def _peer_headers(url: str) -> dict[str, str]:
+        """Headers for a peer, including its token when one is named.
+
+        A peer reached through the node proxy needs the node's bearer token, and
+        a token in an env var is a token in every process's environment. The
+        `|FILE:<path>` form keeps it in a file that can be chmod'd, which is the
+        same reason the node itself takes it from a file.
+        """
+        headers = {"User-Agent": "autoforge-peer-lookup/1.0"}
+        if "|FILE:" not in url:
+            return headers
+        _, path = url.split("|FILE:", 1)
+        try:
+            with open(path.strip(), encoding="utf-8") as fh:
+                token = fh.read().strip()
+            if token:
+                headers["Authorization"] = "Bearer " + token
+        except OSError:
+            pass                                   # no token, or unreadable: try open
+        return headers
+
+    def _peer_lookup(self, need: str) -> list[dict[str, Any]]:
+        """Ask the sibling shelves the same two questions the local one answers.
+
+        Returns ``(hits, answered)`` where hits are
+        ``{"name", "peer", "score"}``. ``answered`` is the distinction the rest
+        of this lookup is built on: a peer that was *reachable* and carried
+        nothing is an answer, and licenses the forge; a peer that was switched
+        off is no answer, and must not. A machine going down must not look like
+        a shelf that was searched -- which is exactly the confusion this whole
+        class of method exists to prevent.
+        """
+        import json as _json
+        import time as _time
+        import urllib.parse as _parse
+        import urllib.request as _url
+
+        hits: list[dict[str, Any]] = []
+        answered = False
+        # A machine that is switched off must not charge a timeout to every
+        # forge: this lookup sits on the forge path, and 8s per peer per need is
+        # paid by the operator waiting. A peer that just failed is skipped for a
+        # couple of minutes -- short enough that it is back the moment the peer
+        # is, long enough that a dead one costs one timeout, not all of them.
+        # Lazy rather than set in __init__: this class is constructed in several
+        # places and a lookup must not depend on an initialiser having run.
+        now = _time.time()
+        dead: dict[str, float] = getattr(self, "_peer_dead_until", None) or {}
+        self._peer_dead_until = dead
+        for label, url in self._peer_market_urls():
+            base = url.split("|FILE:", 1)[0].rstrip("/")
+            if dead.get(base, 0.0) > now:
+                self._record("market_peer_lookup", {
+                    "need": need, "peer": label, "url": base, "ok": False,
+                    "error": "skipped: failed recently"})
+                continue
+            headers = self._peer_headers(url)
+            try:
+                qs = _parse.urlencode({"q": need, "k": 5})
+                req = _url.Request(base + "/search?" + qs, headers=headers)
+                with _url.urlopen(req, timeout=5) as resp:
+                    data = _json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception as exc:                   # noqa: BLE001
+                # An older or simpler peer may have no /search at all. Falling
+                # back to /resources keeps a shelf that can only answer the
+                # lexical question from being silently absent from the lookup.
+                try:
+                    req = _url.Request(base + "/resources", headers=headers)
+                    with _url.urlopen(req, timeout=5) as resp:
+                        data = _json.loads(resp.read().decode("utf-8", "replace"))
+                    names = [(x.get("name"), x.get("description") or "")
+                             for x in (data.get("resources") or data.get("items") or [])
+                             if isinstance(x, dict)]
+                    answered = True
+                    want = {w for w in self._name_tokens(need) if len(w) > 2}
+                    for n, d in names:
+                        toks = set(self._name_tokens(n))
+                        if toks & want:
+                            hits.append({"name": str(n), "peer": label,
+                                         "score": 0.0, "description": str(d)[:110]})
+                    continue
+                except Exception as exc2:              # noqa: BLE001
+                    dead[base] = _time.time() + 120.0
+                    self._record("market_peer_lookup", {
+                        "need": need, "peer": label, "url": base, "ok": False,
+                        "error": "%s: %s / %s: %s"
+                                 % (type(exc).__name__, exc, type(exc2).__name__, exc2)})
+                    continue
+            results = data.get("results") if isinstance(data, dict) else data
+            results = results if isinstance(results, list) else []
+            conf = data.get("confidence") if isinstance(data, dict) else {}
+            confident = conf.get("confident") if isinstance(conf, dict) else None
+            got = []
+            for item in results:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                try:
+                    score = float(item.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                got.append({"name": str(item["name"]), "peer": label,
+                            "score": score,
+                            "description": str(item.get("description") or "")[:110]})
+            # Same discipline as the local search: a hit stands with the top
+            # one. A peer whose own endpoint says it is not confident is
+            # reported as having answered nothing, not as having answered no.
+            if got and confident is not False:
+                top = max(x["score"] for x in got)
+                floor = max(0.01, 0.5 * top)
+                got = [x for x in got if x["score"] >= floor][:5]
+            else:
+                got = []
+            answered = True
+            self._record("market_peer_lookup", {
+                "need": need, "peer": label, "url": base, "ok": True,
+                "confident": confident, "hits": [x["name"] for x in got]})
+            hits.extend(got)
+        return hits, answered
+
     def _prelookup_market(self, need: str) -> str:
         """Ask the shelf *before* the forge instead of only after it.
 
@@ -1468,9 +1625,16 @@ class ForgeAgent:
                 "hits": lexical})
 
         semantic = self._market_search(need)
-        if not lexical_ok and not semantic:
-            # Neither lookup came back. No answer -- which is not an answer of
-            # "nothing there", and must never license the forge.
+        # Peers are asked even -- especially -- when the local shelf is dead.
+        # Written the other way first, and a test with the local shelf refused
+        # showed why it is wrong: the lookup returned "no answer" without ever
+        # asking the peer that was up. "This host's shelf is down" and "nothing
+        # exists anywhere" are different sentences; the first must not quietly
+        # become the second just because of the order two lines happen to be in.
+        peers, peer_answered = self._peer_lookup(need)
+        if not lexical_ok and not semantic and not peers and not peer_answered:
+            # Nothing came back from anywhere. No answer -- which is not an
+            # answer of "nothing there", and must never license the forge.
             return ""
 
         # Third leg, and only when the first two agree there is nothing: the
@@ -1481,12 +1645,19 @@ class ForgeAgent:
         # searchable server-side; `/discover` on the market asks it and registers
         # the hits here as DRAFT. Cheap when it hits, one bounded request when it
         # does not, and skipped entirely when the shelf already answered yes.
-        upstream = [] if (lexical or semantic) else self._discover_upstream(need)
+        # The MCP registry is the last resort: its entries are pointers that
+        # need a package launched before they can be called, while a peer's
+        # shelf holds tools that are callable *now*, on a machine the operator
+        # controls. That ordering is the whole point of asking peers first.
+        upstream = ([] if (lexical or semantic or peers)
+                    else self._discover_upstream(need))
 
         labelled: list[tuple[str, list[str]]] = []
         index: dict[str, list[str]] = {}
         for name, why in ([(h["name"], "synonym") for h in semantic]
                           + [(n, "name") for n in lexical]
+                          + [("%s (%s)" % (p["name"], p["peer"]), "peer")
+                             for p in peers]
                           + [(u["name"], "upstream") for u in upstream]):
             if name not in index:
                 index[name] = []
@@ -1497,6 +1668,30 @@ class ForgeAgent:
         where = "/resources" if lexical_ok else "/resources (unreachable)"
         where += (" + /search" if semantic else
                   " + /search (no answer or no confident hit)")
+        if peer_answered and not peers and not lexical and not semantic and not lexical_ok:
+            # The local shelf never answered, a peer was searched and carried
+            # nothing. That is a partial answer, and it is reported as partial
+            # rather than as either extreme -- the forge is licensed by the peer
+            # alone, and the report says the local half is missing so nobody
+            # reads a one-machine answer as a whole-market one.
+            return ("Tool-market pre-lookup: this host's shelf did not answer; a "
+                    "peer shelf was searched and carries no entry matching this "
+                    "need, so this forge is not a duplicate *there*. The local "
+                    "half of the lookup is missing, not empty.")
+
+        if peers:
+            # Reported before the MCP branch on purpose: a peer shelf is another
+            # machine's own tools, tested and callable, not a registry pointer.
+            lines = ["Tool-market pre-lookup: nothing on this host's shelf, but a "
+                     "peer machine's shelf has entries for this need:"]
+            for p in peers[:5]:
+                lines.append("  - %s [peer %s] %s"
+                             % (p["name"], p["peer"], p.get("description") or ""))
+            lines.append("Do not re-forge one of these. If one serves the need, "
+                         "say which peer it is on and call it there; if none "
+                         "does, say why not in the forge context, then forge.")
+            return "\n".join(lines)
+
         if upstream:
             # Reported before the "nothing on the shelf" branch, because it is a
             # different answer: the shelf was empty and the world was not.

@@ -413,3 +413,144 @@ class TestUpstreamHalf:
         assert events and events[0]["ok"] is True
         assert events[0]["found"] == 1 and events[0]["inserted"] == 1
         assert events[0]["hits"] == ["mcp_x_pdf"]
+
+# ---------------------------------------------------------------------------
+# A shelf on this host is one node of the market, not the market.
+# ---------------------------------------------------------------------------
+
+def _peer_router(markets: dict[str, dict]):
+    """Answer each peer URL with its own canned shelf.
+
+    Keyed by host:port so one address can be live and another refused in the
+    same test -- which is the whole point: "my shelf is down" and "the peer is
+    down" are different situations and must not print the same.
+    """
+    def _u(req, timeout=None):
+        url = getattr(req, "full_url", None) or str(req)
+        for key, canned in markets.items():
+            if key in url:
+                if canned is None:
+                    raise OSError("connection refused")
+                return _Resp(canned)
+        raise OSError("connection refused")
+    return _u
+
+
+class TestPeerShelves:
+    def test_peer_hit_is_reported_as_a_peer_with_its_name(self, monkeypatch):
+        """A hit on another machine must name the machine, not 404 quietly.
+
+        The lookup answered "is this already made" about one host out of two
+        until a sibling on the same LAN turned out to carry the tool. A peer hit
+        is not the same fact as a local hit -- the tool has to be called *there*
+        -- so the verdict carries the peer label through to the model.
+        """
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.9:8000")
+        monkeypatch.setattr(urllib.request, "urlopen", _peer_router({
+            "127.0.0.1:8000": [],                                  # local shelf: empty
+            "10.9.9.9:8000": _hits([("seconds_to_hms", 4.69), ("hms_many", 4.2)]),
+        }))
+        out = agent._prelookup_market("convert seconds into HH:MM:SS")
+        assert "peer machine's shelf" in out
+        assert "seconds_to_hms" in out and "kos" in out
+        assert "Do not re-forge" in out
+
+    def test_a_dead_local_shelf_does_not_skip_a_live_peer(self, monkeypatch):
+        """Found by testing this against a dead local shelf.
+
+        The peer lookup was written *after* the `if neither lookup came back:
+        return ""` line, so a host whose own shelf was down returned "no answer"
+        without ever asking the peer that was up. Same class of bug as the one
+        this whole file exists for: two different states collapsed into one
+        sentence because of where a line happened to sit.
+        """
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8001")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.9:8000")
+        monkeypatch.setattr(urllib.request, "urlopen", _peer_router({
+            "127.0.0.1:8001": None,                                # local: refused
+            "10.9.9.9:8000": _hits([("seconds_to_hms", 4.69)]),
+        }))
+        out = agent._prelookup_market("convert seconds into HH:MM:SS")
+        assert out, "a live peer must be enough to answer, even with the local shelf down"
+        assert "seconds_to_hms" in out
+
+    def test_peer_answered_but_carries_nothing_licenses_the_forge_and_says_which_half_is_missing(self, monkeypatch):
+        """"Searched and empty" is an answer; "unreachable" is not.
+
+        And when only the peer answered, the verdict must say the local half is
+        missing rather than let one machine's answer read as the whole market's.
+        """
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8001")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.9:8000")
+        monkeypatch.setattr(urllib.request, "urlopen", _peer_router({
+            "127.0.0.1:8001": None,
+            "10.9.9.9:8000": {"results": [], "confidence": {"confident": False}},
+        }))
+        out = agent._prelookup_market("parse a parquet file into a dataframe")
+        assert out and "not a duplicate" in out
+        assert "local half" in out, "must not present a one-machine answer as a whole-market one"
+
+    def test_both_shelves_unreachable_is_still_no_answer(self, monkeypatch):
+        """The rule the file was built on, extended to peers: two dead machines
+        are not an empty world."""
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8001")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.9:8000")
+        monkeypatch.setattr(urllib.request, "urlopen", _peer_router({
+            "127.0.0.1:8001": None, "10.9.9.9:8000": None}))
+        assert agent._prelookup_market("convert seconds into HH:MM:SS") == ""
+
+    def test_no_peers_configured_means_no_peer_requests(self, monkeypatch):
+        """Silence, not a LAN sweep. An unconfigured forge must make exactly the
+        requests it made before peers existed."""
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8000")
+        monkeypatch.delenv("AUTOFORGE_PEER_MARKETS", raising=False)
+        seen = []
+
+        def _u(req, timeout=None):
+            seen.append(getattr(req, "full_url", str(req)))
+            return _Resp([])
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        agent._prelookup_market("convert seconds into HH:MM:SS")
+        assert all("127.0.0.1:8000" in u for u in seen), seen
+
+    def test_peer_token_is_read_from_a_file_and_sent_as_a_bearer(self, monkeypatch, tmp_path):
+        """The `|FILE:` form exists so a token need not live in an env var.
+
+        A peer reached through the node's proxy needs the node's bearer token,
+        and env vars are visible to every process. The file form is what makes
+        that path usable without widening who can read the secret.
+        """
+        token_file = tmp_path / "node.token"
+        token_file.write_text("s3cret-token\n", encoding="utf-8")
+        agent = _agent()
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS",
+                           "win=http://10.9.9.9:8077/market|FILE:%s" % token_file)
+        sent = {}
+
+        def _u(req, timeout=None):
+            sent["auth"] = req.get_header("Authorization")
+            sent["url"] = req.full_url
+            return _Resp({"results": []})
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        agent._peer_lookup("anything")
+        assert sent["auth"] == "Bearer s3cret-token"
+        assert "/market/search" in sent["url"]
+
+    def test_peer_config_parses_labels_urls_and_bare_urls(self, monkeypatch):
+        agent = _agent()
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS",
+                           "kos=http://192.168.1.108:8000, http://10.0.0.5:8000 ,")
+        assert agent._peer_market_urls() == [
+            ("kos", "http://192.168.1.108:8000"),
+            ("http://10.0.0.5:8000", "http://10.0.0.5:8000"),
+        ]
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "")
+        assert agent._peer_market_urls() == []
