@@ -625,16 +625,34 @@ class TestPeerShelves:
         agent = _agent()
         assert agent._peer_market_urls() == [("kos", "http://192.168.1.108:8000")]
 
-    def test_the_environment_still_wins_over_the_file(self, tmp_path, monkeypatch):
+    def test_the_environment_wins_the_clash_without_discarding_the_file(
+            self, tmp_path, monkeypatch):
+        """Precedence yes, silent deletion no.
+
+        This asserted that the environment *replaced* the file, and it was the
+        behaviour that lost a real machine: on 2026-09-21 the operator's other
+        host was one `peers.json` edit away from being visible, the edit was
+        made, and the peer stayed invisible -- because the environment value
+        wins and nothing said the file was being ignored. A configured peer that
+        is dropped without a word is the same failure the lookup exists to
+        prevent, one level down: not-in-effect looks exactly like not-set.
+
+        So the env entry still wins the label it names, and the file's *other*
+        peers survive instead of vanishing.
+        """
         import json
 
         monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path))
         monkeypatch.setattr("autoforge.agent.ForgeAgent._peer_market_from_registry",
                             staticmethod(lambda: ""), raising=False)
         (tmp_path / "peers.json").write_text(
-            json.dumps({"peers": {"kos": "http://from-file:8000"}}), encoding="utf-8")
-        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "env=http://from-env:8000")
-        assert _agent()._peer_market_urls() == [("env", "http://from-env:8000")]
+            json.dumps({"peers": {"kos": "http://from-file:8000",
+                                  "lab": "http://from-file-lab:8000"}}), encoding="utf-8")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://from-env:8000")
+        got = dict(_agent()._peer_market_urls())
+        assert got["kos"] == "http://from-env:8000", "the environment must win the clash"
+        assert got["lab"] == "http://from-file-lab:8000", (
+            "a peer configured in the file was dropped silently")
 
     def test_no_peers_configured_means_no_peer_requests(self, tmp_path, monkeypatch):
         """The gate: with nothing configured the lookup must not call out at all."""

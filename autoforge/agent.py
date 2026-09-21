@@ -1437,6 +1437,78 @@ class ForgeAgent:
         return found
 
     @staticmethod
+    def _peer_market_spec_with_source() -> tuple[str, str]:
+        """The spec, plus which of the three places it came from.
+
+        The source is not decoration. Measured 2026-09-21: the operator's other
+        machine was one `peers.json` edit away from being visible, the edit was
+        made, and nothing changed -- because the *environment* value wins, and a
+        value in the environment is not visible to anyone looking at the file.
+        Three sources with a silent precedence order is the same failure this
+        module was written to fix, one level down: a setting that is not in
+        effect looks exactly like a setting that is.
+
+        So the caller records the source, and a file that names a peer the
+        environment does not is reported as ignored rather than obeyed.
+        """
+        raw = ForgeAgent._peer_market_spec_or_none()
+        if raw is None:
+            return "", "none"
+        where = ("environment" if os.environ.get("AUTOFORGE_PEER_MARKETS") is not None
+                 else "file" if ForgeAgent._peer_market_from_file() is not None
+                 else "registry")
+        return raw, where
+
+    @staticmethod
+    def _peer_market_spec_or_none() -> str | None:
+        """The precedence chain, with file-vs-environment made visible.
+
+        Returns the spec, or None when nothing is configured anywhere. When the
+        environment supplies the spec, peers named only by the file are
+        appended to it: the environment cannot be edited by hand in a running
+        session, so ignoring a file the operator just edited would make the file
+        a lie. Precedence still exists (the environment's entries win on a label
+        clash) but it no longer *discards* a configured peer silently.
+        """
+        env_raw = os.environ.get("AUTOFORGE_PEER_MARKETS")
+        file_raw = ForgeAgent._peer_market_from_file()
+        if env_raw is not None:
+            if not file_raw:
+                return env_raw
+            # An empty value is not "unset": it is the way a test, or a machine
+            # that wants no peers, says "none". Falling through to the file here
+            # would make the answer depend on whose machine the suite ran on --
+            # the exact leak `tests/conftest.py` was written to close.
+            if not env_raw.strip():
+                return env_raw
+            have = {e.split("=", 1)[0].strip() for e in env_raw.split(",") if e.strip()}
+            extra = [e.strip() for e in file_raw.split(",")
+                     if e.strip() and e.split("=", 1)[0].strip() not in have]
+            return env_raw + (("," + ",".join(extra)) if extra else "")
+        if file_raw is not None:
+            return file_raw
+        return ForgeAgent._peer_market_from_registry()
+
+    @staticmethod
+    def _peer_market_from_file() -> str | None:
+        """``peers.json``, or None when there is no readable file."""
+        home = (os.environ.get("AUTOFORGE_HOME")
+                or os.path.join(os.path.expanduser("~"), ".autoforge"))
+        try:
+            with open(os.path.join(home, "peers.json"), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:                                      # noqa: BLE001
+            return None
+        if isinstance(data, str):
+            return data
+        items = data.get("peers", data) if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            return ",".join("%s=%s" % (k, v) for k, v in items.items())
+        if isinstance(items, list):
+            return ",".join(str(x) for x in items)
+        return None
+
+    @staticmethod
     def _peer_market_spec() -> str:
         """The peer spec, from the environment, a config file, or the registry.
 
@@ -1463,24 +1535,8 @@ class ForgeAgent:
         # machine it ran on. That leak is not hypothetical: it is what the peer
         # config in the registry did to this very suite the first time it ran
         # after `setx`, and `tests/conftest.py` now closes it.
-        raw = os.environ.get("AUTOFORGE_PEER_MARKETS")
-        if raw is not None:
-            return raw
-        home = (os.environ.get("AUTOFORGE_HOME")
-                or os.path.join(os.path.expanduser("~"), ".autoforge"))
-        try:
-            with open(os.path.join(home, "peers.json"), encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, str):
-                return data
-            items = data.get("peers", data) if isinstance(data, dict) else data
-            if isinstance(items, dict):
-                return ",".join("%s=%s" % (k, v) for k, v in items.items())
-            if isinstance(items, list):
-                return ",".join(str(x) for x in items)
-        except Exception:                                      # noqa: BLE001
-            pass
-        return ForgeAgent._peer_market_from_registry()
+        got = ForgeAgent._peer_market_spec_or_none()
+        return got if got is not None else ""
 
     @staticmethod
     def _peer_market_from_registry() -> str:
@@ -1522,7 +1578,7 @@ class ForgeAgent:
 
             AUTOFORGE_PEER_MARKETS="kos=http://192.168.1.107:8077/market|FILE:C:/path/node.token"
         """
-        raw = ForgeAgent._peer_market_spec()
+        raw, source = ForgeAgent._peer_market_spec_with_source()
         peers: list[tuple[str, str]] = []
         for entry in raw.split(","):
             entry = entry.strip()
