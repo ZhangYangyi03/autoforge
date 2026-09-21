@@ -1591,6 +1591,22 @@ class ForgeAgent:
             url = url.strip().rstrip("/")
             if url:
                 peers.append((label.strip() or url, url))
+        # The default market is not a peer of itself. With TOOLMARKET_URL set to
+        # another machine (which is how a node joins a shared shelf), the same
+        # address is easily named in peers.json as well -- and asking one shelf
+        # twice under two names is not redundancy, it is a double count: the same
+        # tool is reported once as "on the shelf" and once as "on a peer", the
+        # per-peer 20s budget is paid twice, and a shelf that answered confidently
+        # is downgraded to unanswered the second time it is asked.
+        try:
+            from autoforge import market as _market
+
+            default_base = _market.market_url().rstrip("/")
+        except Exception:                                      # noqa: BLE001
+            default_base = ""
+        if default_base:
+            peers = [(lab, u) for lab, u in peers
+                     if u.split("|FILE:", 1)[0].rstrip("/") != default_base]
         return peers
 
     @staticmethod

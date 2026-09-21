@@ -67,3 +67,23 @@ def test_an_explicitly_empty_environment_means_none(home, monkeypatch):
 
 def test_no_configuration_anywhere_is_not_an_error(home):
     assert ForgeAgent._peer_market_urls() == []
+
+
+def test_the_default_market_is_not_its_own_peer(home, monkeypatch):
+    """Double-counting one shelf as both "the market" and "a peer".
+
+    With TOOLMARKET_URL set to another machine -- which is exactly how a node
+    joins a shared shelf -- the same address gets named in peers.json too. The
+    lookup would then ask that one shelf twice, report its tool once as on the
+    shelf and once as on a peer, and pay the per-peer timeout twice.
+    """
+    _file(home, {"kos": "http://192.168.1.108:8000", "lab": "http://10.0.0.5:8000"})
+    monkeypatch.setenv("TOOLMARKET_URL", "http://192.168.1.108:8000")
+    got = ForgeAgent._peer_market_urls()
+    assert [lab for lab, _ in got] == ["lab"], got
+
+
+def test_a_peer_behind_a_token_file_is_still_deduplicated(home, monkeypatch):
+    _file(home, {"kos": "http://192.168.1.108:8077/market|FILE:C:/t.token"})
+    monkeypatch.setenv("TOOLMARKET_URL", "http://192.168.1.108:8077/market")
+    assert ForgeAgent._peer_market_urls() == []
