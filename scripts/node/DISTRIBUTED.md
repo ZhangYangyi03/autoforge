@@ -84,3 +84,35 @@ token 放 $AUTOFORGE_NODE_TOKEN，或放在 node_client.py 旁边。
 - **WSL 只验证到进程级**：WSL2 现在是 mirrored 网络模式（和 Windows 共用 192.168.1.107），
   它对 8077 的连接被同一个 TCP 栈自连回去，不算跨栈验证。真正的跨栈验证是上面那条
   ngrok 公网路径——请求确实换了一个 IP、一个 TLS 终止点才回到这台机。
+
+## Federating two shelves (both machines' tools in one lookup)
+
+Two machines each with a shelf is not one market until each one's forge
+*before* it builds asks the other. That is `AUTOFORGE_PEER_MARKETS`:
+
+    setx AUTOFORGE_PEER_MARKETS "kos=http://192.168.1.108:8000"
+
+Comma-separated `label=url`. A peer reached through the node's authenticated
+proxy takes its token from a file rather than the environment:
+
+    setx AUTOFORGE_PEER_MARKETS "win=http://192.168.1.107:8077/market|FILE:C:\Users\china\autoforge_node\node.token"
+
+Set on THIS machine already: `kos=http://192.168.1.108:8000`.
+For the KOS machine to use this one's 6953 tools it sets the `win=...` line
+above, with the token file copied over.
+
+What the lookup does with a peer, and why each rule is the way it is:
+
+  peer answered, carries a hit     reported first, labelled with the peer name --
+                                   a peer hit is not a local hit, the tool has to
+                                   be called *there*
+  peer answered, carries nothing   an ANSWER: licenses the forge. The verdict says
+                                   the local half is missing when it was, so one
+                                   machine's answer never reads as the whole market's
+  peer switched off                NOT an answer. A machine being down must not read
+                                   as an empty world -- and a peer that just failed is
+                                   skipped for two minutes, so a dead peer costs one
+                                   timeout, not one per forge (measured 4.10s then 0.00s)
+  no peers configured              byte-for-byte the same requests as before the
+                                   feature existed. A LAN sweep on every forge would
+                                   not be a lookup, it would be a scan
