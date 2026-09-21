@@ -554,3 +554,52 @@ class TestPeerShelves:
         ]
         monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "")
         assert agent._peer_market_urls() == []
+
+    def test_a_slow_peer_is_not_an_absent_peer(self, monkeypatch):
+        """The bug a real peer found: a cold hybrid search takes 22 seconds.
+
+        Measured on the live shelf: /search with the cross-encoder rerank is
+        22.4s cold and 1.7s warm. A five-second timeout did not fail to answer
+        the question -- it failed to *ask* it, and then reported the silence as
+        "no answer", which is the one conflation this whole lookup exists to
+        prevent. The fix is a timeout long enough to ask, and a breaker that
+        treats a timeout (there, busy) differently from a refusal (not there).
+        """
+        import time as _t
+
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8000")
+
+        def _slow(req, timeout=None):
+            assert timeout is not None and timeout >= 20, (
+                "a peer search must be allowed to be slow: got timeout=%r" % timeout)
+            _t.sleep(0.05)
+            return _Resp({"results": [{"name": "seconds_to_hms", "score": 4.69}],
+                          "confidence": {"confident": True}})
+
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.9:8000")
+        monkeypatch.setattr(urllib.request, "urlopen", _slow)
+        hits, answered = agent._peer_lookup("convert seconds into HH:MM:SS")
+        assert answered and hits and hits[0]["name"] == "seconds_to_hms"
+
+    def test_a_refused_peer_rests_shorter_than_a_timed_out_one(self, monkeypatch):
+        """Not-there and there-but-busy deserve different retry intervals."""
+        import time as _t
+
+        agent = _agent()
+        monkeypatch.setenv("TOOLMARKET_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS",
+                           "ref=http://10.9.9.8:8000,slow=http://10.9.9.9:8000")
+
+        def _u(req, timeout=None):
+            url = getattr(req, "full_url", str(req))
+            if "10.9.9.8" in url:
+                raise OSError("connection refused")
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        agent._peer_lookup("anything")
+        now = _t.time()
+        refused_until = agent._peer_dead_until["http://10.9.9.8:8000"] - now
+        slow_until = agent._peer_dead_until["http://10.9.9.9:8000"] - now
+        assert refused_until < slow_until, (refused_until, slow_until)

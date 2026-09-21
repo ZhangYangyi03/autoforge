@@ -1510,8 +1510,14 @@ class ForgeAgent:
             headers = self._peer_headers(url)
             try:
                 qs = _parse.urlencode({"q": need, "k": 5})
+                # 20s, not 5. Measured on the live shelf: a *cold* hybrid
+                # search with the cross-encoder rerank takes 22s (1.7s warm).
+                # A five-second timeout did not fail to answer a question -- it
+                # failed to *ask* one, and reported the silence as "no answer",
+                # which is the one conflation this whole lookup exists to
+                # prevent. A peer that is slow must be allowed to be slow.
                 req = _url.Request(base + "/search?" + qs, headers=headers)
-                with _url.urlopen(req, timeout=5) as resp:
+                with _url.urlopen(req, timeout=20) as resp:
                     data = _json.loads(resp.read().decode("utf-8", "replace"))
             except Exception as exc:                   # noqa: BLE001
                 # An older or simpler peer may have no /search at all. Falling
@@ -1533,7 +1539,15 @@ class ForgeAgent:
                                          "score": 0.0, "description": str(d)[:110]})
                     continue
                 except Exception as exc2:              # noqa: BLE001
-                    dead[base] = _time.time() + 120.0
+                    # A refusal means the peer is not there and will still not
+                    # be there in a minute. A timeout means it IS there and
+                    # busy, so it gets a longer rest -- otherwise a peer that is
+                    # merely slow is retried every two minutes and charges 20s
+                    # each time, and worse, gets reported as if it were absent.
+                    refused = ("refused" in str(exc).lower()
+                               or "refused" in str(exc2).lower()
+                               or "getaddrinfo" in str(exc))
+                    dead[base] = _time.time() + (120.0 if refused else 300.0)
                     self._record("market_peer_lookup", {
                         "need": need, "peer": label, "url": base, "ok": False,
                         "error": "%s: %s / %s: %s"
