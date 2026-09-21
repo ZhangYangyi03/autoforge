@@ -34,7 +34,7 @@ import requests
 
 from autoforge import cli
 from autoforge.core import llm
-from autoforge.core.llm import DEFAULT_MAX_TOKENS, OpenAICompatClient
+from autoforge.core.llm import DEFAULT_MAX_TOKENS, LLMError, OpenAICompatClient
 from autoforge.core.message import Message
 from autoforge.forge.generator import LLMToolGenerator
 
@@ -172,7 +172,7 @@ def test_the_clamp_is_not_an_escape_hatch_from_the_attempt_budget(monkeypatch):
     """One clamp only. A second rejection is a real answer, not a puzzle."""
     sender = _wire(monkeypatch, _Resp(400, text=DEEPSEEK_400),
                    _Resp(400, text=DEEPSEEK_400), _Resp(200, "hi"))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(LLMError):
         _client(max_attempts=2).chat(MSGS)
     assert sender.attempts == 2
 
@@ -189,7 +189,7 @@ def test_an_explicit_caller_cap_is_clamped_too(monkeypatch):
 # ======================================================================
 def test_a_400_about_anything_else_is_still_fatal(monkeypatch):
     sender = _wire(monkeypatch, _Resp(400, text="unknown model: m"))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(LLMError):
         _client().chat(MSGS)
     assert sender.attempts == 1
 
@@ -197,7 +197,7 @@ def test_a_400_about_anything_else_is_still_fatal(monkeypatch):
 def test_a_401_that_mentions_max_tokens_is_still_fatal(monkeypatch):
     """The status decides, not the wording: credentials are not a cap problem."""
     sender = _wire(monkeypatch, _Resp(401, text=DEEPSEEK_400))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(LLMError):
         _client().chat(MSGS)
     assert sender.attempts == 1
 
@@ -205,7 +205,7 @@ def test_a_401_that_mentions_max_tokens_is_still_fatal(monkeypatch):
 def test_a_ceiling_below_the_floor_is_reported_rather_than_chased(monkeypatch):
     """Under this the reply cannot hold an envelope, so keep the provider's word."""
     sender = _wire(monkeypatch, _Resp(400, text="max_tokens is in [1, 256]"))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(LLMError):
         _client().chat(MSGS)
     assert sender.attempts == 1
 
@@ -213,6 +213,21 @@ def test_a_ceiling_below_the_floor_is_reported_rather_than_chased(monkeypatch):
 def test_no_cap_on_the_wire_means_nothing_to_clamp(monkeypatch):
     """`default_max_tokens=None` opts out of the field entirely; leave it alone."""
     sender = _wire(monkeypatch, _Resp(400, text=DEEPSEEK_400))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(LLMError):
         _client(default_max_tokens=None).chat(MSGS)
     assert sender.caps == [None]
+
+# ----------------------------------------------------------------------
+# why these expect LLMError and not requests.HTTPError
+#
+# The default client translates a terminal HTTP failure into LLMError. That is
+# deliberate and is the documented contract of the class: "one name for 'this
+# endpoint did not work, whatever the transport said' ... failing over needs one
+# thing to catch". It was added after a live forge round died on a raw
+# "forge error: HTTPError: 503" while a healthy fallback endpoint sat unused one
+# line below in the chain -- the failover handler catches LLMError and never saw
+# it. These five assertions were written before that translation and were left
+# asserting the old type, so they went red on the next full run even though the
+# behaviour they describe (one clamp, then fatal) is unchanged. The status and
+# the attempt count are what these tests are about; the exception type is just
+# how the caller is told, and the caller now needs one type.

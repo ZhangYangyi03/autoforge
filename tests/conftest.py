@@ -50,6 +50,17 @@ def isolated_config(tmp_path, monkeypatch):
     for name in _AMBIENT:
         if name != "AUTOFORGE_CONFIG":
             monkeypatch.delenv(name, raising=False)
+    # Peer shelves. Set to EMPTY rather than deleted: present-but-empty is the
+    # documented way to say "no peers", and deleting it would let the lookup
+    # fall through to ~/.autoforge/peers.json or to HKCU\Environment, where
+    # `setx` puts it. That is not a hypothetical -- after the operator exported a
+    # real peer with setx, three tests in test_market_prelookup.py failed on the
+    # machine and would have passed anywhere else. A test whose result depends
+    # on whose machine it runs on is worse than a failing one.
+    monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "")
+    monkeypatch.setattr("autoforge.agent.ForgeAgent._peer_market_from_registry",
+                        staticmethod(lambda: ""), raising=False)
+
     # Skills and state go under tmp_path, so a run cannot see the real ones.
     monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("AUTOFORGE_SKILLS_DIRS",

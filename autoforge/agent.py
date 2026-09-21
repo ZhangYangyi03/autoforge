@@ -1414,6 +1414,70 @@ class ForgeAgent:
         return found
 
     @staticmethod
+    def _peer_market_spec() -> str:
+        """The peer spec, from the environment, a config file, or the registry.
+
+        Measured failure, 2026-09-21: ``setx AUTOFORGE_PEER_MARKETS ...`` put the
+        value in HKCU\\Environment, so a *new* shell had it -- but the agent
+        already running did not, and the federation check had to tell us so. A
+        setting that only takes effect at the next launch is a setting that is
+        silently not in effect, which is the same shape as the bug this whole
+        lookup exists to prevent.
+
+        So the spec is read from, in order:
+
+          1. the environment (a shell that was started after the setting),
+          2. ``$AUTOFORGE_HOME/peers.json`` or ``~/.autoforge/peers.json`` --
+             a file, so it can be read by a process that already started,
+          3. on Windows, ``HKCU\\Environment``, which is where ``setx`` writes.
+
+        Never discovered from the network: a LAN sweep is a scan, not a lookup.
+        """
+        # Present -- even empty -- is authoritative. An empty value is how a
+        # test, or a machine that wants no peers, says "none"; deleting the
+        # variable instead would let the lookup fall through to a peers.json or
+        # the registry, and whether a test passed would then depend on whose
+        # machine it ran on. That leak is not hypothetical: it is what the peer
+        # config in the registry did to this very suite the first time it ran
+        # after `setx`, and `tests/conftest.py` now closes it.
+        raw = os.environ.get("AUTOFORGE_PEER_MARKETS")
+        if raw is not None:
+            return raw
+        home = (os.environ.get("AUTOFORGE_HOME")
+                or os.path.join(os.path.expanduser("~"), ".autoforge"))
+        try:
+            with open(os.path.join(home, "peers.json"), encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, str):
+                return data
+            items = data.get("peers", data) if isinstance(data, dict) else data
+            if isinstance(items, dict):
+                return ",".join("%s=%s" % (k, v) for k, v in items.items())
+            if isinstance(items, list):
+                return ",".join(str(x) for x in items)
+        except Exception:                                      # noqa: BLE001
+            pass
+        return ForgeAgent._peer_market_from_registry()
+
+    @staticmethod
+    def _peer_market_from_registry() -> str:
+        """Where ``setx`` writes it: HKCU\\Environment.
+
+        Read last, and behind its own function, so a test can replace this one
+        call instead of depending on what the machine running it happens to
+        have exported.
+        """
+        if os.name != "nt":
+            return ""
+        try:
+            import winreg                                      # noqa: PLC0415
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                value, _ = winreg.QueryValueEx(key, "AUTOFORGE_PEER_MARKETS")
+            return str(value).strip()
+        except Exception:                                      # noqa: BLE001
+            return ""
+
+    @staticmethod
     def _peer_market_urls() -> list[tuple[str, str]]:
         """Other machines' shelves, as ``(label, base_url)``.
 
@@ -1435,7 +1499,7 @@ class ForgeAgent:
 
             AUTOFORGE_PEER_MARKETS="kos=http://192.168.1.107:8077/market|FILE:C:/path/node.token"
         """
-        raw = os.environ.get("AUTOFORGE_PEER_MARKETS", "")
+        raw = ForgeAgent._peer_market_spec()
         peers: list[tuple[str, str]] = []
         for entry in raw.split(","):
             entry = entry.strip()

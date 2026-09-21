@@ -603,3 +603,50 @@ class TestPeerShelves:
         refused_until = agent._peer_dead_until["http://10.9.9.8:8000"] - now
         slow_until = agent._peer_dead_until["http://10.9.9.9:8000"] - now
         assert refused_until < slow_until, (refused_until, slow_until)
+
+    def test_peer_spec_survives_a_process_that_already_started(self, tmp_path, monkeypatch):
+        """setx writes the registry; a RUNNING process never sees it.
+
+        Measured 2026-09-21: the federation check reported
+        AUTOFORGE_PEER_MARKETS as unset *after* setx had exported it. A setting
+        that only applies at the next launch is silently not in effect -- the
+        same shape of failure the lookup exists to prevent. So the spec is also
+        read from a file, which a live process can read.
+        """
+        import json
+
+        monkeypatch.delenv("AUTOFORGE_PEER_MARKETS", raising=False)
+        monkeypatch.setattr("autoforge.agent.ForgeAgent._peer_market_from_registry",
+                            staticmethod(lambda: ""), raising=False)
+        monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path))
+        (tmp_path / "peers.json").write_text(
+            json.dumps({"peers": {"kos": "http://192.168.1.108:8000"}}), encoding="utf-8")
+
+        agent = _agent()
+        assert agent._peer_market_urls() == [("kos", "http://192.168.1.108:8000")]
+
+    def test_the_environment_still_wins_over_the_file(self, tmp_path, monkeypatch):
+        import json
+
+        monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path))
+        monkeypatch.setattr("autoforge.agent.ForgeAgent._peer_market_from_registry",
+                            staticmethod(lambda: ""), raising=False)
+        (tmp_path / "peers.json").write_text(
+            json.dumps({"peers": {"kos": "http://from-file:8000"}}), encoding="utf-8")
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "env=http://from-env:8000")
+        assert _agent()._peer_market_urls() == [("env", "http://from-env:8000")]
+
+    def test_no_peers_configured_means_no_peer_requests(self, tmp_path, monkeypatch):
+        """The gate: with nothing configured the lookup must not call out at all."""
+        monkeypatch.delenv("AUTOFORGE_PEER_MARKETS", raising=False)
+        monkeypatch.setenv("AUTOFORGE_HOME", str(tmp_path))
+        monkeypatch.setattr("autoforge.agent.ForgeAgent._peer_market_from_registry",
+                            staticmethod(lambda: ""), raising=False)
+
+        def _boom(*a, **k):
+            raise AssertionError("no peer is configured; nothing may be requested")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+        agent = _agent()
+        assert agent._peer_market_urls() == []
+        assert agent._peer_lookup("anything") == ([], False)

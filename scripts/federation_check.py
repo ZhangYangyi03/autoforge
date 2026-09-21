@@ -89,6 +89,34 @@ def post(url: str, token: str | None, path: str, payload: dict, timeout: float =
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _spec_origin() -> tuple[str, str]:
+    """Which of the three places the peer spec actually came from.
+
+    The three are the environment, ``~/.autoforge/peers.json`` and, on Windows,
+    ``HKCU\\Environment`` (where ``setx`` writes). They are reported separately
+    because they fail differently: the first is invisible to an agent that was
+    already running when it was set, and the third is invisible to a test that
+    replaced the environment to isolate itself.
+    """
+    if os.environ.get("AUTOFORGE_PEER_MARKETS", "").strip():
+        return "env", "AUTOFORGE_PEER_MARKETS"
+    home = (os.environ.get("AUTOFORGE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".autoforge"))
+    path = os.path.join(home, "peers.json")
+    if os.path.exists(path):
+        return "file", path
+    if os.name == "nt":
+        try:
+            import winreg                                       # noqa: PLC0415
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                value, _ = winreg.QueryValueEx(key, "AUTOFORGE_PEER_MARKETS")
+            if str(value).strip():
+                return "registry", "HKCU\\Environment\\AUTOFORGE_PEER_MARKETS"
+        except Exception:                                       # noqa: BLE001
+            pass
+    return "none", ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--peer", help="peer shelf base URL (or label=url)")
@@ -100,12 +128,26 @@ def main() -> int:
 
     peer = a.peer
     if not peer:
-        configured = [e for e in os.environ.get("AUTOFORGE_PEER_MARKETS", "").split(",") if e.strip()]
+        # Same three sources the agent itself reads (env, ~/.autoforge/peers.json,
+        # HKCU\Environment) -- so this check reports what the forge will really
+        # see, not what the current shell happens to have. Using os.environ here
+        # would have made the checker disagree with the agent it is checking.
+        spec = ""
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from autoforge.agent import ForgeAgent
+            spec = ForgeAgent._peer_market_spec()
+        except Exception:                                      # noqa: BLE001
+            spec = os.environ.get("AUTOFORGE_PEER_MARKETS", "")
+        configured = [e for e in spec.split(",") if e.strip()]
         if not configured:
-            print("no --peer and AUTOFORGE_PEER_MARKETS is empty:")
-            print("  set AUTOFORGE_PEER_MARKETS=\"kos=http://192.168.1.108:8000\"")
+            print("no peer configured anywhere this agent reads:")
+            print('  set AUTOFORGE_PEER_MARKETS="kos=http://192.168.1.108:8000"')
+            print('  or write {"peers": {"kos": "http://192.168.1.108:8000"}} to')
+            print("     %APPDATA%\\..\\.autoforge\\peers.json  (i.e. ~/.autoforge/peers.json)")
             return 2
         peer = configured[0]
+        print(f"peer taken from configuration: {peer}")
     label, _, url = peer.partition("=") if "=" in peer else (peer, "", peer)
     url = url.split("|FILE:", 1)[0].rstrip("/")
 
@@ -196,10 +238,21 @@ def main() -> int:
         if ev["kind"] in ("market_peer_lookup", "market_prelookup", "market_semantic_lookup"):
             print("    ledger:", json.dumps(ev, ensure_ascii=False)[:190])
     print(f"{OK if verdict else BAD} verdict: {verdict or '(no answer -- the forge would not be licensed)'}")
-    if not env_markets:
-        print(f"{WARN} AUTOFORGE_PEER_MARKETS was NOT set before this ran; the check set it")
-        print("       in-process only. Set it permanently or the forge will not see the peer:")
-        print(f'       setx AUTOFORGE_PEER_MARKETS "{label}={url}"')
+    # Where did the spec come from? Only "nowhere" is a warning. An earlier
+    # version of this check keyed off os.environ alone and so warned even when
+    # the peer came from ~/.autoforge/peers.json -- which the agent reads too,
+    # so the warning named a problem that did not exist and would have sent
+    # someone to run setx for a setting already in effect.
+    origin, detail = _spec_origin()
+    if origin == "env":
+        print(f"  ok  configuration source: environment")
+    elif origin == "file":
+        print(f"  ok  configuration source: {detail} (the agent reads this too)")
+    elif origin == "registry":
+        print(f"  ok  configuration source: {detail} -- where setx writes it")
+    else:
+        print(f"{WARN} this check set the peer in-process only; nothing persistent exists:")
+        print(f'       setx AUTOFORGE_PEER_MARKETS "{label}={url}"   (or write ~/.autoforge/peers.json)')
     return 0 if not failures else 1
 
 
