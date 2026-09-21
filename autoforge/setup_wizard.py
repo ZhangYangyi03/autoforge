@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 
 from . import configfile
-from .core.llm import DEFAULT_MAX_TOKENS, OpenAICompatClient
+from .core.llm import DEFAULT_MAX_TOKENS, LLMError, OpenAICompatClient
 from .core.message import Message
 
 # label, base_url, model, needs_key
@@ -85,6 +85,24 @@ def _ask_yes(prompt: str, current: bool) -> bool:
     return raw.startswith("y")
 
 
+def _status_of(exc: BaseException) -> int | None:
+    """The HTTP status behind a failure, whichever layer reported it.
+
+    Two layers can: an un-translated ``requests.HTTPError`` carries ``.response``,
+    and a translated ``LLMError`` carries the original as ``__cause__``. The
+    wizard's advice keys off this, so it has to survive both -- the alternative
+    is advice that silently stops being given the day the client changed, which
+    is exactly what had happened here.
+    """
+    seen = 0
+    while exc is not None and seen < 5:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        exc = exc.__cause__
+        seen += 1
+    return None
+
 def _probe(base: str, model: str, key: str, use_proxy: bool, max_tokens: int) -> tuple[bool, str]:
     """One tiny round-trip. Returns (ok, human-readable detail).
 
@@ -100,13 +118,21 @@ def _probe(base: str, model: str, key: str, use_proxy: bool, max_tokens: int) ->
     )
     try:
         out = client.chat([Message.user("Reply with the single word: ready")])
-    except requests.HTTPError as exc:
-        # A key is provider-specific. Switching provider in the wizard offers the
-        # stored key on a bare Enter, so the commonest failure here is a key that
-        # belongs to the endpoint you just moved away from -- and a bare "401"
-        # gives the user nothing to act on.
-        status = getattr(exc.response, "status_code", None)
+    except LLMError as exc:
+        # LLMError, not requests.HTTPError. The client translates a terminal
+        # HTTP failure into LLMError (with the original chained as __cause__) so
+        # that failing over needs one thing to catch -- and catching only the raw
+        # type here meant this whole branch was dead code: the 401 fell through
+        # to the generic handler and the user was told
+        # "LLMError: openai-compat: HTTP 401 after 1 attempt(s)" instead of the
+        # one thing that would fix it. The advice below is the reason this
+        # function has a try at all.
+        status = _status_of(exc)
         if status in (401, 403):
+            # A key is provider-specific. Switching provider in the wizard offers
+            # the stored key on a bare Enter, so the commonest failure here is a
+            # key that belongs to the endpoint you just moved away from -- and a
+            # bare "401" gives the user nothing to act on.
             return False, (f"{status}: the endpoint rejected the key. Keys are "
                            f"provider-specific -- an existing key is reused when "
                            f"you switch provider, so enter this provider's key.")

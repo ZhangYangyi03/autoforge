@@ -573,7 +573,14 @@ class OpenAICompatClient(LLMClient):
                 # fallback endpoint sat unused one line below in the chain.
                 raise LLMError(
                     f"{self.name}: HTTP {resp.status_code} after {attempt} "
-                    f"attempt(s): {(resp.text or '')[:200]!r}"
+                    # getattr, not resp.text: this line runs *inside an error
+                    # handler*, and a response-like object without `.text` would turn
+                    # "HTTP 400 after 2 attempts" into "AttributeError: no attribute
+                    # text" -- losing the status the message exists to carry. Real
+                    # requests.Response always has it; the crash-on-the-error-path is
+                    # the part worth closing. (Tests/test_llm_retry.py and
+                    # test_setup.py were failing on exactly this.)
+                    f"attempt(s): {(getattr(resp, 'text', '') or '')[:200]!r}"
                 ) from exc
             try:
                 body = resp.json()

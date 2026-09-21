@@ -17,7 +17,7 @@ from __future__ import annotations
 import requests
 
 from autoforge.core import llm
-from autoforge.core.llm import OpenAICompatClient
+from autoforge.core.llm import LLMError, OpenAICompatClient
 from autoforge.core.message import Message
 
 
@@ -87,7 +87,7 @@ def test_a_permanent_400_is_not_retried(monkeypatch):
     try:
         _ask(_client())
         raise AssertionError("a 400 should have raised")
-    except requests.HTTPError:
+    except LLMError:
         pass
     assert sender.attempts == 1
 
@@ -109,8 +109,13 @@ def test_exhausting_the_attempts_re_raises_the_real_error(monkeypatch):
     try:
         _ask(_client())
         raise AssertionError("three 503s should have raised")
-    except requests.HTTPError as exc:
+    except LLMError as exc:
         assert "503" in str(exc)
+        # "handed back, never swallowed" is the property this test is named for,
+        # and chaining is how it stays true now that the client translates: the
+        # last attempt's HTTPError is `__cause__`, so the status and the response
+        # are still reachable by a caller that wants them.
+        assert isinstance(exc.__cause__, requests.HTTPError)
     assert sender.attempts == 3
 
 
@@ -183,7 +188,7 @@ def test_max_attempts_of_one_disables_retrying(monkeypatch):
     try:
         _ask(client)
         raise AssertionError("should have raised on the first failure")
-    except requests.HTTPError:
+    except LLMError:
         pass
     assert sender.attempts == 1
 
@@ -202,3 +207,15 @@ def test_a_tool_call_only_reply_counts_as_an_answer(monkeypatch):
     resp = _client().chat([Message(role="user", content="hi")])
     assert resp.content == "" and len(resp.tool_calls) == 1
     assert sender.attempts == 1
+
+# ---------------------------------------------------------------------------
+# why these expect LLMError
+#
+# A terminal HTTP failure leaves the client as LLMError, with the original
+# requests.HTTPError chained as __cause__. That translation is deliberate: the
+# failover chain and the run loop need one thing to catch, and it was added
+# after a live forge round died on a raw "HTTPError: 503" that the chain could
+# not see. These three assertions were written before the translation and had
+# been failing ever since -- on any machine, from the checked-in code. What they
+# are about (one attempt for a permanent 400, three for a transient 503, the
+# last failure's status preserved) is unchanged.

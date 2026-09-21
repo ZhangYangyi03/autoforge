@@ -94,7 +94,15 @@ class TestTheSummaryIsAskedToYield:
         # The same callable, not a copy of its logic: a summarizer that asked
         # the question slightly differently would be the one step that failed
         # to yield, which is the bug this whole file is about.
-        assert summarizer.should_abort == agent._operator_wants_the_floor
+        # The *cheap* question: a summary is a model call, and a question typed
+        # during one costs nothing that cannot be asked again. An earlier version
+        # of this assertion named `_operator_wants_the_floor` while the code
+        # wired `_operator_should_yield` -- and ForgeAgent's
+        # `_operator_wants_the_floor` was then a duplicate of the cheap one, so
+        # both names meant the same thing and the mismatch went unnoticed. They
+        # are now genuinely different, which is what makes this assert about
+        # something.
+        assert summarizer.should_abort == agent._operator_should_yield
 
     def test_the_minimal_mode_asks_it_too(self):
         # The control group gets the same context management, so it has to get
@@ -102,7 +110,7 @@ class TestTheSummaryIsAskedToYield:
         mode = MinimalAgent(llm=MockLLMClient(script=[LLMResponse(content="ok")]))
         summarizer = mode.compactor.summarizer
         assert isinstance(summarizer, LLMSummarizer)
-        assert summarizer.should_abort == mode._operator_wants_the_floor
+        assert summarizer.should_abort == mode._operator_should_yield
 
     def test_the_question_reaches_the_client(self):
         seen: list[bool] = []
@@ -247,3 +255,41 @@ class TestTheLoopComesBackMidSummary:
         assert came_back < summarizer.patience, (
             f"the run waited out the summary anyway ({came_back:.1f}s)")
 
+
+# ======================================================================
+# the split has to hold for ForgeAgent too, not only for Agent
+# ======================================================================
+class TestTheSplitHoldsOneLayerDown:
+
+    def test_a_question_does_not_abort_a_forge(self):
+        """The regression this file keeps finding, in the class it kept missing.
+
+        `core.agent.Agent` splits "a question" from "a stop"; ForgeAgent has its
+        own copies of both predicates, and for a while they were byte-identical
+        -- `has_pending or stop_requested` twice. So a forge, which is the one
+        step that runs for minutes and which passes
+        `_operator_wants_the_floor` to the sandbox as `abort_check`, was killed
+        by "how is it going?" while the comment above the call site said only a
+        /stop could kill it.
+        """
+        from autoforge.agent import ForgeAgent
+
+        class _Steer:
+            def __init__(self, line=None, stop=False):
+                self._line, self._stop = line, stop
+            def has_pending(self):
+                return self._line is not None
+            def stop_requested(self):
+                return self._stop
+
+        a = ForgeAgent.__new__(ForgeAgent)
+        a.steer = _Steer(line="how is it going?")
+        assert a._operator_should_yield() is True       # the model call yields
+        assert a._operator_wants_the_floor() is False   # the forge survives
+
+        a.steer = _Steer(stop=True)
+        assert a._operator_wants_the_floor() is True    # a stop still stops it
+
+        a.steer = _Steer()
+        assert a._operator_wants_the_floor() is False
+        assert a._operator_should_yield() is False

@@ -553,6 +553,14 @@ BUILTIN_SCOPES: dict[str, str] = {
     "mission_focus": "local_write",
     "mission_list": "read_only",
     "mission_show": "read_only",
+    # These three were missing, which is worse than it sounds: an unscoped
+    # builtin is treated as capable of *everything*, so mission_wake and
+    # mission_block and mission_sweep were gated by every switched-off freedom
+    # at once and could not be called in a supervised session at all. The gate
+    # is only as good as the declarations, and these declarations did not exist.
+    "mission_wake": "local_write",
+    "mission_block": "local_write",
+    "mission_sweep": "local_write",
     # Reading the agent's own state. Nothing leaves the process.
     "my_capabilities": "read_only",
     "my_history": "read_only",
@@ -877,6 +885,11 @@ class ForgeAgent:
         # summarizer's reach entirely, are the Compactor's business.
         if self.compactor is None:
             self.compactor = Compactor(
+                # The summarizer is a *model call*, so it asks the cheap
+                # question -- the same one `core.agent.Agent` hands to its own
+                # summarizer. A question typed during a summary costs nothing
+                # that cannot be asked again; only the forge and the sandbox ask
+                # the narrow question.
                 summarizer=LLMSummarizer(
                     self.llm, should_abort=self._operator_should_yield),
                 fallback=DeterministicSummarizer(),
@@ -1167,18 +1180,28 @@ class ForgeAgent:
             return False
 
     def _operator_wants_the_floor(self) -> bool:
-        """Whether the operator has said something the forge has not consumed.
+        """Whether a *long* step must give way -- only a real /stop.
 
         The forge is the one step in this framework that runs for minutes, so
         it is the one that most needs to be interruptible from the inside. This
         is the same question `core.agent.Agent` asks of its own long steps --
         asked here too because a forge is reached from a *tool call*, one layer
         below the loop, and the loop's boundary check cannot see inside it.
+
+        Only `stop_requested`, NOT `has_pending`. This method used to be a
+        copy of `_operator_should_yield` above -- the same
+        `has_pending or stop_requested` -- which silently undid the fix that
+        test_steering.py exists to pin: a question typed while a forge ran
+        arrived here as an abort and threw the whole round away. The call site
+        says so in a comment ("Only a real /stop may kill a forge") and the
+        predicate it handed over did the opposite. Four long jobs were recorded
+        as "stopped at the operator's request" and every one was killed by
+        "how is it going?".
         """
         if self.steer is None:
             return False
         try:
-            return bool(self.steer.has_pending()) or bool(self.steer.stop_requested())
+            return bool(self.steer.stop_requested())
         except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
@@ -4011,6 +4034,7 @@ class ForgeAgent:
                 "mid": {"type": "integer", "description": "mission id"},
                 "note": {"type": "string", "description": "why it is owed again"},
             }, "required": ["mid"]},
+            effect_signature="local_write",   # overturning the assumption rewrites the mission row
             fn=mission_wake, source="builtin", tags=["meta", "mission"],
         ))
 
@@ -4064,6 +4088,7 @@ class ForgeAgent:
                                "description": "what it is waiting for; omit to read "
                                               "it back, pass '' to clear it"},
             }, "required": ["mid"]},
+            effect_signature="local_write",   # sets/clears the waiting-on field
             fn=mission_block, source="builtin", tags=["meta", "mission"],
         ))
 
@@ -4086,6 +4111,7 @@ class ForgeAgent:
                 "now_epoch": {"type": "number",
                               "description": "sweep as of this unix time (0 = now)"},
             }, "required": []},
+            effect_signature="local_write",   # presumes (and after a week, closes) missions
             fn=mission_sweep, source="builtin", tags=["meta", "mission"],
         ))
 
