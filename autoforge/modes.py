@@ -62,12 +62,46 @@ task is done, say what you changed and how you checked it.
 # --------------------------------------------------------------------------
 
 
+def _posix_shell() -> str | None:
+    """A real POSIX shell on this host, or None.
+
+    On Windows ``shell=True`` means cmd.exe, and this tool is called ``bash``
+    with a POSIX contract: a model writing ``cat note.txt && sleep 5`` gets
+    "'cat' is not recognized as an internal or external command" on every
+    command it tries, and the benchmark measures that as the model being bad at
+    coding. Measured here: Git for Windows is installed and provides ``sleep``,
+    ``cat`` and the rest. So when a POSIX shell exists it is used, and cmd.exe is
+    only the fallback when it does not.
+
+    ``SHELL`` is honoured first, so a person with their own shell gets it.
+    """
+    if os.name != "nt":
+        return os.environ.get("SHELL") or "/bin/sh"
+    cands = [os.environ.get("SHELL")]
+    for root in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                 r"C:\Program Files", r"C:\Program Files (x86)"):
+        if root:
+            cands += [os.path.join(root, "Git", "bin", "bash.exe"),
+                      os.path.join(root, "Git", "usr", "bin", "bash.exe")]
+    for c in cands:
+        if c and os.path.basename(c).lower().startswith(("bash", "sh", "zsh")) \
+                and os.path.exists(c):
+            return c
+    return None
+
+
 def _bash(command: str, timeout: int = 60, cwd: str | None = None) -> str:
-    """Run a shell command; return combined stdout/stderr with the exit code."""
+    """Run a shell command; return combined stdout/stderr with the exit code.
+
+    The shell is POSIX where the host has one -- see `_posix_shell` for why that
+    is not just a preference.
+    """
     timeout = max(1, min(int(timeout or 60), 600))
+    shell = _posix_shell()
+    argv: str | list[str] = [shell, "-c", command] if shell else command
     try:
         proc = subprocess.run(
-            command, shell=True, cwd=cwd or os.getcwd(),
+            argv, shell=shell is None, cwd=cwd or os.getcwd(),
             capture_output=True, text=True, errors="replace", timeout=timeout,
         )
     except subprocess.TimeoutExpired:

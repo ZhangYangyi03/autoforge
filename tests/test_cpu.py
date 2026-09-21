@@ -20,6 +20,8 @@ in which its claims can be false:
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from autoforge import cpu as C
@@ -431,3 +433,42 @@ def test_cpu_compile_refuses_a_kernel_with_no_entry_point():
     agent = make_agent()
     out = agent.registry.call("cpu_compile", {"code": "static void hidden(void){} int main(void){return 0;}"})
     assert not out.ok or "no callable entry point" in (out.output or out.error or "")
+
+
+# ---------------------------------------------------------------------------
+# 7. the harness's own BLAS must not kill the process
+# ---------------------------------------------------------------------------
+def test_numpy_is_imported_with_a_bounded_blas(monkeypatch):
+    """A library that aborts the process is not a library you can catch.
+
+    Measured on this host (16 cores, Windows): importing numpy lets OpenBLAS
+    size its thread pool from the core count, the allocation fails inside the
+    process, and OpenBLAS does not raise -- it aborts:
+
+        OpenBLAS error: Memory allocation still failed after 10 retries, giving up.
+
+    No traceback, no exception, no return code to interpret: the interpreter is
+    simply gone. In tests it showed up as 18 failures in this file (the pytest
+    process dying mid-run, so the ones that "failed" produced no output at all);
+    in production it would report a correct kernel as unrunnable on any machine
+    with enough cores. The bound has to be set before the import, which is why
+    it lives in `_numpy()` rather than in a caller.
+    """
+    from autoforge.cpu import ops
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OPENBLAS_DEFAULT_NUM_THREADS", raising=False)
+    ops._numpy()
+    assert os.environ["OPENBLAS_NUM_THREADS"].isdigit()
+    assert int(os.environ["OPENBLAS_NUM_THREADS"]) <= int(os.cpu_count() or 1)
+
+
+def test_the_kernels_own_threads_are_left_alone(monkeypatch):
+    """OMP_NUM_THREADS is the kernel's, and the guard times the kernel."""
+    from autoforge.cpu import ops
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    ops._numpy()
+    assert "OMP_NUM_THREADS" not in os.environ, (
+        "bounding OMP_NUM_THREADS would change the number the guard reports for "
+        "a kernel written with `#pragma omp parallel`")

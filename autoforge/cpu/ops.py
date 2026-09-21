@@ -27,6 +27,8 @@ Three ideas, one per hazard:
 """
 from __future__ import annotations
 
+import os
+
 import array
 import ctypes
 import math
@@ -435,6 +437,28 @@ class Problem:
 
 
 def _numpy():
+    """numpy, with its BLAS thread count bounded before the import.
+
+    Why this is not premature: importing numpy initialises OpenBLAS, which sizes
+    its thread pool from the core count and allocates for it. On this host --
+    16 cores, Windows -- that allocation fails inside the process and OpenBLAS
+    does not raise, it *aborts*:
+
+        OpenBLAS error: Memory allocation still failed after 10 retries, giving up.
+
+    No traceback, no exception for a caller to catch, and the process is gone.
+    Measured: 16 threads dies, 8 dies, 4 and below is fine. The visible symptom
+    was 18 tests in tests/test_cpu.py going red with the pytest process dying
+    mid-file, which reads exactly like "the isolated-execution layer is broken"
+    when nothing in the layer is involved.
+
+    Set before `import numpy`, and with `setdefault` so a caller who knows their
+    machine can override it. OPENBLAS_* only -- OMP_NUM_THREADS governs the
+    kernel under test, and bounding *that* would change the number the guard
+    reports.
+    """
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+    os.environ.setdefault("OPENBLAS_DEFAULT_NUM_THREADS", "4")
     try:
         import numpy
         return numpy

@@ -350,6 +350,21 @@ def run_isolated(
         pkg_parent = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = pkg_parent + os.pathsep + env.get("PYTHONPATH", "")
         env["PYTHONIOENCODING"] = "utf-8"
+        # numpy's BLAS is the harness's, not the kernel's, and on this host it
+        # can kill the child before a single instruction of the kernel runs.
+        # Measured on a 16-core Windows box: OpenBLAS allocating its default
+        # one-thread-per-core aborts the process with
+        #   "OpenBLAS error: Memory allocation still failed after 10 retries"
+        # -- no traceback, no return code to interpret, just a dead child. That
+        # turns 18 tests red and, in production, reports a perfectly good kernel
+        # as unrunnable. 4 threads is comfortable here and OpenBLAS is not what
+        # is being measured.
+        #
+        # OPENBLAS_* only. OMP_NUM_THREADS is deliberately left alone: a kernel
+        # written with `#pragma omp parallel` is timed on its own threads, and
+        # pinning those would change the number the guard reports.
+        env.setdefault("OPENBLAS_NUM_THREADS", "4")
+        env.setdefault("OPENBLAS_DEFAULT_NUM_THREADS", "4")
         cmd = [sys.executable, "-m", "autoforge.cpu.safety",
                "--payload", str(payload), "--out", str(out)]
 
