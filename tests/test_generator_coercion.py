@@ -164,3 +164,53 @@ def test_entry_defaults_to_name():
     payload = {k: v for k, v in BASE.items() if k != "entry"}
     tool = gen(payload).generate("x")
     assert tool.entry == tool.name
+
+# ---------------------------------------------------------------------------
+# A *union* type is legal JSON Schema, and it used to kill the forge pipeline.
+# ---------------------------------------------------------------------------
+
+def test_union_type_is_normalised_and_does_not_crash_the_fuzzer():
+    """`{"type": ["number", "null"]}` is how a nullable parameter is written.
+
+    Reported 2026-09-21 by a peer session: forging any tool whose parameter was
+    declared as a list of types died with
+
+        TypeError: unhashable type: 'list'
+
+    The list survived `normalise_parameters` (which only coerced bare strings and
+    non-dicts) and reached `_PROBE_MAP.get(ptype, ...)` in the fuzzer, where a
+    list cannot be a dict key. The fix is at the trust boundary where untrusted
+    parameters enter, which is what `normalise_parameters` is for -- so this
+    test asserts on that function *and* on the fuzzer actually running.
+    """
+    from autoforge.forge.fuzzer import _reference_args, generate_robustness_probes
+    from autoforge.tools.spec import ToolSpec, normalise_parameters
+
+    params = normalise_parameters({
+        "type": "object",
+        "properties": {"sec": {"type": ["number", "null"]}},
+        "required": ["sec"],
+    })
+    # The first non-null member is the real type. Choosing the *last* member
+    # would call a nullable number a null, which is worse than a crash because
+    # it is silent, so the order matters and is asserted.
+    assert params["properties"]["sec"]["type"] == "number"
+    assert params["properties"]["sec"]["type_union"] == ["number", "null"]
+
+    spec = ToolSpec(name="u", description="d", parameters=params, fn=lambda **k: None)
+    assert generate_robustness_probes(spec)          # no TypeError
+    assert _reference_args(spec) == {"sec": 1}
+
+
+def test_union_type_does_not_escape_into_a_tool_schema():
+    """Nothing downstream should ever see the list again."""
+    from autoforge.tools.spec import normalise_parameters
+
+    for declared, expected in [(["null", "string"], "string"),
+                               (["integer", "null"], "integer"),
+                               (["null"], "null"),       # degenerate but legal: kept, not invented away
+                               (["widget", "null"], "string")]:   # not a JSON type at all
+        got = normalise_parameters(
+            {"type": "object", "properties": {"p": {"type": declared}}}
+        )["properties"]["p"]["type"]
+        assert got == expected, (declared, got)

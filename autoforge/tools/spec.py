@@ -133,6 +133,41 @@ def normalise_parameters(params: Any) -> dict[str, Any]:
             schema = {"type": token if token in _JSON_TYPES else "string"}
         elif not isinstance(schema, dict):
             schema = {"type": "string"}
+        # A *list* of types is legal JSON Schema and means "any of these":
+        # {"type": ["number", "null"]} is how a nullable parameter is written,
+        # and MCP servers emit it routinely. Every downstream consumer does
+        # `schema.get("type", "string")` and then uses that value as a dict key
+        # -- `_PROBE_MAP.get(ptype, ...)`, `ptype in ("number", "integer")` --
+        # so a list arrives at a hashing site and dies with
+        # `TypeError: unhashable type: 'list'`, four modules away from the type
+        # that caused it. Reported by a peer session 2026-09-21 as a forge-pipeline
+        # crash for any tool whose parameter was declared as a list.
+        #
+        # Normalised here rather than at each consumer: this is the trust
+        # boundary where untrusted parameters enter, which is exactly what this
+        # function exists for. The FIRST non-"null" member is the real type --
+        # the nullable case is `["T", "null"]`, and picking the last member
+        # would call a nullable number a null, which is worse than a crash
+        # because it is silent. Dropped, not kept: downstream only asks for one
+        # type, and keeping the list would leave the same landmine for the next
+        # reader. The original is preserved beside it so nothing is lost.
+        elif isinstance(schema, dict):
+            declared = schema.get("type")
+            if isinstance(declared, (list, tuple, set, frozenset)):
+                members = [str(m) for m in declared]
+                # Prefer the first member that is not "null". A union of only
+                # "null" is degenerate but legal, and "null" IS a JSON type, so
+                # it is kept rather than swapped for an invented "string" --
+                # the one thing this function must not do is fabricate a type
+                # the schema never declared. A member that is not a JSON type
+                # at all ("widget") degrades to "string", which is the same
+                # convention already applied to a bare string.
+                chosen = next(
+                    (m for m in members if m != "null"),
+                    members[0] if members else "string")
+                schema = dict(schema)
+                schema["type"] = chosen if chosen in _JSON_TYPES else "string"
+                schema["type_union"] = members
         fixed[str(name)] = schema
     out["properties"] = fixed
 

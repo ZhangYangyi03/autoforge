@@ -183,9 +183,20 @@ class Handler(BaseHTTPRequestHandler):
         single HTTP tunnel, and a second tunnel needs a card, so rather than
         choose between "the shelf is reachable" and "the node is reachable" the
         node -- which already speaks HTTP -- carries the market under a path
-        prefix. The market keeps its own surface and its own auth; this only
-        moves bytes.
+        prefix. Because the market itself is unauthenticated by design (it leans
+        on the LAN boundary), the proxy is what enforces that boundary once a
+        public tunnel is in front: every /market request needs the node token
+        unless AUTOFORGE_NODE_MARKET_OPEN=1 says this node is LAN-only. The
+        market keeps its own surface; this moves bytes and holds the door.
         """
+        # The market's own design is "no auth, the LAN boundary is the auth".
+        # That sentence stops being true the moment this node carries the market
+        # out through a public tunnel: the boundary becomes the whole internet.
+        # So the proxy is the boundary now and it asks for the node token.
+        # Set AUTOFORGE_NODE_MARKET_OPEN=1 to restore the market's own posture
+        # on a host where the node is only ever reached from the LAN.
+        if os.environ.get("AUTOFORGE_NODE_MARKET_OPEN") != "1" and self._need_auth():
+            return
         import urllib.error as _e
         import urllib.request as _u
         n = int(self.headers.get("Content-Length") or 0)
