@@ -582,6 +582,50 @@ class TestPeerShelves:
         hits, answered = agent._peer_lookup("convert seconds into HH:MM:SS")
         assert answered and hits and hits[0]["name"] == "seconds_to_hms"
 
+    def test_a_peer_that_comes_back_is_asked_again(self, monkeypatch):
+        """Recovery, not just backoff -- the half that only shows up over time.
+
+        The rest is the point of the backoff, but a rest that never expires is a
+        peer deleted by a temporary failure. A machine that went to sleep is the
+        same machine that comes back, and the lookup has to hear it when it does.
+        """
+        import json as _json
+        import time as _t
+
+        agent = _agent()
+        monkeypatch.setenv("AUTOFORGE_PEER_MARKETS", "kos=http://10.9.9.7:8000")
+        calls = {"n": 0}
+
+        def _u(req, timeout=None):
+            calls["n"] += 1
+            # Both legs, /search *and* the /resources fallback: a peer that is
+            # switched off answers neither, and a stub that answered the second
+            # request would be testing a peer that is up.
+            if calls["n"] <= 2:
+                raise OSError("connection refused")
+            class _R:
+                status = 200
+                def read(self_inner):
+                    return _json.dumps({"results": [
+                        {"name": "seconds_to_hms", "score": 1.0}],
+                        "confidence": {"confident": True}}).encode()
+                def __enter__(self_inner): return self_inner
+                def __exit__(self_inner, *a): return False
+            return _R()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _u)
+        assert agent._peer_lookup("seconds") == ([], False), "down = no answer"
+        base = "http://10.9.9.7:8000"
+        assert base in agent._peer_dead_until, "a failed peer must be rested"
+        # Inside the window it must not be asked at all.
+        assert agent._peer_lookup("seconds") == ([], False)
+        assert calls["n"] == 2, "the resting peer was asked again"
+        # Let the rest expire the way time would, and it must be heard.
+        agent._peer_dead_until[base] = _t.time() - 1
+        hits, answered = agent._peer_lookup("seconds")
+        assert calls["n"] == 3, "the peer was never retried"
+        assert answered is True and [h["name"] for h in hits] == ["seconds_to_hms"], (hits, answered)
+
     def test_a_refused_peer_rests_shorter_than_a_timed_out_one(self, monkeypatch):
         """Not-there and there-but-busy deserve different retry intervals."""
         import time as _t
