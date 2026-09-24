@@ -64,6 +64,7 @@ from .forge.validity import FrozenBaseline
 from .forge.verifier import ToolVerifier
 from .mcp import MCPClient, MCPHub
 from .mission import MissionError, MissionStore
+from . import runs as runs_mod
 from .ecosystem import merged_servers, read_all as ecosystem_read_all
 from .browser import (
     Browser,
@@ -976,6 +977,10 @@ class ForgeAgent:
         self._tool_notify()
         self._tool_schedule()
         self._tool_mission()
+        # Runs sit next to the mission and the schedule on purpose: all three
+        # answer "what is outstanding", and the one that is easiest to lose is
+        # the one whose process is already dead.
+        self._tool_runs()
         self._tool_browser()
         self._tool_vision()
         self._tool_code()
@@ -3167,6 +3172,178 @@ class ForgeAgent:
             return store.report().splitlines()
         except Exception as exc:  # a broken mission table must not eat the turn
             return [f"MISSION — unreadable: {exc}"]
+
+    # ------------------------------------------------------------------
+    # unfinished runs: the sweep, the resume, and the tool
+    # ------------------------------------------------------------------
+    def _resume_line(self) -> str:
+        """One line for the prompt, when there is a stranded run to name.
+
+        In the prompt rather than only in a tool, for the same reason the
+        mission list is: the failure is not "I could not find the record", it is
+        "I did not think to look". A run that was interrupted overnight is
+        exactly the kind of thing the next session has to be told about rather
+        than asked about.
+        """
+        try:
+            rows = runs_mod.scan()
+        except Exception:                             # noqa: BLE001
+            return ""
+        open_rows = [r for r in rows if r["status"] == "resumable"]
+        if not open_rows:
+            return ""
+        first = open_rows[0]
+        more = f" (+{len(open_rows) - 1} more)" if len(open_rows) > 1 else ""
+        return (f"UNFINISHED RUN: {first['task'][:90]!r} stopped "
+                f"{runs_mod._human(first['age_s'])} ago after {first['turns']} "
+                f"turn(s) -- {first['reason']}. Resume it with "
+                f"resume_run(){more}.")
+
+    def resume(self, run_id: str = "", *, task_text: str = "",
+               progress: Callable[[str, dict[str, Any]], None] | None = None
+               ) -> AgentResult:
+        """Pick up a stranded run and carry it on.
+
+        With no `run_id`, the oldest resumable record is taken -- oldest first
+        because the run that has been stranded longest is the one whose operator
+        has waited longest. The record is adopted before any work begins, so a
+        second resumer reads it as live and leaves it alone, and the attempt
+        count moves on the new record; after `MAX_RESUMES` the record reports
+        itself stale, because a task entered four times and failed four times is
+        not waiting for a network.
+
+        `task_text` overrides what is being pursued. That exists for the case
+        the record cannot know about: the operator has since said something
+        different, and resuming an abandoned instruction faithfully is its own
+        kind of failure.
+        """
+        if run_id:
+            marks = [m for m in runs_mod.unfinished()
+                     if m.run_id == run_id or m.run_id.startswith(run_id)]
+            if not marks:
+                raise ValueError(f"no unfinished run {run_id!r}")
+            mark = marks[0]
+            status, reason = mark.claim()
+            if status != "resumable":
+                raise ValueError(f"run {mark.run_id} is {status}: {reason}")
+        else:
+            pick = runs_mod.resumable()
+            if not pick:
+                raise ValueError(
+                    "nothing to resume: " + (runs_mod.report() or "no records"))
+            mark = pick[0]
+
+        text = task_text or mark.task
+        self._record("run_resumed", {
+            "from": mark.run_id, "attempt": mark.attempts + 1,
+            "turns": mark.turns, "task": text[:200],
+        }, durable=True)
+        # The record is adopted inside `run`, and only there. Adopting here as
+        # well would write a second record and orphan the first -- a file
+        # claiming this pid is working on the task, owned by nobody, which reads
+        # to the next scan as a live run and is never cleaned up. Found by
+        # running it: one resume, two records on disk.
+        return self.run(text, progress=progress, resumed=mark)
+
+    def _tool_runs(self) -> None:
+        """The tools that let a running agent see and pick up stranded work."""
+        from .tools.spec import ToolSpec
+
+        def runs_status() -> str:
+            """What is unfinished, with the reason each record is or is not
+            resumable. Reads; never resumes anything."""
+            return runs_mod.report()
+
+        def resume_run(run_id: str = "", task_text: str = "") -> str:
+            """Pick up where an interrupted run stopped and carry it on.
+
+            An interrupted run is one whose process died, or stopped beating,
+            while a task was in flight -- a dropped connection, a killed
+            session, a reboot. The transcript of what had already happened is
+            replayed and the loop continues from it, rather than starting the
+            task again.
+            """
+            try:
+                result = self.resume(run_id, task_text=task_text)
+            except ValueError as exc:
+                return f"cannot resume: {exc}"
+            head = (result.content or "").strip()
+            return (f"resumed and reached a result in {result.turns} turn(s); "
+                    f"{'the run was ended by the agent' if result.self_terminated else ''}"
+                    f"\n{head[:1500]}").strip()
+
+        def runs_forget(run_id: str, why: str = "") -> str:
+            """Drop one record so it is never resumed.
+
+            For the case where the operator has decided the work is not wanted
+            -- not that it is finished, which is what reaching a result means,
+            but abandoned. The record is deleted, so 'never resumed' is a
+            decision on the record rather than a hope.
+            """
+            mark = None
+            for m in runs_mod.unfinished():
+                if m.run_id == run_id or m.run_id.startswith(run_id):
+                    mark = m
+                    break
+            if mark is None:
+                return f"no unfinished run {run_id!r}"
+            try:
+                runs_mod._path(mark.run_id).unlink()
+            except OSError as exc:
+                return f"could not drop {mark.run_id}: {exc}"
+            self._record("run_dropped", {"run_id": mark.run_id, "why": why[:200]},
+                         durable=True)
+            return f"dropped run {mark.run_id} ({mark.task[:80]})"
+
+        self._add(ToolSpec(
+            name="runs_status",
+            description=(
+                "List unfinished runs -- tasks whose process died mid-flight -- "
+                "with the reason each one is or is not resumable. Read-only. An "
+                "interrupted run is the ordinary case on this host, not an "
+                "exotic one: the model gateway returns 503 for minutes at a "
+                "time, so a task long enough to matter is a task likely to have "
+                "been cut off at least once."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            fn=runs_status, source="builtin",
+            effect_signature="read_only",
+            tags=["runs", "resume", "durability"],
+        ))
+        self._add(ToolSpec(
+            name="resume_run",
+            description=(
+                "Pick up an interrupted run from where it stopped and carry it "
+                "on, replaying the recorded transcript instead of starting the "
+                "task over. With no run_id, takes the one stranded longest. A "
+                "resumed run continues as a real run: it can be interrupted "
+                "again and picked up again."
+            ),
+            parameters={"type": "object", "properties": {
+                "run_id": {"type": "string",
+                           "description": "a run id (or its prefix); omit for the "
+                                          "oldest resumable one"},
+                "task_text": {"type": "string",
+                              "description": "what to pursue instead of the "
+                                             "recorded task, if the goal has since "
+                                             "changed"},
+            }, "required": []},
+            fn=resume_run, source="builtin", tags=["runs", "resume", "durability"],
+        ))
+        self._add(ToolSpec(
+            name="runs_forget",
+            description=(
+                "Drop an unfinished run so it is never resumed. For work that is "
+                "abandoned rather than finished -- reaching a result is what "
+                "finishes a run, and this is the other thing."
+            ),
+            parameters={"type": "object", "properties": {
+                "run_id": {"type": "string", "description": "run id or prefix"},
+                "why": {"type": "string", "description": "why it is not wanted"},
+            }, "required": ["run_id"]},
+            fn=runs_forget, source="builtin",
+            tags=["runs", "resume", "durability"],
+        ))
 
     def _mission_store(self) -> MissionStore:
         """One MissionStore per agent, sharing the tool store's sqlite file.
@@ -5529,8 +5706,17 @@ class ForgeAgent:
         # stable-to-volatile order puts it -- it changes only when the machine
         # does, so it cannot re-bill the menu behind it.
         probe = "\n".join(self._host_probe_lines())
+        # The unfinished run rides *with* the mission block, and for the same
+        # reason: it is the other thing that gets lost when a session carries
+        # many requests, and it is the one that is already half-done. A stranded
+        # run is invisible from inside the conversation -- the process that knew
+        # about it is dead -- so if it is not in the prompt it is not missed, it
+        # is unknown. Empty string when there is nothing to resume, so the
+        # common case costs exactly nothing and cannot re-bill the prefix.
+        stranded = self._resume_line()
+        tail = f"\n\n{stranded}" if stranded else ""
         out = (f"{self.system_prompt}\n\n{facts}\n\n{menu}\n\n"
-               f"{probe}\n\n{kept}\n\n{mission}\n\n{self._self_report()}")
+               f"{probe}\n\n{kept}\n\n{mission}{tail}\n\n{self._self_report()}")
         if self.role_brief:
             # Last, and separately labelled: a role narrows what this run is
             # for, and the point of putting it after the general instructions is
@@ -5541,27 +5727,52 @@ class ForgeAgent:
 
     # ------------------------------------------------------------------
     def run(self, task: str, history: list[Message] | None = None,
-            progress: Callable[[str, dict[str, Any]], None] | None = None) -> AgentResult:
+            progress: Callable[[str, dict[str, Any]], None] | None = None,
+            *, journal: bool = True, resumed: Any = None) -> AgentResult:
         """Run one task.
 
         `progress(kind, payload)` is called as the loop moves — `request` before
         each model call, `call`/`result` around each tool. The CLI uses it to
         print live status, so a slow model reads as "waiting", not "hung".
+
+        `journal=True` writes down where the loop is as it goes, so a wire that
+        dies mid-task costs a step rather than the task. `resumed` is a
+        `runs.Mark` to continue from instead of starting — see `resume`. The
+        default is on because the failure it covers is the ordinary one on this
+        host: the gateway 503s for minutes at a time, and a task that has to be
+        re-typed from the beginning every time is a task nobody leaves running.
         """
         def _emit(kind: str, **payload: Any) -> None:
             if progress:
                 progress(kind, payload)
 
+        journal_obj = None
+        if journal:
+            try:
+                maker = runs_mod.Journal(
+                    task, session=getattr(self, "_session_id", ""),
+                    cwd=os.getcwd())
+                journal_obj = maker.adopt(resumed) if resumed is not None else maker
+            except Exception as exc:                  # noqa: BLE001 - see below
+                # Reported, not swallowed, and still fatal to nothing: a run
+                # that cannot record its progress is a worse run than one that
+                # can, and it is not a run that should refuse to start. The
+                # alternative -- raising here -- would trade a lost checkpoint
+                # for a lost task, which is the wrong way round.
+                self._record("journal_unavailable", {"error": str(exc)[:200]},
+                             durable=True)
+                journal_obj = None
+
         # Also attach it to the trace, so records written by forging and
         # self-modification stream live too — not just the loop's own events.
         self._progress = progress
         try:
-            return self._run_locked(task, history, _emit)
+            return self._run_locked(task, history, _emit, journal=journal_obj)
         finally:
             self._progress = None
 
     def _run_locked(self, task: str, history: list[Message] | None,
-                    _emit: Callable[..., None]) -> AgentResult:
+                    _emit: Callable[..., None], *, journal: Any = None) -> AgentResult:
         agent = Agent(
             self.llm, self.registry,
             system_prompt=self._effective_prompt(),
@@ -5583,8 +5794,36 @@ class ForgeAgent:
             steer=self.steer,
             compactor=self.compactor,
             on_compact=self._on_compact,
+            journal=journal,
         )
-        result = agent.run(task, history)
+        # A resumed run is handed the *stored transcript* plus a short
+        # instruction, and this is the shape that makes a resume a resume. The
+        # transcript already ends with the last thing that happened -- an
+        # answer, or a tool result the model has not read -- and the resume
+        # prompt is the next user turn, which is exactly what `Agent.run` would
+        # have appended if a person had typed it. Handing it the original task
+        # text instead would begin the work again from the top, which is a
+        # retry, not a resume, and it is the difference the operator notices as
+        # "it read the same file twice".
+        if journal is not None and getattr(journal, "mark", None) is not None \
+                and journal.mark.prior_run_id:
+            task = runs_mod.resume_prompt(journal.mark)
+            history = list(journal.mark.messages)
+        done = False
+        try:
+            result = agent.run(task, history)
+            done = True
+            return result
+        finally:
+            # A record left standing is the whole mechanism, so it is removed
+            # only when the loop genuinely reached a result. A run that raised,
+            # or that was killed, keeps its record -- which is exactly the case
+            # `resume` exists for.
+            if journal is not None and done:
+                try:
+                    journal.finish()
+                except Exception:                     # noqa: BLE001
+                    pass
         # Token spend for this run, read from the client's own accounting.
         # Without this the number exists only in memory and dies with the
         # process, which is why one run could never be compared to another.

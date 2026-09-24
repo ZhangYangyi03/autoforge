@@ -165,6 +165,7 @@ class Agent:
         steer: Any = None,
         compactor: Any = None,
         on_compact: Callable[[Any], None] | None = None,
+        journal: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -191,12 +192,39 @@ class Agent:
         # deciding a window size for the caller.
         self.compactor = compactor
         self.on_compact = on_compact
+        #: Anything with `beat(msgs, turn=, last_action=)` -- where this loop is,
+        #: written down so a wire that goes down mid-step costs a step rather
+        #: than a task. Optional, and owned from outside: this loop knows the
+        #: moment worth recording, but only the caller knows whether the run is
+        #: one worth resuming. See `autoforge.runs`.
+        self.journal = journal
+        #: The last tool asked for, kept so the checkpoint can say what the run
+        #: was in the middle of doing. A resume prompt that says "you were 4
+        #: turns in" is far weaker than one that says "you had just called
+        #: run_python", and the name is the difference.
+        self._last_tool = ""
         self._terminated: _TerminateSignal | None = None
         #: How many operator lines the last `_absorb` folded in. Reset there, so
         #: a run with no steering channel never reads a stale count.
         self._folded = 0
         if allow_self_terminate:
             self._register_terminate_tool()
+
+    def _beat(self, msgs: list[Message], turn: int, action: str = "") -> None:
+        """Write down where this loop is, and never let that cost the run.
+
+        Guarded, like every other reporter here: a checkpoint that cannot be
+        written must not be the thing that kills the run it was recording. The
+        loud half is on the reading side -- see `runs.scan` and the resume path
+        in `ForgeAgent`, where a record that cannot be interpreted is reported
+        rather than guessed at.
+        """
+        if self.journal is None:
+            return
+        try:
+            self.journal.beat(msgs, turn=turn, last_action=action)
+        except Exception:                             # noqa: BLE001 - see above
+            pass
 
     def _bounded(self, output: str, tool: str) -> str:
         """`output` cut down to the cap before it enters the context.
@@ -450,6 +478,18 @@ class Agent:
                 if event is not None:
                     _notify(self.on_compact, event)
 
+            # Where the loop is, on disk, before the step that might not come
+            # back. The turn boundary is the only safe place: the message list
+            # here is guaranteed to hold whole groups -- an assistant message
+            # and every result answering it -- which is what makes the recorded
+            # transcript something that can be *replayed* rather than a request
+            # that would be malformed. Recording it mid-tool would capture a
+            # call whose result never arrived, and continuing from that is
+            # asking the model to carry on from a step nobody knows the outcome
+            # of.
+            #
+            self._beat(msgs, turn, self._last_tool)
+
             _notify(self.on_request, turn)
             try:
                 resp = self.llm.chat(
@@ -492,6 +532,17 @@ class Agent:
 
             if not resp.tool_calls:
                 return AgentResult(resp.content, msgs, turn, used)
+
+            # The second moment worth recording, and the more important one: the
+            # transcript now ends in an assistant message asking for tools whose
+            # results do not exist yet, which is exactly the shape a resume has
+            # to be able to recognise. Written *before* the tools run, so that a
+            # process that dies inside one of them leaves a record naming the
+            # step in flight -- and a reader can then trim it back to the last
+            # whole group and know the step must be redone. Recorded after, this
+            # beat would never happen at all in the case it exists for.
+            self._last_tool = ", ".join(tc.name for tc in resp.tool_calls)
+            self._beat(msgs, turn, self._last_tool)
 
             for tc in resp.tool_calls:
                 used.append(tc.name)

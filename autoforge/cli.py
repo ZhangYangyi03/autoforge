@@ -1246,12 +1246,24 @@ def cmd_tick(args: argparse.Namespace) -> int:
     now = time.time()
     due = table.due(now)
 
+    # Stranded runs are attended to *before* the schedule and even when nothing
+    # is due. A tick is the only moment this program runs with no person
+    # watching, so a task interrupted by a dropped connection has exactly one
+    # chance to be picked up again, and it is here. Leaving it to a human who
+    # notices is how a resume becomes a thing that never happens.
+    #
+    # Deliberately before the `not due` return, and that order is the whole
+    # change: a schedule with nothing on it and one stranded run is the normal
+    # case, not the edge case.
+    rescued = _resume_stranded(getattr(args, "file", None), args,
+                              budget=getattr(args, "resume_budget", 2))
+
     if not due:
         if not args.quiet:
             upcoming = table.next_due(now)
             print("Nothing is due." if upcoming is None
                   else f"Nothing is due. Next: {upcoming.line(now)}")
-        return 0
+        return 1 if rescued < 0 else 0
 
     if not args.quiet:
         print(f"{len(due)} task(s) due:")
@@ -1288,6 +1300,153 @@ def cmd_tick(args: argparse.Namespace) -> int:
     if failures and not args.quiet:
         print(_c(_D, f"{failures} of {len(due)} task(s) failed."))
     return 1 if failures else 0
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    """`auto runs ...` -- what was interrupted, read from a terminal.
+
+    The third reader of the same records, beside the prompt and the tick. The
+    prompt is how the agent remembers, the tick is how the machine remembers,
+    and this is how the *person* remembers -- which matters because the other
+    two only work if the program starts, and a task interrupted on a machine
+    that is then shut down is only ever picked up by somebody deciding to.
+    """
+    from . import runs as runs_mod
+
+    action = getattr(args, "runs_action", "list")
+
+    if action == "list":
+        print(runs_mod.report())
+        return 0
+
+    if action == "prune":
+        gone = runs_mod.prune()
+        print(f"removed {len(gone)} record(s) past their TTL."
+              if gone else "nothing past its TTL.")
+        return 0
+
+    if action == "drop":
+        if not args.run_id:
+            print("which run? `auto runs list` shows the ids.")
+            return 2
+        hit = [m for m in runs_mod.unfinished()
+               if m.run_id == args.run_id or m.run_id.startswith(args.run_id)]
+        if not hit:
+            print(f"no unfinished run {args.run_id!r}.")
+            return 2
+        for mark in hit:
+            try:
+                runs_mod._path(mark.run_id).unlink()
+            except OSError as exc:
+                print(f"could not drop {mark.run_id}: {exc}")
+                return 1
+            print(f"dropped {mark.run_id} ({mark.task[:80]})"
+                  + (f" -- {args.why}" if args.why else ""))
+        return 0
+
+    # resume
+    pick = []
+    if args.run_id:
+        hit = [m for m in runs_mod.unfinished()
+               if m.run_id == args.run_id or m.run_id.startswith(args.run_id)]
+        if not hit:
+            print(f"no unfinished run {args.run_id!r}.")
+            return 2
+        mark = hit[0]
+        status, reason = mark.claim()
+        if status != "resumable":
+            print(f"{mark.run_id} is {status}: {reason}")
+            return 2
+        pick = [mark]
+    else:
+        pick = runs_mod.resumable()
+    if not pick:
+        print("nothing to resume. " + (runs_mod.report() or ""))
+        return 0
+    if not args.do_all:
+        pick = pick[:1]
+    pick = pick[:max(1, args.budget)]
+
+    cfg = _config(args)
+    agent = _build_mode(cfg, args.mode)
+    failed = 0
+    for mark in pick:
+        print(f"=== resuming {mark.run_id}: {mark.task[:100]} ===")
+        print(f"    {mark.claim()[1]}")
+        live = _LiveRun().start()
+        try:
+            # Through the same `run` entry point the tools use, so a resumed run
+            # is an ordinary run: it beats, it can be interrupted again, and it
+            # closes its own record only if it reaches a result.
+            result = agent.run(args.task or mark.task, progress=live,
+                               resumed=mark)
+        except Exception as exc:                      # noqa: BLE001 - reported
+            failed += 1
+            print(f"    still interrupted: {type(exc).__name__}: {exc}")
+        else:
+            print((result.content or "").strip()[:1500])
+        finally:
+            live.stop()
+    return 1 if failed else 0
+
+
+def _resume_stranded(store: str | None, args: argparse.Namespace, *,
+                     budget: int = 2) -> int:
+    """Pick up interrupted runs, newest trouble first. Returns how many resumed.
+
+    Bounded by `budget` per tick, and that bound is a cost decision rather than
+    caution. A tick that finds six stranded records and resumes all six spends
+    six full model conversations in one unattended wake-up; a tick that resumes
+    two works through a backlog over the following wakes, which is what a
+    scheduler is for. The records are not lost by being left -- each carries the
+    attempt count that eventually marks it stale.
+
+    Never raises. This runs inside the OS wake-up, where an exception means the
+    machine's one unattended moment is spent on a traceback -- and the report is
+    worth more here than in a log nobody reads, which is why a resume that fails
+    is printed with the reason instead.
+    """
+    from . import runs as runs_mod
+
+    try:
+        pick = runs_mod.resumable()[:max(0, budget)]
+    except Exception as exc:                          # noqa: BLE001
+        if not getattr(args, "quiet", False):
+            print(f"unfinished runs: unreadable ({type(exc).__name__}: {exc})")
+        return 0
+    if not pick:
+        return 0
+
+    if not getattr(args, "quiet", False):
+        print(f"{len(pick)} interrupted run(s) to pick up:")
+        for mark in pick:
+            print(f"  {mark.run_id} {mark.turns} turn(s) in: {mark.task[:90]}")
+
+    # The model is built here and not before, for the same reason the schedule
+    # builds it only when something is due: a machine with no network must be
+    # able to tick without a failure.
+    cfg = _config(args)
+    agent = _build_mode(cfg, args.mode)
+    resumed = 0
+    for mark in pick:
+        live = _LiveRun().start()
+        try:
+            result = agent.run(mark.task, progress=live, resumed=mark)
+        except Exception as exc:                      # noqa: BLE001 - recorded below
+            note = f"{type(exc).__name__}: {exc}"
+            if not getattr(args, "quiet", False):
+                print(f"  {mark.run_id}: still interrupted -- {note[:200]}")
+            # The record is left standing on purpose: another attempt is what
+            # the attempt counter is for, and after MAX_RESUMES it reports
+            # itself stale rather than looping.
+            continue
+        finally:
+            live.stop()
+        resumed += 1
+        if not getattr(args, "quiet", False):
+            head = (result.content or "").strip().splitlines()
+            print(f"  {mark.run_id}: done -- {head[0][:160] if head else '(no output)'}")
+    return resumed
 
 
 def cmd_mission(args: argparse.Namespace) -> int:
@@ -1562,6 +1721,26 @@ def build_parser() -> argparse.ArgumentParser:
                                    "$AUTOFORGE_HOME/schedule.jsonl)")
     tk.add_argument("--mode", choices=list(MODES), default="standard",
                     help="which agent runs the due tasks")
+    tk.add_argument("--resume-budget", dest="resume_budget", type=int, default=2,
+                    help="how many interrupted runs this tick picks up "
+                         "(default 2; 0 disables it)")
+
+    rs = sub.add_parser(
+        "runs", help="what was interrupted, and pick it up again")
+    rs.add_argument("runs_action", nargs="?", default="list",
+                    choices=["list", "resume", "drop", "prune"],
+                    help="list (default) | resume | drop | prune")
+    rs.add_argument("--id", dest="run_id", default="",
+                    help="a run id or its prefix (resume/drop)")
+    rs.add_argument("--task", default="",
+                    help="pursue this instead of the recorded task")
+    rs.add_argument("--why", default="", help="why a run is not wanted (drop)")
+    rs.add_argument("--mode", choices=list(MODES), default="standard",
+                    help="which agent carries the work on")
+    rs.add_argument("--all", dest="do_all", action="store_true",
+                    help="resume every resumable run, not just one")
+    rs.add_argument("--budget", type=int, default=3,
+                    help="cap on how many to resume (default 3)")
 
     b = sub.add_parser(
         "bus", help="talk to another session working in this repo "
@@ -1590,6 +1769,7 @@ def command_table() -> dict[str, Any]:
         "run": cmd_run,
         "modes": cmd_modes,
         "tick": cmd_tick,
+        "runs": cmd_runs,
         "bus": cmd_bus,
         "mission": cmd_mission,
     }

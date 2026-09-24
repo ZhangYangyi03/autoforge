@@ -86,6 +86,59 @@ class Message:
             msg["name"] = self.name
         return msg
 
+    # -- persistence ---------------------------------------------------
+    def to_dict(self) -> dict[str, Any]:
+        """This message as plain data, for a journal that outlives the process.
+
+        The whole message, not a summary: a checkpoint that kept only the text
+        would lose the tool calls, and a transcript whose tool calls are missing
+        is not a transcript the model can be asked to continue -- it is a
+        different conversation that happens to end with the same sentence.
+        """
+        data: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            data["tool_calls"] = [
+                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                for tc in self.tool_calls
+            ]
+        if self.tool_call_id:
+            data["tool_call_id"] = self.tool_call_id
+        if self.name:
+            data["name"] = self.name
+        if self.images:
+            data["images"] = self.images
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Message":
+        """The inverse of `to_dict`, tolerant of a row written by older code.
+
+        Tolerant rather than strict because the reader is a resume path: it runs
+        precisely when something has already gone wrong, and a journal written
+        by the version before this one must not be the second failure. A missing
+        field is a default; an unknown field is ignored.
+        """
+        if not isinstance(data, dict):
+            return cls("user", str(data))
+        calls = [
+            ToolCall(
+                id=str(tc.get("id") or f"call_{tc.get('name') or 'unknown'}"),
+                name=str(tc.get("name") or ""),
+                arguments=(tc.get("arguments") if isinstance(tc.get("arguments"), dict)
+                           else {}),
+            )
+            for tc in (data.get("tool_calls") or [])
+            if isinstance(tc, dict)
+        ]
+        return cls(
+            role=data.get("role") or "user",
+            content=data.get("content") or "",
+            tool_calls=calls,
+            tool_call_id=data.get("tool_call_id"),
+            name=data.get("name"),
+            images=(data.get("images") if isinstance(data.get("images"), list) else None),
+        )
+
     # -- constructors -------------------------------------------------
     @classmethod
     def system(cls, content: str) -> "Message":
