@@ -57,6 +57,12 @@ class ForgeResult:
     #: tool was not judged, so nothing about it is known -- which is why this
     #: must never be reported as "the forge failed".
     aborted: bool = False
+    #: Set when the candidate was built and verified but its *name* was already
+    #: taken. The tool did not fail; it was refused, and the difference decides
+    #: what the caller says. Without this the caller read `ok=False` and reported
+    #: the need as unservable, when the truth was "a tool beside this one already
+    #: exists" -- the opposite advice.
+    replace_conflict: str = ""
 
     @property
     def ok(self) -> bool:
@@ -132,7 +138,8 @@ class ForgePipeline:
 
     # -- the loop --------------------------------------------------------
     def forge(self, need: str, context: str = "",
-              should_abort: Callable[[], bool] | None = None) -> ForgeResult:
+              should_abort: Callable[[], bool] | None = None,
+              replace: bool = False) -> ForgeResult:
         """Run the loop until a tool is sealed, the rounds run out, or the
         operator says something.
 
@@ -215,9 +222,34 @@ class ForgePipeline:
                                     else "promote_on_pass is off"
                                 ),
                             })
-                        self.registry.register(spec)
-                        attempt.accepted = True
-                        result.spec = spec
+                        # `replace=False`: a forge is not a deliberate
+                        # replacement. This call used to inherit
+                        # `register(replace=True)`, so a candidate that happened
+                        # to be named like a tool already in the library
+                        # overwrote it -- no refusal, no mention in the reply.
+                        # The ledger shows 8 accepted forges landing on a name
+                        # already taken, and `chrome_cdp_drive` reaching version
+                        # 3 that way. Evolve is the path that replaces on
+                        # purpose; it judges the old against the new first.
+                        try:
+                            self.registry.register(spec, replace=replace)
+                        except ValueError as exc:
+                            attempt.accepted = False
+                            # Not a failed round: the tool was built and
+                            # verified. Re-asking the model to "repair" an
+                            # already-working tool would spend the rest of the
+                            # budget on the wrong problem, so this stops the
+                            # loop and hands the fact to the caller.
+                            futile = True
+                            result.replace_conflict = str(exc)
+                            attempt.error = (
+                                "refused: %s -- the tool was verified, but this "
+                                "library already holds that name. Evolve it, or "
+                                "forge under a name that says what is different."
+                                % exc)
+                        else:
+                            attempt.accepted = True
+                            result.spec = spec
                     else:
                         spec.state = ToolState.DRAFT
                         feedback = self._feedback(report)
@@ -284,6 +316,8 @@ class ForgePipeline:
         self._emit("forge_done", {
             "need": need, "ok": result.ok, "rounds": result.rounds,
             "name": getattr(result.spec, "name", None),
+            **({"replace_conflict": result.replace_conflict}
+               if result.replace_conflict else {}),
         })
         return result
 

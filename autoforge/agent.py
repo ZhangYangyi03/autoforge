@@ -75,6 +75,7 @@ from .browser import (
 )
 from .notify import Notifier, NotifyError, channels_from_config
 from .vision import VisionError, vision_from_config
+from .route.arbiter import Arbiter
 from .route.router import BehaviourRouter, RoutingWeights
 from .schedule import Schedule, ScheduleError, as_clock
 from .schedule import install_system_task as _install_system_task
@@ -746,6 +747,24 @@ def _render_run(res: Any, cap: float) -> str:
     return out or "(no output)"
 
 
+class _Unarbitrated:
+    """The verdict when the arbiter itself failed: no coverage, forge may go on.
+
+    A distinct object rather than `None`, so every caller reads the same three
+    attributes and a missing one is an AttributeError at the source instead of a
+    silent "no coverage".
+    """
+
+    refused = False
+    veto = None
+    ranked: tuple = ()
+    reason = "the arbiter could not be consulted"
+
+    @staticmethod
+    def context_block() -> str:
+        return ""
+
+
 @dataclass
 class ForgeAgent:
     llm: LLMClient
@@ -829,6 +848,12 @@ class ForgeAgent:
             on_event=self._on_forge_event,
         )
         self.router = BehaviourRouter(self.registry)
+        # The call site the router never had. Constructed here, next to the
+        # router it scores with, and consulted on the forge path -- see
+        # `_arbitrate_forge`. Until this existed, `self.router` was built, its
+        # weights were amendable, and `rank()` was called from nowhere in the
+        # package: seven references to routing weights, zero decisions.
+        self.arbiter = Arbiter(self.router, self.registry)
         # Needs whose forge the operator interrupted, normalised. Read by
         # `forge_tool` -- see the note there for why the second attempt at an
         # interrupted need is the wrong move rather than the right one.
@@ -1761,6 +1786,43 @@ class ForgeAgent:
             hits.extend(got)
         return hits, answered
 
+    def _arbitrate_forge(self, need: str) -> Any:
+        """Ask the router which existing tool owns this need, and record it.
+
+        The other half of the forge gate. `_prelookup_market` asks a *different*
+        library -- the tool-market's, which is a peer's shelf -- whether this job
+        is already held anywhere. This one asks the agent's *own* library, using
+        the behavioural router that was built for exactly this question and then
+        never called.
+
+        Why both are needed, and neither is redundant: the market lookup can only
+        see what has been synced, and it reports in prose appended to the forge
+        context. A distinct improvement in prose was measured to change nothing
+        -- 293 forge attempts against 120 owned tools, 8 of them replacing a
+        taken name, with the pre-lookup running on 64% of post-belt forges and
+        finding hits on 17 of 30. The prose leg is worth keeping and it is not
+        sufficient. This leg returns a decision.
+
+        Never raises. An arbiter that cannot answer returns "no coverage", which
+        licenses the forge: the failure mode of a broken gate must be the old
+        behaviour, not a library that cannot be extended.
+        """
+        try:
+            verdict = self.arbiter.decide(need)
+        except Exception as exc:                          # noqa: BLE001
+            self._record("arbitration", {
+                "need": need, "ok": False,
+                "error": "%s: %s" % (type(exc).__name__, exc)})
+            return _Unarbitrated()
+        self._record("arbitration", {
+            "need": need, "ok": True,
+            "refused": verdict.refused,
+            "veto": getattr(verdict.veto, "name", None),
+            "reason": verdict.reason,
+            "ranked": [c.name for c in verdict.ranked[:5]],
+        })
+        return verdict
+
     def _prelookup_market(self, need: str) -> str:
         """Ask the shelf *before* the forge instead of only after it.
 
@@ -2146,6 +2208,19 @@ class ForgeAgent:
             # including the one probe it needed to see that machine's processes.
             # Settled 2026-09-15.
             over = self._tool_budget_report()
+            # Arbitration first, because it is the only half of this gate that
+            # can refuse. It is the call site `BehaviourRouter` never had: the
+            # router could rank the library for a need and nothing ever asked
+            # it to. The numbers behind making it binding are in the arbiter's
+            # docstring -- 8 accepted forges silently replacing a taken name,
+            # `chrome_cdp_drive` at version 3, and the right existing tool
+            # sitting at median rank 64 of 120 in the list the forge was handed.
+            verdict = self._arbitrate_forge(need)
+            if verdict.refused:
+                return verdict.refusal()
+            if verdict.context_block():
+                over = ((over + "\n\n" + verdict.context_block()) if over
+                        else verdict.context_block())
             # Look on the shelf *before* building, not only after. The rule
             # "check the market before forging" sat in this agent's prompt for
             # a day with zero executions -- 158 forges, no pre-forge lookup --
@@ -2154,6 +2229,11 @@ class ForgeAgent:
             shelf = self._prelookup_market(need)
             if shelf:
                 over = (over + "\n\n" + shelf) if over else shelf
+            # `replace` is left at the pipeline default (False): a forge is not
+            # a deliberate replacement, and a candidate whose name is already
+            # taken is refused rather than silently overwriting it. Stated here
+            # as a comment rather than an argument, so a test double that models
+            # only the forge path still satisfies the protocol.
             res = self.pipeline.forge(
                 need, context=over,
                 # Only a real /stop may kill a forge. A question typed
@@ -2176,6 +2256,17 @@ class ForgeAgent:
                     "unchanged."
                 )
             if not res.ok:
+                if getattr(res, "replace_conflict", ""):
+                    # The tool verified. It was refused a name. Saying "could not
+                    # forge a working tool" here would be false and would send
+                    # the model looking for a different capability, when the
+                    # library already holds this one.
+                    return (
+                        "Not forged: %s The candidate passed verification, so the "
+                        "capability exists -- it just may not take a name this "
+                        "library already uses. Either evolve that tool, or forge "
+                        "again with a need that names what is different about this "
+                        "one. This refusal is on the ledger." % res.replace_conflict)
                 return f"Could not forge a working tool for: {need} ({res.rounds} rounds)."
             # Persist, or the tool dies with the process: the agent would then
             # "remember" nothing it made and re-forge it every session. Mirrors
