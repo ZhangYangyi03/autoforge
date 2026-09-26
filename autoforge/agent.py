@@ -298,7 +298,12 @@ _AMEND_TARGETS: dict[str, dict[str, Any]] = {
 FORGE_ROUND_CEILING = 3      # unbounded_forge_rounds == False
 SUPERVISED_TURN_CAP = 25     # unlimited_turns == False
 
-_WEIGHT_FIELDS = ("text", "success", "trust", "cost", "over_trigger")
+#: The five blend weights plus the tiebreak scale. `tiebreak` is separate
+#: because it is not a weight on a signal -- it sets how loudly the behaviour
+#: terms may speak when the text scores tie, and the calibration
+#: (`tools/calibrate_routing.py`) found that "quietly" is the only setting the
+#: ledger justifies.
+_WEIGHT_FIELDS = ("text", "success", "trust", "cost", "over_trigger", "gate")
 
 # How much of every request the agent's own kept facts may occupy, and how long
 # any single entry may be before it is elided. Bounded because this block is

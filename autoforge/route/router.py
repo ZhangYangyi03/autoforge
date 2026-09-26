@@ -63,17 +63,75 @@ def text_similarity(query: str, spec: ToolSpec) -> float:
 
 @dataclass
 class RoutingWeights:
+    """The retrieval taste, as numbers that were measured rather than chosen.
+
+    These shipped as 1.0 / 1.2 / 0.8 / 0.5 / 0.6, picked by taste and never
+    scored. `tools/calibrate_routing.py` scores them against two ground-truth
+    sets that were already on disk:
+
+      probes  312 (query, expect=call) pairs from the tools' own TriggerProbes,
+              plus 312 (negative_query) pairs they must NOT win. Model-written
+              from the description, so lexical access is easy. Necessary, not
+              sufficient.
+      forged  117 accepted forges: real needs, written with no knowledge of what
+              the tool would one day be called, against the library as it stood
+              at that moment. The only set that is not partly the router's echo.
+
+    The old numbers were not slightly wrong, they were the wrong shape. `success`
+    and `trust` do not depend on the query -- they are per-tool constants -- so
+    as additive terms they are a fixed bonus on every query, and the more weight
+    they carry the more they drown out the only term that answers "which tool for
+    THIS need". Raising them to catch a flaky tool also promotes it for needs it
+    has nothing to do with.
+
+        5-fold CV, 114 forged cases                top1    recall@5
+          shipped 1.0 / 1.2 / 0.8 / 0.5 / 0.6      0.183     0.228
+          text only                                0.570     0.833
+          text + availability gate + trust tiebreak 0.570    0.833
+
+    So the two questions are separated, because they are different questions:
+
+    *Relevance* is `text * gate`. The gate is `min(1, success_rate / gate)` --
+      a proven-broken tool is scaled toward zero, and a healthy one is scaled by
+      exactly 1.0. It never rewards. A tool with too few calls to judge keeps
+      its default 0.5, which is exactly the threshold, so it is not penalised
+      for being new. On the real corpus this fires on 1 of 120 tools (22 of the
+      24 judged tools are at success 1.0), so it costs nothing measurable and
+      stops a never-working tool from outranking a working one on the strength
+      of its name.
+
+    *Trust* is a weak tiebreak (`trust`, default 0.1). It is small on purpose:
+      it orders two candidates that match the need equally well -- a probed
+      tool ahead of a probationary one -- and is too small to reorder candidates
+      that differ in relevance.
+
+    `cost` and `over_trigger` default to 0 because they are 0.0 for all 120
+    tools: `cost_hint` is "cheap" everywhere and `trigger_misses` is unpopulated.
+    A term that cannot vary is not evidence, and leaving it non-zero is how the
+    old numbers went wrong. They stay tunable for when the ledger fills in.
+
+    `amend_self(routing_weights=...)` still edits all of these.
+    """
     text: float = 1.0
-    success: float = 1.2
-    trust: float = 0.8
-    cost: float = 0.5
-    over_trigger: float = 0.6
+    #: Additive weight on success. 0 on purpose: success is not a gradient of
+    #: relevance. The `gate` below is where it acts.
+    success: float = 0.0
+    #: Weak tiebreak. Orders equally-relevant candidates; too small to reorder
+    #: candidates that differ in relevance.
+    trust: float = 0.1
+    cost: float = 0.0
+    over_trigger: float = 0.0
     min_calls_for_success: int = 3
+    #: Success rate below which a tool's relevance is scaled down; 0 disables.
+    #: A tool at exactly this rate is scaled by 1.0, which is why the 0.5
+    #: default for unjudged tools costs them nothing.
+    gate: float = 0.5
 
     def to_dict(self) -> dict[str, float]:
         return {
             "text": self.text, "success": self.success, "trust": self.trust,
             "cost": self.cost, "over_trigger": self.over_trigger,
+            "gate": self.gate,
         }
 
 
@@ -119,8 +177,16 @@ class BehaviourRouter:
         if st.calls:
             over = min(1.0, st.trigger_misses / max(st.calls, 1))
 
+        # Relevance and availability are different questions and are scored
+        # separately. `gate` scales relevance by whether the tool works at all --
+        # never above 1.0, so a good record is not a bonus on an unrelated need;
+        # at most 1.0, so an unjudged tool (success defaulted to 0.5, exactly the
+        # threshold) is not penalised for being new.
+        gate = 1.0
+        if w.gate > 0:
+            gate = max(0.0, min(1.0, success / w.gate))
         total = (
-            w.text * text
+            w.text * gate * text
             + w.success * success
             + w.trust * trust
             - w.cost * cost
@@ -131,6 +197,7 @@ class BehaviourRouter:
             score=total,
             breakdown={
                 "text": w.text * text,
+                "gate": gate,
                 "success": w.success * success,
                 "trust": w.trust * trust,
                 "cost": -w.cost * cost,
@@ -164,6 +231,20 @@ def skill_similarity(query: str, skill: Any) -> float:
     return _cosine(_tokens(query), _tokens(fields))
 
 
+#: The skill router's own defaults. It cannot share the tool router's: the two
+#: evidence terms are different things. A tool's `success` is a rate over all
+#: calls and is folded into availability (`gate`), which is why its additive
+#: weight is 0. A skill's evidence is `proven` -- how many times it was opened --
+#: and it is the ONLY signal distinguishing two skills that read alike, so
+#: zeroing it would make the router blind to the exact failure it exists for.
+#:
+#: Uncalibrated, and labelled so: there is no skill ledger with ground truth to
+#: replay, unlike the 114 forged needs behind the tool weights above. The number
+#: is 1.0 because it is known to work, not because it was measured.
+SKILL_WEIGHTS = RoutingWeights(
+    text=1.0, success=1.0, trust=0.0, cost=0.0, over_trigger=0.0, gate=0.0)
+
+
 class SkillRouter:
     """Rank skills by fit, blended with evidence that they have been used.
 
@@ -185,7 +266,10 @@ class SkillRouter:
 
     def __init__(self, library: Any, *, weights: RoutingWeights | None = None) -> None:
         self.library = library
-        self.weights = weights or RoutingWeights()
+        # Not `RoutingWeights()`: the tool defaults put 0 on `success` because
+        # for tools success is folded into the availability gate instead. For
+        # skills it is the evidence term itself. See SKILL_WEIGHTS.
+        self.weights = weights or SKILL_WEIGHTS
 
     def score(self, query: str, skill: Any) -> RouteCandidate:
         w = self.weights
@@ -212,6 +296,7 @@ class SkillRouter:
 
 
 __all__ = [
-    "BehaviourRouter", "RoutingWeights", "RouteCandidate", "text_similarity",
+    "BehaviourRouter", "RoutingWeights", "RouteCandidate", "SKILL_WEIGHTS",
+    "text_similarity",
     "SkillRouter", "skill_similarity",
 ]

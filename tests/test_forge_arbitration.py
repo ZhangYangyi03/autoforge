@@ -156,6 +156,11 @@ class TestForgePathCallsIt:
         for s in specs:
             a.registry.register(s)
         a.arbiter = Arbiter(_Router(pairs), a.registry)
+        # The forge path also looks on the shared market shelf, which is a real
+        # socket. Stub it: this test is about the ranking, and a network call
+        # makes it slow in proportion to how busy the machine is (measured:
+        # 17s vs 0.2s), which is not something a unit test should depend on.
+        a._prelookup_market = lambda need: ""
         return a
 
     def test_the_ranking_reaches_the_forge_context(self):
