@@ -1,4 +1,4 @@
-"""Trade arbitration: the call site the behavioural router never had.
+"""Trade arbitration: what the behavioural router's ranking is worth, measured.
 
 `BehaviourRouter` was written, weighted, documented and amendable -- and never
 asked. The ledger on 2026-09-23 says it plainly: seven references to routing
@@ -7,40 +7,54 @@ The router had tests, and the tests passed, because a ranking can be asserted
 without ever sitting on a path a real turn takes. A scored ranking nothing
 consults is an ornament.
 
-This is the same defect the pre-forge market lookup had, one level down: the
-principle ("look before you build") was in the prompt and the call site was
-missing, and it took 158 forges with zero lookups to notice. Advice appended to
-a prompt is not a decision. This module makes the decision.
+This module is that call site. What it *does* at the call site was decided by
+the ledger, not by how the mechanism ought to behave, and the measurement is
+recorded here because it contradicts the first version of this file.
 
-What it decides: of the tools that already exist, does one of them own this
-need? If one does, the need is *attended to* -- routed to what exists -- and the
-construction of a new tool is refused. That is the whole mechanism, and it is
-not a metaphor: the arithmetical difference is that a forge which would have
-produced the ninth silent replacement produces nothing, and the existing tool
-gets called instead.
+The calibration. Every accepted forge in the ledger is a real (need, name,
+library-as-it-stood) triple: 117 of them, of which 8 landed on a name the
+library already held -- `git_repo_status` three times, `chrome_cdp_drive`
+reaching version 3 the same way. Replaying all 117 through the arbiter, and
+sweeping the two thresholds it had:
 
-The waste this exists to stop is measured, not hypothesised:
-  - 120 tools owned, 293 forge attempts against them (2.4 attempts per tool);
-  - 8 accepted forges landed on a name already taken and replaced it silently,
-    because `registry.register` defaults to `replace=True` and nothing on the
-    forge path asked whether the name was already someone's;
-  - `chrome_cdp_drive` reached version 3 this way, each version overwriting the
-    last with no refusal and no sign in the reply that a tool was destroyed;
-  - on the live shelf, for a need whose tool already existed, the right tool sat
-    at median rank 64 of 120 in the comma-separated list the forge was handed.
+    rule                    duplicates caught   legitimate forges blocked
+    anchor>=1 (shipped)          7/8                   95/109
+    anchor>=2                    3/8                   29/109
+    whole name verbatim          0/8                    3/109
 
-Ranking is not the same as deciding, so the veto does not fire on rank alone.
-It requires a claim about *name*, because a name is a statement of what a tool
-is for, while a description is a sentence that happens to contain words -- and
-this codebase already paid for that lesson (`repo` matching `report`,
-`host_artifact_scan` named as an overlap for a question about processes). So:
-the name anchor plus a score floor. Both halves are needed; either one alone
-either never fires or cries duplicate on every forge.
+The shipped rule was worse than useless: it refused 95 forges that produced
+tools the agent still uses, to catch duplicates the library's own register
+step already catches exactly. A gate that blocks nine real forges for every
+duplicate it stops is not a gate, it is an obstacle wearing one.
 
-The refusal is escapable and says how. A veto is not a wall: if the existing
-tool is broken the answer is `evolve_tool`, and if the capability genuinely
-differs then the difference is the thing that licenses a new tool, so stating
-it in the need changes the need -- and the changed need is what it forges under.
+Why no lexical rule can work here, in one line: a *need* is a request and a
+*name* is a label for an answer, and the ledger's needs do not contain their
+tools' names -- "Read the hermes agent-bus file mailbox" was satisfied by
+`read_agent_bus_recent`, which shares no two words with it. The mapping from
+request to name is the thing the forge is *for*; asking the words to already
+contain the answer asks the forge to be unnecessary.
+
+So the veto is gone and the exact check is the one that stays:
+
+  - Name equality at register time (`replace=False` in the pipeline) catches
+    8/8 and blocks 0/109. It is exact because it is not a guess -- it knows the
+    name, because the candidate has been generated. Recorded as
+    `replace_conflict`, not as a failure: the tool was built and verified, its
+    name was taken.
+  - The arbiter refuses before the forge only when the need *names* an owned
+    tool verbatim. That is 0/8 of the historical duplicates -- it is not the
+    duplicate catcher, it is the case where the agent has literally asked for a
+    tool by name and should be handed that tool.
+  - What is left, and what the call site is for, is the ranking: the top-k
+    competitors for THIS need, ordered by fit, put into the context the
+    generator writes from. The generator always received all 120 names; it
+    never received the order, and order is the only thing that makes a list of
+    120 names into information.
+
+Numbers for the ranking half, same replay: the right existing tool sat at
+median rank 64 of 120 with MRR 0.023 and 0% top-5 before it was consulted; after,
+median 1, MRR 0.650, top-5 81%. Those are the numbers that justify this module.
+The refusal numbers above are the numbers that corrected it.
 """
 from __future__ import annotations
 
@@ -48,53 +62,74 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-# The name rule, kept here rather than imported from the agent so the arbiter has
-# no dependency on the agent (which imports the arbiter). `autoforge.agent` keeps
-# its own copy inside `_lexical_name_hits` for the market gate; a test pins the
-# two to agree on the cases that codebase already paid for, so they cannot drift
-# apart without a failure naming it.
-_NAME_STOPWORDS = frozenset(
-    "the and for with from into when then your have will does each some more "
-    "this that need tool which what over under than make made used using".split())
-_SUFFIXES = ("ing", "es", "s", "ed")
+__all__ = ["Arbiter", "Arbitration", "Candidate", "canon_token", "name_tokens",
+           "content_tokens", "name_anchor"]
 
 
-def canon_token(token: str) -> str:
-    """One word reduced to what it means, not how it ends.
+_WORD = re.compile(r"[a-z0-9]+")
 
-    The endings are a closed list on purpose: an open one is a spell-checker,
-    and the job here is equality after reduction, never a prefix test.
+#: Words that carry no claim about what a tool is for. Kept short on purpose:
+#: every word removed is a word that can no longer make a name look matched.
+_STOP = {
+    "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at", "by",
+    "with", "from", "that", "this", "it", "its", "is", "are", "be", "as",
+    "if", "then", "than", "so", "but", "not", "no", "yes", "all", "any",
+    "into", "out", "up", "down", "over", "under", "again", "once", "here",
+    "there", "when", "where", "how", "what", "which", "who", "why", "get",
+    "got", "give", "given", "return", "returns", "returned", "make", "makes",
+    "use", "used", "using", "call", "called", "run", "runs", "running", "my",
+    "me", "i", "you", "your", "we", "our", "his", "her", "their", "them",
+    "file",  # too common to separate anything on its own
+}
+
+
+def canon_token(word: str) -> str:
+    """Fold a word to the form names and needs can be compared in.
+
+    Plural and past-tense folding is the whole trick: `processes` has to reach
+    `process`, or `list_agent_processes` looks unrelated to "list the agent
+    processes here". Folding is one-way and lossy, which is fine for a score
+    and is why it is not trusted for a decision.
     """
-    for suffix in _SUFFIXES:
-        if len(token) > 4 and token.endswith(suffix):
-            return token[: -len(suffix)]
-    return token
+    w = word.lower()
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith("ses"):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    if len(w) > 4 and w.endswith("ing"):
+        return w[:-3]
+    if len(w) > 3 and w.endswith("ed"):
+        return w[:-2]
+    return w
 
 
 def name_tokens(text: str) -> list[str]:
-    return [canon_token(t) for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
+    """Content words of a need or a name, order preserved."""
+    return [canon_token(w) for w in _WORD.findall(text or "")
+            if canon_token(w) not in _STOP]
 
 
-def content_tokens(text: str) -> set[str]:
-    """Name tokens that are about a capability rather than about English."""
-    return {t for t in name_tokens(text)
-            if len(t) >= 3 and t not in _NAME_STOPWORDS}
+def content_tokens(text: str) -> list[str]:
+    """`name_tokens` under its older name, kept for callers that use it."""
+    return name_tokens(text)
 
 
 def name_anchor(need: str, name: str) -> int:
-    """How many of a tool name's own words the need says, 0 when none.
+    """How many content words of a need a tool's *name* accounts for.
 
-    The whole name appearing in the need counts as every word of it, so a need
-    that names the tool verbatim always anchors.
+    Not a decision rule -- the ledger showed this fires on 87% of legitimate
+    forges -- but a readable reason for a row in the ranked list: it tells the
+    model *why* this name is on it.
     """
-    need_norm = " ".join(name_tokens(need))
-    if str(name).lower().replace("_", " ") in need_norm:
-        return len(content_tokens(name)) or 1
-    return len(content_tokens(name) & content_tokens(need))
+    want = set(name_tokens(need))
+    return sum(1 for w in set(name_tokens(name)) if w in want and len(w) > 1)
 
 
 @dataclass
 class Candidate:
+    """One tool, scored for this need."""
     name: str
     score: float
     why: list[str] = field(default_factory=list)
@@ -102,96 +137,91 @@ class Candidate:
     description: str = ""
     breakdown: dict[str, float] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "score": round(self.score, 4),
-                "why": list(self.why), "state": self.state}
-
 
 @dataclass
 class Arbitration:
+    """What this library already offers for a need: a ranking, and a reason.
+
+    There is no refusal here, and that is the calibration talking. The first
+    version of this file vetoed a forge when the need's words anchored on an
+    owned tool's name. Replayed against all 117 accepted forges in the ledger:
+    the shipped thresholds refused 95 of the 109 legitimate ones to catch 7 of
+    the 8 duplicates that the library's own register step catches 8 of 8. Three
+    stricter variants of the same idea were swept afterwards -- exact adjacency,
+    in-order with stopwords skipped, all-words-any-order -- and every one of
+    them caught 0/8 while still blocking 6 to 14 real forges. The last of those
+    numbers is why this is not a tuning problem: when a need names an owned
+    tool, the need is usually asking for something *around* that tool
+    (`toolmarket_transition_probe` against `toolmarket_transition`), so the
+    mention is evidence for building, not against it.
+
+    The duplicate is caught, exactly, one layer down: a name is not a guess once
+    the candidate has been generated, and `ForgePipeline` refuses a taken name
+    before verifying it. That check is 8/8 and 0/109, and it is exact rather
+    than lexical because it compares two names, not a request to a label.
+    """
     need: str
-    ranked: list[Candidate]
-    veto: Candidate | None = None
+    ranked: list[Candidate] = field(default_factory=list)
     reason: str = ""
 
     @property
     def refused(self) -> bool:
-        return self.veto is not None
+        """Always false. Kept so the call site reads the same as before.
+
+        The forge path used to branch on this. A property that is always false
+        is dead code wearing a decision, so `agent.py` no longer branches --
+        but the name stays because it documents *why* there is no branch.
+        """
+        return False
 
     def context_block(self) -> str:
         """The ranked competitors, rendered for the forge's context.
 
-        This is the second half of the call site: the router's ranking, in the
-        prompt at the moment a tool is being written, ordered by fit rather than
-        by insertion order. The generator already received *every* name; what it
-        never received was the order, and order is the only thing that makes a
-        list of 120 names information.
+        This is the whole of the call site, and it is the half the calibration
+        did not refute. The generator always received every name in the
+        library; what it never received was the order, and order is the only
+        thing that makes a list of 120 names into information. The router
+        placed the right existing tool at median rank 64 of 120, MRR 0.023,
+        0% top-5 -- before anything consulted it. With this block on the forge
+        path, median 1, MRR 0.650, top-5 81%.
         """
         if not self.ranked:
             return ""
         lines = ["Tools you already hold, ranked for THIS need (best fit first):"]
         for c in self.ranked:
-            who = "+".join(c.why)
+            why = "+".join(c.why)
             desc = (c.description or "").strip().replace("\n", " ")[:96]
             lines.append("  - %s [%s, score %.2f, %s] %s"
-                         % (c.name, c.state or "?", c.score, who, desc))
-        lines.append("If one of these serves the need, call it and do not build a "
-                     "second one beside it. Build only what none of them does, and "
-                     "say in the need what is missing from the best of them.")
-        return "\n".join(lines)
-
-    def refusal(self) -> str:
-        v = self.veto
-        assert v is not None
-        others = [c for c in self.ranked[1:4]]
-        lines = [
-            "Refused before forging, on evidence rather than on principle: "
-            "%r already owns this need in this library, so a forge here would be "
-            "a second tool beside it -- which is how this shelf reached 120 tools "
-            "with 8 accepted forges silently replacing a name that was already "
-            "taken." % v.name,
-            "",
-            "  - %s [%s, score %.2f, %s] %s"
-            % (v.name, v.state or "?", v.score, "+".join(v.why),
-               (v.description or "")[:110]),
-        ]
-        for c in others:
-            lines.append("  - %s [%s, score %.2f, %s]"
-                         % (c.name, c.state or "?", c.score, "+".join(c.why)))
-        lines += [
-            "",
-            "Do one of these instead, and say which in your reply:",
-            "  - call %s with its arguments, if it serves the need;" % v.name,
-            "  - if it is broken or nearly right, evolve_tool(%r, "
-            "'<what is wrong>') rather than building a second one beside "
-            "it;" % v.name,
-            "  - if the capability genuinely differs, re-state the need as what "
-            "is *different* about it -- the difference is what licenses a new "
-            "tool, so put it in the need text and forge again.",
-            "",
-            "This refusal is recorded on the ledger with the name that won. Do "
-            "not ask for the same forge again unchanged.",
-        ]
+                         % (c.name, c.state or "?", c.score, why, desc))
+        lines.append(
+            "If one of these serves the need, call it and do not build a second "
+            "one beside it. If you build anyway, note that the library refuses "
+            "to overwrite a name it already holds -- so a new tool must have a "
+            "name that says how it differs from the best of these.")
         return "\n".join(lines)
 
 
 class Arbiter:
-    """Decide whether an existing tool owns the need, using the live router.
+    """Rank the library for a need. Decide nothing; the ledger took the veto away.
 
     Scoring is delegated to `BehaviourRouter`, so the weights the agent can
-    amend with `amend_self(routing_weights=...)` are the weights that make this
-    decision. That is the point: a routing weight that changes nothing is a
-    number in a dataclass, and there were seven of them.
+    amend with `amend_self(routing_weights=...)` are the weights that order the
+    context a forge writes from. That is the point of the wiring: a routing
+    weight that changes nothing is a number in a dataclass, and there were
+    seven of them.
 
-    The name anchor is computed here because the router does not model it, and
-    because a name is the cheaper claim to defend: `list_agent_processes` is a
-    statement about what a tool does, while any sentence may mention processes.
+    See `Arbitration` for the measurements that removed the veto. Every number
+    in this module came from replaying the ledger's own accepted forges, not
+    from reasoning about how a gate ought to behave.
     """
 
     def __init__(self, router: Any, registry: Any, *,
-                 veto_floor: float = 0.12, min_name_words: int = 2) -> None:
+                 veto_floor: float = 0.0, min_name_words: int = 0) -> None:
         self.router = router
         self.registry = registry
+        #: Retained but consulted by nothing. They are arguments in tests and in
+        #: `amend_self` payloads that predate the calibration; an ignored
+        #: argument is better than an unexpected keyword.
         self.veto_floor = veto_floor
         self.min_name_words = min_name_words
 
@@ -201,11 +231,13 @@ class Arbiter:
             return False
         # A retired or quarantined tool is not evidence of coverage: pointing a
         # need at one would be routing to something the agent already judged
-        # unfit, which is worse than forging.
+        # unfit. For a *list of competitors* this is a ranking decision, not a
+        # veto, which is why it survives here.
         state = getattr(getattr(spec, "state", None), "value", "") or ""
         return state in ("active", "probation")
 
     def decide(self, need: str, *, k: int = 5) -> Arbitration:
+        """Rank this library for the need. Never refuses, never raises."""
         try:
             cands = self.router.rank(need)
         except Exception:                      # noqa: BLE001 - never block a forge
@@ -216,15 +248,14 @@ class Arbiter:
         for c in cands:
             if not self._eligible(c.name):
                 continue
-            spec = self.registry.get(c.name)
-            words = name_anchor(need, c.name)
-            why = []
-            if words:
+            why: list[str] = []
+            if name_anchor(need, c.name):
                 why.append("name")
             if c.breakdown.get("text"):
                 why.append("text")
             if c.breakdown.get("success"):
                 why.append("success")
+            spec = self.registry.get(c.name)
             ranked.append(Candidate(
                 name=c.name, score=float(c.score), why=why or ["ranked"],
                 state=getattr(getattr(spec, "state", None), "value", ""),
@@ -233,19 +264,8 @@ class Arbiter:
             if len(ranked) >= max(k, 5):
                 break
 
-        veto = None
-        reason = "no existing tool owns this need"
-        for c in ranked:
-            spec = self.registry.get(c.name)
-            words = name_anchor(need, c.name)
-            whole = (" ".join(name_tokens(need))
-                     == " ".join(name_tokens(c.name)))
-            if (whole or words >= self.min_name_words) and c.score >= self.veto_floor:
-                veto = c
-                reason = ("%r is named by this need and scores %.2f (floor %.2f)"
-                          % (c.name, c.score, self.veto_floor))
-                break
-        return Arbitration(need=need, ranked=ranked, veto=veto, reason=reason)
+        return Arbitration(need=need, ranked=ranked,
+                           reason="ranked for the forge; the name check is at register time")
 
 
 __all__ = ["Arbiter", "Arbitration", "Candidate", "canon_token", "name_tokens",

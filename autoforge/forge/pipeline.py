@@ -202,11 +202,48 @@ class ForgePipeline:
                         break
                     spec = self._to_spec(generated)
 
-                    report = self.verifier.verify(spec, self.config.sample_args)
+                    # The name is known the moment the candidate exists, and
+                    # this is the only point on the path where the duplicate
+                    # can be refused *exactly* and *cheaply*. Exactly, because
+                    # two names are compared rather than a request against a
+                    # label; cheaply, because verification -- a sandbox run,
+                    # a trigger probe, a negative probe -- has not happened
+                    # yet. Replayed over the ledger's 117 accepted forges this
+                    # is 8/8 duplicates caught and 0/109 legitimate forges
+                    # blocked. The pre-forge lexical veto that used to sit in
+                    # `Arbiter` was 7/8 and 95/109; see `route/arbiter.py` for
+                    # that table. Order matters here, so it is asserted in
+                    # `tests/test_forge_arbitration.py` rather than assumed.
+                    taken = (not replace
+                             and self.registry.get(spec.name) is not None)
+                    if taken:
+                        attempt.accepted = False
+                        result.replace_conflict = (
+                            "%r is already in this library" % spec.name)
+                        attempt.error = (
+                            "refused before verification: this library already "
+                            "holds a tool named %r, and a forge is not a "
+                            "deliberate replacement. Evolve it, or forge under "
+                            "a name that says what is different." % spec.name)
+                        self._emit("name_taken", {
+                            "need": need, "name": spec.name,
+                            "round": attempt.round,
+                        })
+                        futile = True
+                        # Fall through to the attempt record at the bottom of
+                        # the loop rather than `continue` or `break`. Both jump
+                        # past that record, and a refusal with no
+                        # `forge_attempt` row reads on the ledger as a forge
+                        # that ran and produced nothing -- the opposite of what
+                        # happened. `futile` ends the loop after the record.
+                        report = None
+                    else:
+                        report = self.verifier.verify(spec, self.config.sample_args)
                     attempt.report = report
-                    spec.verification = report.to_dict()
+                    if report is not None:
+                        spec.verification = report.to_dict()
 
-                    if report.passed:
+                    if report is not None and report.passed:
                         if self._may_promote():
                             spec.state = ToolState.ACTIVE
                         else:
@@ -250,9 +287,14 @@ class ForgePipeline:
                         else:
                             attempt.accepted = True
                             result.spec = spec
-                    else:
+                    elif report is not None:
                         spec.state = ToolState.DRAFT
                         feedback = self._feedback(report)
+                    # `report is None` is the name-taken refusal: there is no
+                    # verdict to feed back and no repair to ask for, because
+                    # nothing about the candidate was judged -- its name was
+                    # taken before verification ever ran. `futile` already
+                    # ended the loop; `feedback` is left untouched.
                 except LLMAborted:
                     # The operator's line, arriving inside a model call. Not a
                     # failure and not a round: nothing about the candidate was

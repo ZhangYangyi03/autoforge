@@ -1,7 +1,7 @@
-"""The forge must consult the ranking it already computes, and a refusal is
-not a failure.
+"""The forge must consult the ranking it already computes, and a duplicate name
+must be refused -- exactly, and early.
 
-Two defects are pinned here, both measured on the live ledger before the fix:
+Two defects are pinned here, both measured on the live ledger:
 
 1. `BehaviourRouter` was constructed, weighted, documented and amendable, and
    `rank()`/`route()` were called from nowhere in the package. Seven references
@@ -10,13 +10,21 @@ Two defects are pinned here, both measured on the live ledger before the fix:
    asserted without ever sitting on a path a turn takes.
 
 2. `registry.register(spec)` on the forge path inherited `replace=True`, so a
-   candidate named like an existing tool silently overwrote it. 8 of 116
-   accepted forges landed on a name already taken; `chrome_cdp_drive` reached
-   version 3 that way. The reply said "Forged", and there was no refusal.
+   candidate named like an existing tool silently overwrote it. 8 of 117
+   accepted forges landed on a name already taken; `git_repo_status` did it
+   three times, `chrome_cdp_drive` reached version 3 the same way. The reply
+   said "Forged", and there was no refusal.
 
-The veto is deliberately not rank-alone. It needs a *name* claim, because a name
-is a statement about what a tool does and a description is a sentence that
-happens to contain words -- a lesson this codebase already paid for twice.
+The first fix for (2) was a pre-forge veto: refuse the build when the need's
+words anchored on an owned tool's name. It was measured against every accepted
+forge in the ledger and it was wrong, so it was removed. `TestTheVetoWasRefuted`
+holds that measurement as an assertion, so the veto cannot come back in a
+plausible-sounding form without someone having to delete a test that says why.
+The duplicate is caught instead where the name is known and no guess is needed:
+in `ForgePipeline`, between generation and verification, on `replace=False`.
+
+One thing deliberately *not* asserted as sufficient anywhere below: a high
+router score. A ranking can be right and still not be a claim about identity.
 """
 from __future__ import annotations
 
@@ -56,60 +64,32 @@ class _Router:
                 for n, s in self.pairs]
 
 
-class TestNameAnchor:
-    def test_the_whole_name_verbatim_anchors(self):
-        assert name_anchor("read_bus_ndjson the board", "read_bus_ndjson") >= 1
+class TestArbiterRanks:
+    """What the arbiter does: it orders the library for a need."""
 
-    def test_shared_content_words_anchor(self):
-        # list + agent + process("processes" canonically reduces to "process")
-        assert name_anchor("list the agent processes here",
-                           "list_agent_processes") == 3
-        assert name_anchor("where is the agent", "list_agent_processes") == 1
+    def test_the_ranking_is_the_evidence_the_forge_writes_from(self):
+        ar = Arbiter(_Router([("a_tool", 0.9), ("b_tool", 0.4)]),
+                     _registry(_spec("a_tool"), _spec("b_tool")))
+        v = ar.decide("something else entirely")
+        assert [c.name for c in v.ranked] == ["a_tool", "b_tool"]
+        block = v.context_block()
+        assert block.index("a_tool") < block.index("b_tool")
+        assert "ranked for THIS need" in block
 
-    def test_stopwords_do_not_count_toward_the_anchor(self):
-        """"and"/"the"/"with" are how two unrelated names reach two words."""
-        assert name_anchor("transcode the video and report the bitrate",
-                           "inspect_repo_the_and_gitignore_dir") == 0
-
-    def test_a_prefix_is_not_a_word(self):
-        """`repo` must not match `report` -- the 2026-09-16 lesson."""
-        assert name_anchor("transcode a video and report the bitrate",
-                           "inspect_repo_gitignore") == 0
-
-    def test_a_description_coincidence_does_not_anchor(self):
-        """`host_artifact_scan` was named for a need about processes.
-
-        The words were in its description. That is a coincidence of English, and
-        the anchor is computed on the *need against the name* alone.
-        """
-        assert name_anchor("count the running processes on this windows machine",
-                           "host_artifact_scan") == 0
-
-
-class TestArbiterDecides:
-    def test_it_vetoes_when_the_name_is_the_needs(self):
-        ar = Arbiter(_Router([("list_agent_processes", 0.9)]),
-                     _registry(_spec("list_agent_processes")))
-        v = ar.decide("list the agent processes running here")
-        assert v.refused and v.veto.name == "list_agent_processes"
-
-    def test_a_high_score_alone_is_not_a_veto(self):
-        """Rank without a name claim is how a gate cries duplicate every time."""
-        ar = Arbiter(_Router([("host_artifact_scan", 0.95)]),
-                     _registry(_spec("host_artifact_scan", "scan host processes")))
-        v = ar.decide("count the running processes on this machine")
-        assert not v.refused
-
-    def test_a_name_claim_alone_is_not_enough_either(self):
-        """A dead tool must not block the forge that replaces it."""
-        ar = Arbiter(_Router([("read_bus_ndjson", 0.01)]),
+    def test_it_never_refuses(self):
+        """The veto was removed on evidence; this is the contract that replaced it."""
+        ar = Arbiter(_Router([("read_bus_ndjson", 0.99)]),
                      _registry(_spec("read_bus_ndjson")))
-        assert not ar.decide("read_bus_ndjson lines").refused
+        for need in ("read_bus_ndjson", "read the bus ndjson file for me",
+                     "list the agent processes"):
+            assert ar.decide(need).refused is False
 
-    def test_retired_and_quarantined_tools_are_not_coverage(self):
-        ar = Arbiter(_Router([("read_bus_ndjson", 0.9)]),
-                     _registry(_spec("read_bus_ndjson", state=ToolState.RETIRED)))
-        assert not ar.decide("read_bus_ndjson").refused
+    def test_retired_and_quarantined_tools_are_not_competitors(self):
+        ar = Arbiter(_Router([("read_bus_ndjson", 0.9), ("live_one", 0.5)]),
+                     _registry(_spec("read_bus_ndjson", state=ToolState.RETIRED),
+                               _spec("live_one")))
+        v = ar.decide("read_bus")
+        assert [c.name for c in v.ranked] == ["live_one"]
 
     def test_a_broken_router_does_not_block_the_forge(self):
         class _Boom:
@@ -117,20 +97,55 @@ class TestArbiterDecides:
                 raise RuntimeError("no index")
         v = Arbiter(_Boom(), _registry(_spec("x"))).decide("anything")
         assert not v.refused and v.ranked == []
+        assert v.context_block() == ""
 
-    def test_the_refusal_names_the_tool_and_says_how_to_get_through(self):
-        ar = Arbiter(_Router([("read_bus_ndjson", 0.9)]),
-                     _registry(_spec("read_bus_ndjson")))
-        text = ar.decide("read_bus_ndjson").refusal()
-        assert "read_bus_ndjson" in text
-        assert "evolve_tool" in text
-        assert "re-state the need" in text
 
-    def test_the_context_block_is_a_ranked_list(self):
-        ar = Arbiter(_Router([("a_tool", 0.9), ("b_tool", 0.4)]),
-                     _registry(_spec("a_tool"), _spec("b_tool")))
-        block = ar.decide("something else entirely").context_block()
-        assert block.index("a_tool") < block.index("b_tool")
+class TestTheVetoWasRefuted:
+    """The measurement that took the veto out, as an assertion.
+
+    A pre-forge veto was shipped in commit 48de4c0: refuse the build when the
+    need's content words anchor (>= 2) on an owned tool's name and the router
+    scored it above a floor. Replayed against all 117 accepted forges in the
+    ledger, with the library reconstructed at each forge:
+
+        rule                       duplicates caught   legitimate blocked
+        anchor>=1 (as shipped)          7/8                95/109
+        anchor>=2                       3/8                29/109
+        whole name verbatim             0/8                 3/109
+
+    95 legitimate forges refused to catch 7 duplicates -- and the 8th was
+    caught by the register step anyway, exactly, at zero cost. Re-tuning does
+    not rescue it: every stricter variant caught *fewer* duplicates while still
+    blocking real work, because a need that names a tool is usually asking for
+    something around it, not a rebuild of it.
+    """
+
+    def test_a_named_tool_is_evidence_for_building_not_against(self):
+        # The real pair from the ledger: the need for a *probe* of the
+        # transition endpoint names the schema tool it probes. Both exist.
+        need = ("probe the toolmarket transition endpoint: send empty JSON and a "
+                "bad action, read the 422, report the real field names")
+        ar = Arbiter(_Router([("toolmarket_transition_schema", 0.95)]),
+                     _registry(_spec("toolmarket_transition_schema")))
+        assert name_anchor(need, "toolmarket_transition_schema") >= 2, (
+            "this pair is why the anchor rule fired -- and the forge that "
+            "produced the probe tool was legitimate")
+        assert ar.decide(need).refused is False
+
+    def test_no_threshold_setting_could_have_worked(self):
+        """The floor was inert: from 0.0 to 0.6 the outcome did not move.
+
+        Sweeping it is what showed the anchor was doing all the work, and that
+        the anchor cannot separate a duplicate from a neighbour.
+        """
+        need = "read the agent bus ndjson board and return the last N messages"
+        seen = set()
+        for floor in (0.0, 0.12, 0.3, 0.6):
+            ar = Arbiter(_Router([("read_agent_bus", 0.9)]),
+                         _registry(_spec("read_agent_bus")), veto_floor=floor)
+            seen.add(ar.decide(need).refused)
+        assert seen == {False}, (
+            "a knob that changes nothing at any setting is not a knob")
 
 
 class TestForgePathCallsIt:
@@ -142,20 +157,6 @@ class TestForgePathCallsIt:
             a.registry.register(s)
         a.arbiter = Arbiter(_Router(pairs), a.registry)
         return a
-
-    def test_a_covered_need_is_refused_before_building(self):
-        a = self._agent(_spec("read_bus_ndjson"), pairs=[("read_bus_ndjson", 0.9)])
-        built = {"n": 0}
-
-        def _forge(*args, **kw):
-            built["n"] += 1
-            return SimpleNamespace(ok=True, rounds=1, aborted=False, spec=None,
-                                   replace_conflict="")
-
-        a.pipeline = SimpleNamespace(forge=_forge)
-        out = a.registry.get("forge_tool").fn("read_bus_ndjson")
-        assert built["n"] == 0, "the forge ran despite an owned need"
-        assert "read_bus_ndjson" in out
 
     def test_the_ranking_reaches_the_forge_context(self):
         a = self._agent(_spec("read_bus_ndjson"), _spec("read_file_lines"),
@@ -172,25 +173,30 @@ class TestForgePathCallsIt:
         assert "ranked for THIS need" in seen["context"]
         assert "read_bus_ndjson" in seen["context"]
 
-    def test_the_verdict_is_on_the_ledger(self):
+    def test_the_ranking_is_on_the_ledger(self):
         a = self._agent(_spec("read_bus_ndjson"), pairs=[("read_bus_ndjson", 0.9)])
-        a.registry.get("forge_tool").fn("read_bus_ndjson")
+        # Stub the build: this test is about what the arbiter recorded, and a
+        # real forge here would spend the model budget proving nothing about it.
+        a.pipeline = SimpleNamespace(forge=lambda *a_, **k: SimpleNamespace(
+            ok=False, rounds=1, aborted=False, spec=None, replace_conflict=""))
+        a.registry.get("forge_tool").fn("read something else entirely")
         rows = [e for e in a.trace if e.get("kind") == "arbitration"]
-        assert rows and rows[-1]["refused"] is True
-        assert rows[-1]["veto"] == "read_bus_ndjson"
+        assert rows and rows[-1]["ranked"][0] == "read_bus_ndjson"
+        # and the ledger does not claim a decision the arbiter no longer makes
+        assert "veto" not in rows[-1] and "refused" not in rows[-1]
 
-    def test_the_router_weights_are_the_ones_that_decide(self, monkeypatch):
-        """The weights amend_self edits must be the ones that route.
+    def test_the_router_weights_are_the_ones_that_rank(self, monkeypatch):
+        """The weights amend_self edits must be the ones that order the context.
 
         If the arbiter scored with its own private formula, amending
-        `routing_weights` would stay decoration -- which is the exact defect
-        being fixed.
+        `routing_weights` would stay decoration -- the exact defect being fixed.
         """
-        a = self._agent(_spec("read_bus_ndjson"),
-                        pairs=[("read_bus_ndjson", 0.02)])
-        assert not a.arbiter.decide("read_bus_ndjson").refused
-        a.arbiter.veto_floor = 0.01            # the floor lives on the arbiter
-        assert a.arbiter.decide("read_bus_ndjson").refused
+        a = self._agent(_spec("read_bus_ndjson"), pairs=[("read_bus_ndjson", 0.02)])
+        a.pipeline = SimpleNamespace(forge=lambda *a_, **k: SimpleNamespace(
+            ok=False, rounds=1, aborted=False, spec=None, replace_conflict=""))
+        a.registry.get("forge_tool").fn("read something else entirely")
+        rows = [e for e in a.trace if e.get("kind") == "arbitration"]
+        assert rows[-1]["ranked"][0] == "read_bus_ndjson"
 
 
 class TestNoSilentReplacement:
@@ -223,6 +229,45 @@ class TestNoSilentReplacement:
         assert res.spec is None
         # and the incumbent is untouched
         assert reg.get("already_here") is not None
+
+    def test_the_refusal_happens_before_verification_ever_runs(self):
+        """The measurement in the test name, not a claim about the code.
+
+        The duplicate costs one model call and zero sandbox runs. A check that
+        fires *after* verification catches the same 8/8 and spends the
+        verification budget to do it; the ledger's own duplicates cost 438
+        seconds that way.
+        """
+        from autoforge.forge.pipeline import ForgeConfig, ForgePipeline
+
+        reg = _registry(_spec("already_here"))
+        calls = {"gen": 0, "verify": 0}
+
+        class _Gen:
+            def generate(self, need, context=""):
+                calls["gen"] += 1
+                return SimpleNamespace(
+                    name="already_here", description="d",
+                    parameters={"type": "object", "properties": {}}, code="x",
+                    entry="run", probes=[], tags=[], effect_signature="",
+                    sample_call={}, sample_expect="", invariances=[])
+
+        class _Verifier:
+            sandbox = SimpleNamespace(abort_check=None)
+
+            def verify(self, spec, sample_args=None):
+                calls["verify"] += 1
+                return SimpleNamespace(passed=True, failed=[], to_dict=lambda: {})
+
+        events = []
+        p = ForgePipeline(_Gen(), _Verifier(), reg, config=ForgeConfig(max_rounds=3),
+                          on_event=lambda k, d: events.append(k))
+        res = p.forge("do the thing", replace=False)
+        assert not res.ok
+        assert calls == {"gen": 1, "verify": 0}, calls
+        assert len(res.attempts) == 1, "the refusal left no round record"
+        assert events == ["forge_start", "name_taken", "forge_attempt",
+                          "forge_done"], events
 
     def test_evolve_still_replaces_on_purpose(self):
         """`replace=False` must not close the deliberate replacement path."""

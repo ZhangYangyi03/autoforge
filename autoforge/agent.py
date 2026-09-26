@@ -1816,8 +1816,10 @@ class ForgeAgent:
             return _Unarbitrated()
         self._record("arbitration", {
             "need": need, "ok": True,
-            "refused": verdict.refused,
-            "veto": getattr(verdict.veto, "name", None),
+            # No "refused"/"veto": the arbiter ranks, it does not veto. The
+            # duplicate is refused in the pipeline on the generated name, and
+            # that is recorded there as a `name_taken` event. Keeping the old
+            # keys here would put a decision on the ledger that was never made.
             "reason": verdict.reason,
             "ranked": [c.name for c in verdict.ranked[:5]],
         })
@@ -2215,9 +2217,13 @@ class ForgeAgent:
             # docstring -- 8 accepted forges silently replacing a taken name,
             # `chrome_cdp_drive` at version 3, and the right existing tool
             # sitting at median rank 64 of 120 in the list the forge was handed.
+            # No `if verdict.refused` branch: the arbiter's veto was removed
+            # after the ledger refuted it (7/8 duplicates caught, 95/109
+            # legitimate forges blocked -- see `route/arbiter.py`). The
+            # duplicate is now refused exactly and cheaply in the pipeline, on
+            # the generated name, before verification. What remains here is the
+            # ranking, which is the half the measurement supported.
             verdict = self._arbitrate_forge(need)
-            if verdict.refused:
-                return verdict.refusal()
             if verdict.context_block():
                 over = ((over + "\n\n" + verdict.context_block()) if over
                         else verdict.context_block())
