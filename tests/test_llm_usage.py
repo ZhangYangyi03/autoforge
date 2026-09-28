@@ -158,3 +158,36 @@ def test_accounting_folds_one_response_in():
 
     assert totals == {"calls": 1, "prompt_tokens": 7, "cached_tokens": 5,
                       "completion_tokens": 3}
+
+
+def test_the_failover_chain_reports_the_spend_it_carried():
+    """A chain in front of the clients must not swallow the counters.
+
+    The ledger writes token spend with `getattr(llm, "usage_total", {})`.
+    `FailoverClient` had no `usage_total`, so the getattr's default hid the
+    hole: every run behind a `fallbacks` list recorded `usage: {}` from
+    2026-09-17 on, and an empty counter reads exactly like a run that cost
+    nothing. The attribute is the fix; this test is what stops it being
+    dropped again, because the failure mode is silent by construction.
+    """
+    from autoforge.core.llm import FailoverClient
+
+    a = MockLLMClient(script=[LLMResponse(content="a", usage={
+        "prompt_tokens": 100, "completion_tokens": 10,
+        "prompt_tokens_details": {"cached_tokens": 90}})])
+    b = MockLLMClient(script=[LLMResponse(content="b", usage={
+        "prompt_tokens": 50, "completion_tokens": 5})])
+    chain = FailoverClient([a, b])
+
+    a.chat(MSGS)
+    b.chat(MSGS)
+
+    assert chain.usage_total == {"calls": 2, "prompt_tokens": 150,
+                                 "cached_tokens": 90, "completion_tokens": 15}
+    assert chain.cache_hit_rate == pytest.approx(90 / 150)
+
+
+def test_an_empty_chain_is_zero_rather_than_missing():
+    from autoforge.core.llm import FailoverClient
+
+    assert FailoverClient([MockLLMClient()]).usage_total == new_usage_totals()

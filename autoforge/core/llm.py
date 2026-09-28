@@ -672,6 +672,26 @@ class FailoverClient(LLMClient):
             client.abort_check = predicate
 
     @property
+    def usage_total(self) -> dict[str, int]:
+        """The chain's own accounting, summed over the endpoints that served it.
+
+        The run reads `getattr(self.llm, "usage_total", {})` to write token
+        spend into the ledger. That attribute existed on `OpenAICompatClient`
+        and on the mock, but not here -- so from the day a `fallbacks` list put
+        a FailoverClient in front of the clients (2026-09-17), every run
+        recorded `usage: {}`, and the one number that says whether the prompt
+        prefix is worth caching stopped being written down at all. A missing
+        attribute that `getattr(..., default)` hides is worse than a missing
+        one that raises: the counter read as a real, empty result.
+        """
+        total = new_usage_totals()
+        for client in self.clients:
+            u = getattr(client, "usage_total", None) or {}
+            for k in total:
+                total[k] += int(u.get(k, 0) or 0)
+        return total
+
+    @property
     def cache_hit_rate(self) -> float:
         """Aggregate, not the first client's: the number answers "is the prefix
         stable enough to cache", and with a failover chain that is a question
