@@ -792,6 +792,36 @@ class ToolStore:
     def lineage_of(self, tool: str, depth: int = 3) -> dict[str, Any]:
         """Derivation edges actually recorded for a tool -- not inferred ones."""
         return chaining.lineage_of(self._conn, tool, depth=depth)
+    def last_called_by_tool(self) -> dict[str, float]:
+        """Newest `call` event per tool, from the ledger.
+
+        The ledger is the only complete record of what was used: `call` events
+        are appended for every tool the loop ran, while a tool's own
+        `stats.last_called` is only written back when something saves the tool,
+        which is rare. That asymmetry is why the exposure decision can be made
+        from the ledger and not from the registry.
+
+        One pass over one indexed column. The result is held by the registry
+        until a call happens, so this runs once per tool call, not once per
+        turn, and the prompt does not move between turns that call nothing.
+        """
+        newest: dict[str, float] = {}
+        try:
+            rows = self._conn.execute(
+                "SELECT timestamp, payload FROM forge_events"
+                " WHERE kind='call' ORDER BY id"
+            ).fetchall()
+        except Exception:                                     # noqa: BLE001
+            return newest
+        for r in rows:
+            try:
+                name = _unjson(r["payload"]).get("tool")
+            except Exception:                                 # noqa: BLE001
+                continue
+            if name:
+                newest[name] = float(r["timestamp"])
+        return newest
+
     def get_events(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM forge_events ORDER BY id DESC LIMIT ?",

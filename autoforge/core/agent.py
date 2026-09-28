@@ -166,6 +166,7 @@ class Agent:
         compactor: Any = None,
         on_compact: Callable[[Any], None] | None = None,
         journal: Any = None,
+        exposure: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -198,6 +199,13 @@ class Agent:
         #: moment worth recording, but only the caller knows whether the run is
         #: one worth resuming. See `autoforge.runs`.
         self.journal = journal
+        #: Anything with `exposure(protect=...) -> (hot, cold_lines, counts)`:
+        #: the split between tool schemas that ride in every request and tools
+        #: that are only named. Optional, and None means every visible tool is
+        #: sent in full -- the behaviour before this existed, which is what a
+        #: bare loop and every test that does not care about cost should get.
+        #: See `autoforge/tools/exposure.py` for the measured reason it exists.
+        self.exposure = exposure
         #: The last tool asked for, kept so the checkpoint can say what the run
         #: was in the middle of doing. A resume prompt that says "you were 4
         #: turns in" is far weaker than one that says "you had just called
@@ -225,6 +233,50 @@ class Agent:
             self.journal.beat(msgs, turn=turn, last_action=action)
         except Exception:                             # noqa: BLE001 - see above
             pass
+
+    def _request(self, msgs: list[Message]) -> tuple[list[Message], list[dict[str, Any]]]:
+        """The messages and schemas for one request.
+
+        Two things differ from `msgs` itself, and both are deliberate:
+
+        * only the *hot* tool schemas are sent as tools;
+        * the cold ones ride as one extra user message, placed immediately
+          after the system prompt rather than at the end.
+
+        The position is a cost decision. The provider bills a prompt prefix from
+        cache only while it is byte-identical to the last request, and this
+        block changes exactly when a tool is called -- so putting it early means
+        a turn that calls nothing re-bills nothing, and the growing conversation
+        behind it is the only part that moves. At the end it would sit after the
+        whole conversation and be cached anyway; the reason for the front is
+        that a model reads instructions before the transcript, and a list of
+        what it has is an instruction, not a remark.
+
+        A cold tool stays callable and stays discoverable. What is not sent is
+        its parameter schema, which for 61 tools that were never called is the
+        bulk of what this saves.
+        """
+        if self.exposure is None:
+            return msgs, self.registry.schemas()
+        try:
+            hot, cold_lines, stats = self.exposure.exposure()
+        except Exception:                                     # noqa: BLE001
+            # A cost optimisation must never be the thing that loses the run.
+            # Falling back to sending everything is the pre-existing behaviour:
+            # expensive and correct.
+            return msgs, self.registry.schemas()
+        if not cold_lines:
+            return msgs, hot
+        from ..tools.exposure import manifest_header
+        block = (manifest_header(stats, getattr(self.exposure, "window_days", 7.0))
+                 + "\n" + "\n".join(cold_lines))
+        # Copied, never appended to `msgs`: the transcript on disk is the
+        # conversation, and a block injected per request that became part of the
+        # record would be replayed by a resume as something the person said.
+        req = list(msgs)
+        insert_at = 1 if msgs and msgs[0].role == "system" else 0
+        req.insert(insert_at, Message.user(block))
+        return req, hot
 
     def _bounded(self, output: str, tool: str) -> str:
         """`output` cut down to the cap before it enters the context.
@@ -492,8 +544,9 @@ class Agent:
 
             _notify(self.on_request, turn)
             try:
+                _req_msgs, _req_tools = self._request(msgs)
                 resp = self.llm.chat(
-                    msgs, tools=self.registry.schemas(),
+                    _req_msgs, tools=_req_tools,
                     # The cheap step: a question is reason enough to go round
                     # again and answer it, because nothing is lost by asking a
                     # request twice. Long steps ask the narrower question.

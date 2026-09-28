@@ -101,6 +101,33 @@ class ToolRegistry:
         # this to include DRAFT so a tool can be tested before it is trusted.
         self.visible_states = visible_states or {ToolState.PROBATION, ToolState.ACTIVE}
         self._events: list[dict[str, Any]] = []
+        #: Where "when was this last called" comes from. A callable rather than
+        #: a field because the answer outlives this process: the registry's own
+        #: `spec.stats.last_called` is only as good as the last `save_tool`, and
+        #: a call is not a state change, so most calls are never written back.
+        #: The ledger has every call; this is how the ledger gets asked. None
+        #: falls back to `spec.stats.last_called`, which is the right answer for
+        #: a bare registry with no store behind it (tests, embedders).
+        self.last_called_source: Callable[[str], float | None] | None = None
+        #: Calls made through this registry, which is what makes the exposure
+        #: cache below safe to keep: the thing the exposure depends on -- how
+        #: recently each tool was used -- can only change when a call happens.
+        #: How many days of silence demote a tool from "carried in full" to
+        #: "named on a list". A week, because the ledger says that is roughly
+        #: the working set: 40 of 204 tools on this machine at 7 days, 143 at
+        #: 14. Read by the exposure cache's key and by the block that explains
+        #: the demotion to the model, so the sentence and the behaviour cannot
+        #: disagree.
+        self.window_days = 7.0
+        #: Names to keep hot whatever the ledger says, set by the caller per
+        #: run. A *past* record cannot answer whether a tool is wanted for
+        #: *this* task, and the run that needs a tool it has not used this week
+        #: is exactly the run whose first turn would otherwise not carry it.
+        self.protect: set[str] = set()
+        self._calls_seen = 0
+        self._exposure_cache: tuple[Any, ...] | None = None
+        self._exposure_result: tuple[list[dict[str, Any]], list[str],
+                                     dict[str, int]] | None = None
 
     @property
     def _plane(self) -> Any:
@@ -162,6 +189,72 @@ class ToolRegistry:
             include = self.visible_states
         return [s.schema for s in self._tools.values() if s.state in include]
 
+    # -- exposure: what rides in every request, and what is only listed -----
+    def days_since_called(self, name: str) -> float | None:
+        """How long ago this tool was last called, or None if never.
+
+        The ledger first, `spec.stats` second. The order matters: a call is not
+        a state change, so `stats.last_called` only survives processes where
+        something happened to save the tool -- which is to say, almost never.
+        The ledger answers for every call ever made on this machine, which is
+        the only source with enough rows to demote anything honestly.
+        """
+        if self.last_called_source is not None:
+            try:
+                ts = self.last_called_source(name)
+            except Exception:                             # noqa: BLE001
+                ts = None
+            if ts:
+                return max(0.0, (time.time() - float(ts)) / 86400.0)
+        spec = self._tools.get(name)
+        if spec is None or not spec.stats.last_called:
+            return None
+        return max(0.0, (time.time() - spec.stats.last_called) / 86400.0)
+
+    def exposure(self, *, window_days: float | None = None,
+                 protect: "Iterable[str] | None" = None,
+                 include: "set[ToolState] | None" = None
+                 ) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+        """(hot schemas, cold lines, counts) for the next request.
+
+        Cached until a call happens or the hour turns over, because those are
+        the only two things that can change the answer. Without the cache this
+        would run a query per tool per turn, which is a real cost paid to save a
+        real cost; with it, the prompt it builds is byte-identical between two
+        turns that made no call, which is what the provider's prefix cache needs.
+
+        The hour is in the key because a call is *not* the only thing that moves
+        the answer -- time does. A tool called yesterday is hot for seven days
+        and must go cold on the eighth without anybody calling anything. A cache
+        keyed only on the call counter gets that right for every session that
+        restarts, and wrong for one that stays up: measured from the counter
+        alone, a long-lived session would keep yesterday's working set for as
+        long as it ran. One bucket per hour bounds the error at an hour and
+        re-bills a prompt prefix once an hour, which is nothing against a window
+        measured in days.
+        """
+        from . import exposure as exposure_mod
+
+        if window_days is None:
+            window_days = self.window_days
+        if protect is None:
+            protect = self.protect
+        key = (round(window_days, 4), tuple(sorted(protect)),
+               tuple(sorted(s.value for s in (include or self.visible_states))),
+               self._calls_seen, len(self._tools),
+               int(time.time() // 3600))
+        if self._exposure_cache == key and self._exposure_result is not None:
+            return self._exposure_result
+        result = exposure_mod.split(
+            self.schemas(include=include) if include is not None else self.schemas(),
+            self.days_since_called,
+            window_days=window_days,
+            protect=protect,
+        )
+        self._exposure_cache = key
+        self._exposure_result = result
+        return result
+
     # -- invocation ----------------------------------------------------
     def call(self, name: str, arguments: dict[str, Any], *, force: bool = False) -> ToolResult:
         spec = self._tools.get(name)
@@ -180,6 +273,12 @@ class ToolRegistry:
         blocked = self._gate(spec, name, arguments)
         if blocked is not None:
             return blocked
+
+        # Only here: after the state check and after the gate. A tool that was
+        # quarantined or that the operator refused did not run, and counting it
+        # as used would keep a tool hot on the strength of calls it never made.
+        self._calls_seen += 1
+        spec.stats.last_called = time.time()
 
         started = time.perf_counter()
         try:

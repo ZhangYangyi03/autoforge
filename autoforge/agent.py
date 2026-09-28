@@ -607,6 +607,12 @@ BUILTIN_SCOPES: dict[str, str] = {
     "verify_ledger": "local_write",
     "list_tools": "read_only",
     "find_gaps": "read_only",
+    # Handing back one tool's schema is a read of the registry in this process.
+    # Missing here until 2026-09-28, and the same way the mission_* rows above
+    # were: an undeclared builtin is gated by every switched-off freedom at
+    # once, so the tool that is the way to reach a demoted tool could not be
+    # called in the one session most likely to need it.
+    "describe_tool": "read_only",
     # Procedures. Reading one is a read; writing or retiring one edits a file
     # under the skills directories and the index row that points at it.
     "skill_list": "read_only",
@@ -1010,6 +1016,7 @@ class ForgeAgent:
         self._tool_autonomy()
         self._tool_source()
         self._tool_list()
+        self._tool_describe()
         self._tool_evaluate()
         self._tool_gaps()
         self._tool_retire()
@@ -2711,6 +2718,52 @@ class ForgeAgent:
             description="List your tools with their lifecycle state and health.",
             parameters={"type": "object", "properties": {}},
             fn=list_tools, source="builtin", tags=["meta"],
+        ))
+
+    def _tool_describe(self) -> None:
+        """The way back from a cold tool's name to its full schema.
+
+        The exposure split demotes a tool that has not been called in a week to
+        one line: name, arguments, a short description. That is enough to
+        recognise it and enough to call it -- but not enough to know the shape
+        of a nested parameter, and the failure mode of a guessed argument list
+        is a call that fails for a reason that looks like the tool's fault.
+
+        So the demotion ships with the way back, in the same prompt sentence
+        that announces it. A capability that is one call away and says so is
+        not the same thing as one the model has to discover it is missing.
+        """
+        def describe_tool(name: str) -> str:
+            spec = self.registry.get(name)
+            if spec is None:
+                # Not "no such tool": a miss is usually a near miss, and on a
+                # library of 200 the useful answer is the three names closest
+                # to what was asked for.
+                names = self.registry.names()
+                low = name.lower()
+                near = [n for n in names if low in n.lower() or n.lower() in low][:5]
+                hint = (" Closest names: " + ", ".join(near)) if near else ""
+                return f"No tool named {name!r}.{hint}"
+            hot, _, _ = self.registry.exposure()
+            carried = any(
+                (s.get("function") or s).get("name") == name for s in hot)
+            schema = json.dumps(spec.schema, ensure_ascii=False, indent=2)
+            head = ("Already carried in full in every request this turn."
+                    if carried else
+                    "This one was demoted to a name on the list, so the schema"
+                    " below is what the request does not carry.")
+            return (f"{spec.name} [{spec.state.value}] from {spec.source or '?'}"
+                    f"\n{head}\n\n{schema}")
+
+        self._add(ToolSpec(
+            name="describe_tool",
+            description=("Full parameter schema for one tool by name. The tools "
+                         "list carries the rest as one line each; call this "
+                         "before calling one whose arguments you are not sure of."),
+            parameters={"type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]},
+            fn=describe_tool, source="builtin", tags=["meta"],
         ))
 
     def _tool_evaluate(self) -> None:
@@ -5685,12 +5738,81 @@ class ForgeAgent:
             return
         self.controls.bind(conn)
         self.registry.controls = self.controls
+        # The exposure decision reads the ledger, and this is the wire: the
+        # registry asks the store which tools were called when, once per call,
+        # and the answer is what decides which schemas ride in every request.
+        # Bound here rather than in the registry's constructor for the same
+        # reason the control plane is: a bare registry has no ledger to ask.
+        if hasattr(self.registry, "last_called_source"):
+            self.registry.last_called_source = self._last_called_at
         try:
             from . import egress
 
             egress.bind(conn)
         except Exception:                                     # noqa: BLE001
             pass
+
+    def _hot_protect(self) -> set[str]:
+        """Tools this run must carry in full, whatever the ledger says.
+
+        The ledger answers "what has been used lately", and that is the right
+        question for a cost decision -- but it is a *past* question, and a task
+        can be about something the ledger has never seen. A run whose text names
+        Chromium should carry the browser tools whether or not any of them were
+        called this week; otherwise the first turn of exactly the tasks that
+        need a tool is the one turn that cannot call it in full.
+
+        Deliberately narrow: names appearing whole in the task text, matched on
+        word boundaries. A substring match would keep `see` hot on every task
+        containing "seen", and a set that grows to everything protects nothing.
+        """
+        task = getattr(self, "_current_task", "") or ""
+        if not task:
+            return set()
+        tokens = re.findall(r"[a-z0-9_]+", task.lower())
+        if not tokens:
+            return set()
+        # Word boundaries, which the first draft only half-had: it tested
+        # `name.replace("_", " ") in task` with a plain substring `in`, so a
+        # tool called `see` was protected by the word "seen" and one called
+        # `run` by "running". The boundary is the entire point of this function
+        # -- a set that grows to everything protects nothing -- and the bug
+        # produced exactly the failure the docstring warns about.
+        # So: a single-word name matches a whole token, and a multi-word name
+        # matches a *contiguous* run of tokens. Nothing matches a fragment.
+        words = set(tokens)
+        out = set()
+        for name in self.registry.names():
+            low = name.lower()
+            if low in words:
+                out.add(name)
+                continue
+            parts = low.split("_")
+            if len(parts) < 2:
+                continue
+            width = len(parts)
+            if any(tokens[i:i + width] == parts
+                   for i in range(len(tokens) - width + 1)):
+                out.add(name)
+        return out
+
+    def _last_called_at(self, name: str) -> float | None:
+        """When this tool was last called, from the ledger, newest per tool.
+
+        Cached on the agent rather than on the registry so the registry stays a
+        dict of specs and this stays a fact about the ledger. Invalidated by the
+        registry's own call counter: the only thing that can change an answer
+        here is a call, and every call bumps that counter.
+        """
+        seen = getattr(self.registry, "_calls_seen", 0)
+        if getattr(self, "_last_called_seen", None) == seen:
+            return (self._last_called_map or {}).get(name)
+        try:
+            self._last_called_map = self.store.last_called_by_tool()
+        except Exception:                                     # noqa: BLE001
+            self._last_called_map = {}
+        self._last_called_seen = seen
+        return self._last_called_map.get(name)
 
     def _persist_tool_state(self, spec: ToolSpec) -> None:
         """Write a tool's new state through to the store.
@@ -5885,10 +6007,21 @@ class ForgeAgent:
         # Also attach it to the trace, so records written by forging and
         # self-modification stream live too — not just the loop's own events.
         self._progress = progress
+        # Held for the run and cleared after it: the exposure decision reads it
+        # to keep a tool hot when the task names it, and a task text left behind
+        # would keep the previous run's tools hot forever.
+        self._current_task = task
+        # Read by the exposure filter and cleared with the task: a tool the task
+        # names stays hot even if nothing called it this week, because the run
+        # that needs it is exactly the run whose first turn would otherwise miss
+        # it. Set here rather than inside the loop: this is where the task is.
+        self.registry.protect = self._hot_protect()
         try:
             return self._run_locked(task, history, _emit, journal=journal_obj)
         finally:
             self._progress = None
+            self._current_task = ""
+            self.registry.protect = set()
 
     def _run_locked(self, task: str, history: list[Message] | None,
                     _emit: Callable[..., None], *, journal: Any = None) -> AgentResult:
@@ -5914,6 +6047,15 @@ class ForgeAgent:
             compactor=self.compactor,
             on_compact=self._on_compact,
             journal=journal,
+            # Where the token bill is decided. Handing the registry over as the
+            # expose callback is what makes "not called in a week" mean "not in
+            # every request"; without it the loop sends all 204 schemas, which
+            # is what it did until 2026-09-28.
+            # Where the token bill is decided. Handing the registry over as the
+            # expose callback is what makes "not called in a week" mean "not in
+            # every request"; without it the loop sends all 204 schemas, which
+            # is what it did until 2026-09-28.
+            exposure=self.registry,
         )
         # A resumed run is handed the *stored transcript* plus a short
         # instruction, and this is the shape that makes a resume a resume. The
