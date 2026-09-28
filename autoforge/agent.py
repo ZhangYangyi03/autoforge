@@ -298,12 +298,21 @@ _AMEND_TARGETS: dict[str, dict[str, Any]] = {
 FORGE_ROUND_CEILING = 3      # unbounded_forge_rounds == False
 SUPERVISED_TURN_CAP = 25     # unlimited_turns == False
 
-#: The five blend weights plus the tiebreak scale. `tiebreak` is separate
-#: because it is not a weight on a signal -- it sets how loudly the behaviour
-#: terms may speak when the text scores tie, and the calibration
-#: (`tools/calibrate_routing.py`) found that "quietly" is the only setting the
-#: ledger justifies.
-_WEIGHT_FIELDS = ("text", "success", "trust", "cost", "over_trigger", "gate")
+#: The live blend weights. `cost` and `over_trigger` were in this tuple until
+#: 2026-09-28 and are named below instead of dropped in silence: a retired knob
+#: and a misspelled one are different answers, and the agent amending its own
+#: retrieval is the one caller that can be told the difference.
+_WEIGHT_FIELDS = ("text", "success", "trust", "gate")
+
+#: Knobs the calibration took away rather than set to zero. Both scored a
+#: constant across all 120 tools (`cost_hint` is "cheap" everywhere, and
+#: `trigger_misses` is unpopulated because nothing re-probes a forged tool
+#: against its TriggerProbe), so a weight on either could only ever make
+#: retrieval worse while looking like tuning.
+_RETIRED_WEIGHT_FIELDS = {
+    "cost": "cost_hint is 'cheap' for all 120 tools, so the term is constant",
+    "over_trigger": "trigger_misses is unpopulated, so the term is constant",
+}
 
 # How much of every request the agent's own kept facts may occupy, and how long
 # any single entry may be before it is elided. Bounded because this block is
@@ -351,6 +360,14 @@ def _coerce_weights(value: Any, current: Any) -> tuple[Any | None, str | None]:
             except (TypeError, ValueError):
                 return None, f"min_calls_for_success must be an integer, got {raw!r}"
             continue
+        if key in _RETIRED_WEIGHT_FIELDS:
+            return None, (
+                f"routing weight {key!r} was retired 2026-09-28: "
+                + _RETIRED_WEIGHT_FIELDS[key]
+                + ". It cannot be set because it could not vary; the live "
+                "weights are " + ", ".join(_WEIGHT_FIELDS)
+                + " (or min_calls_for_success)."
+            )
         if key not in _WEIGHT_FIELDS:
             return None, (
                 f"unknown routing weight {key!r}; known: "
@@ -2594,7 +2611,7 @@ class ForgeAgent:
                     "type": "string",
                     "description": (
                         "the new value; routing_weights takes a JSON object such as "
-                        '{"success": 1.5, "text": 0.8}'
+                        '{"trust": 0.1, "text": 0.8}'
                     ),
                 },
                 "rationale": {"type": "string", "description": "WHY you are changing yourself"},

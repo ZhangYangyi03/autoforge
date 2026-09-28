@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autoforge.route.router import _COST, _TRUST, text_similarity
+from autoforge.route.router import _TRUST, text_similarity
 from autoforge.store import ToolStore
 from autoforge.tools.spec import ToolState
 
@@ -65,7 +65,7 @@ def forged_cases(specs):
 
 
 def build_features(specs):
-    """(target, [(name, text, success, trust, cost, over)]) per case.
+    """(target, [(name, text, success, trust)]) per case.
 
     Pre-tokenising each tool once is the whole trick: recomputing
     `text_similarity` inside the loop re-tokenises 120 descriptions 741 times
@@ -87,9 +87,7 @@ def build_features(specs):
             "dn": math.sqrt(sum(v * v for v in d.values())) or 1.0,
             "success": st.success_rate if st.calls >= 3 else 0.5,
             "trust": _TRUST.get(s.state, 0.0),
-            "cost": _COST.get(s.cost_hint, 0.0),
-            "over": min(1.0, st.trigger_misses / max(st.calls, 1)) if st.calls else 0.0,
-        })
+                })
     routable = {p["name"] for p in pool}
 
     def one(cases):
@@ -107,22 +105,21 @@ def build_features(specs):
                     common = set(q) & set(p["tok"])
                     t = (sum(q[x] * p["tok"][x] for x in common)
                          / (qn * p["dn"]))
-                rows.append((p["name"], t, p["success"], p["trust"],
-                             p["cost"], p["over"]))
+                rows.append((p["name"], t, p["success"], p["trust"]))
             out.append((c["target"], rows))
         return out
 
     return one
 
 def score_set(cases, w):
-    """w = (text, success, trust, cost, over) multipliers."""
-    wt, ws, wtr, wc, wo = w
+    """w = (text, success, trust) multipliers."""
+    wt, ws, wtr = w
     h1 = h3 = 0
     rr = []
     for target, rows in cases:
         best = [t[0] for t in sorted(
-            rows, key=lambda r: (wt * r[1] + ws * r[2] + wtr * r[3]
-                                 - wc * r[4] - wo * r[5]), reverse=True)]
+            rows, key=lambda r: (wt * r[1] + ws * r[2] + wtr * r[3]),
+            reverse=True)]
         if target in best:
             i = best.index(target)
             rr.append(1.0 / (i + 1))
@@ -135,11 +132,10 @@ def score_set(cases, w):
 
 
 def neg_false_win(cases, w):
-    wt, ws, wtr, wc, wo = w
+    wt, ws, wtr = w
     wrong = 0
     for target, rows in cases:
-        best = max(rows, key=lambda r: (wt * r[1] + ws * r[2] + wtr * r[3]
-                                        - wc * r[4] - wo * r[5]))
+        best = max(rows, key=lambda r: (wt * r[1] + ws * r[2] + wtr * r[3]))
         wrong += (best[0] == target)
     return wrong / len(cases) if cases else 0.0
 
@@ -154,10 +150,10 @@ def main():
         pickle.dump({"pos": F_pos, "neg": F_neg, "forged": F_for},
                     open(CACHE, "wb"))
 
-    shipped = (1.0, 1.2, 0.8, 0.5, 0.6)
+    shipped = (1.0, 1.2, 0.8)
     print(f"library {len(specs)} tools | probes {len(F_pos)} pos / {len(F_neg)} neg"
           f" | forged {len(F_for)}")
-    print("\nshipped (text 1.0, success 1.2, trust 0.8, cost 0.5, over 0.6)")
+    print("\nshipped (text 1.0, success 1.2, trust 0.8)")
     for label, cases in (("probes", F_pos), ("forged", F_for)):
         a, b, m, n = score_set(cases, shipped)
         print(f"  {label:7} top1 {a:.3f}  top3 {b:.3f}  MRR {m:.3f}  (n={n})")
@@ -170,8 +166,6 @@ def main():
         (0.4, 0.7, 1.0, 1.4, 2.0),      # text
         (0.0, 0.4, 0.8, 1.2, 2.0),      # success
         (0.0, 0.3, 0.6, 1.0),           # trust
-        (0.0, 0.3, 0.6),                # cost
-        (0.0, 0.4, 0.8),                # over_trigger
     ))
     print(f"\nsearching {len(grid)} weight vectors on the older half (n={len(older)})")
     best = None
@@ -182,8 +176,7 @@ def main():
         if best is None or obj > best[0]:
             best = (obj, w, mrr, fw)
     obj, w, mrr_old, fw = best
-    print("chosen on older half: text %.1f success %.1f trust %.1f cost %.1f over %.1f"
-          % w)
+    print("chosen on older half: text %.1f success %.1f trust %.1f" % w)
     print("  older-half MRR %.3f  negative false-win %.3f" % (mrr_old, fw))
     print("\nHELD-OUT (newer half, never used to choose):")
     a, b, m, n = score_set(newer, w)
@@ -195,8 +188,7 @@ def main():
         a, b, m, n = score_set(cases, w)
         print(f"  {label:7} top1 {a:.3f}  top3 {b:.3f}  MRR {m:.3f}  (n={n})")
     print(f"  negative false-win {neg_false_win(F_neg, w):.3f}")
-    print("\njson:", json.dumps({"text": w[0], "success": w[1], "trust": w[2],
-                                 "cost": w[3], "over_trigger": w[4]}))
+    print("\njson:", json.dumps({"text": w[0], "success": w[1], "trust": w[2]}))
 
 
 if __name__ == "__main__":

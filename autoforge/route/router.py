@@ -10,8 +10,6 @@ on *observed behaviour*:
     score = w_text * text_similarity
           + w_success * success_rate
           + w_trust * state_trust
-          - w_cost * cost_penalty
-          - w_fire * over_trigger_penalty
 
 No offline RL required — a weighted, inspectable blend. The weights are the
 policy, and they live in one dataclass so the agent's retrieval taste is a
@@ -38,7 +36,6 @@ _TRUST = {
     ToolState.DRAFT: 0.2,
 }
 
-_COST = {"cheap": 0.0, "moderate": 0.15, "expensive": 0.4}
 
 
 def _tokens(text: str) -> Counter:
@@ -105,12 +102,19 @@ class RoutingWeights:
       tool ahead of a probationary one -- and is too small to reorder candidates
       that differ in relevance.
 
-    `cost` and `over_trigger` default to 0 because they are 0.0 for all 120
-    tools: `cost_hint` is "cheap" everywhere and `trigger_misses` is unpopulated.
-    A term that cannot vary is not evidence, and leaving it non-zero is how the
-    old numbers went wrong. They stay tunable for when the ledger fills in.
+    Two of the five terms this class shipped with are *gone*, not merely
+    weighted at zero (2026-09-28). `cost` and `over_trigger` were set to 0 by the
+    calibration because they scored 0.0 for all 120 tools -- `cost_hint` is
+    "cheap" everywhere in the library, and `trigger_misses` counts nothing
+    because nothing ever calls `TriggerProbe` a second time after a forge. A
+    tunable weight on a constant is not a quiet default, it is a knob an
+    `amend_self` can turn to make retrieval strictly worse with no signal to
+    notice it by, and both of this week's routing defects were that shape. The
+    fields went; the terms they scored had no variance to lose. `trigger_misses`
+    stays on the ledger for the day something does populate it.
 
-    `amend_self(routing_weights=...)` still edits all of these.
+    `amend_self(routing_weights=...)` edits what is left, and names the two it
+    retired by name rather than by silence -- see `agent.py`.
     """
     text: float = 1.0
     #: Additive weight on success. 0 on purpose: success is not a gradient of
@@ -119,8 +123,6 @@ class RoutingWeights:
     #: Weak tiebreak. Orders equally-relevant candidates; too small to reorder
     #: candidates that differ in relevance.
     trust: float = 0.1
-    cost: float = 0.0
-    over_trigger: float = 0.0
     min_calls_for_success: int = 3
     #: Success rate below which a tool's relevance is scaled down; 0 disables.
     #: A tool at exactly this rate is scaled by 1.0, which is why the 0.5
@@ -130,7 +132,6 @@ class RoutingWeights:
     def to_dict(self) -> dict[str, float]:
         return {
             "text": self.text, "success": self.success, "trust": self.trust,
-            "cost": self.cost, "over_trigger": self.over_trigger,
             "gate": self.gate,
         }
 
@@ -170,12 +171,6 @@ class BehaviourRouter:
         text = text_similarity(query, spec)
         success = st.success_rate if st.calls >= w.min_calls_for_success else 0.5
         trust = _TRUST.get(spec.state, 0.0)
-        cost = _COST.get(spec.cost_hint, 0.0)
-        # over-trigger penalty: high call count relative to distinct needs is a
-        # proxy for a tool that fires when it should not.
-        over = 0.0
-        if st.calls:
-            over = min(1.0, st.trigger_misses / max(st.calls, 1))
 
         # Relevance and availability are different questions and are scored
         # separately. `gate` scales relevance by whether the tool works at all --
@@ -189,8 +184,6 @@ class BehaviourRouter:
             w.text * gate * text
             + w.success * success
             + w.trust * trust
-            - w.cost * cost
-            - w.over_trigger * over
         )
         return RouteCandidate(
             name=spec.name,
@@ -200,8 +193,6 @@ class BehaviourRouter:
                 "gate": gate,
                 "success": w.success * success,
                 "trust": w.trust * trust,
-                "cost": -w.cost * cost,
-                "over_trigger": -w.over_trigger * over,
             },
             state=spec.state.value,
         )
@@ -242,7 +233,7 @@ def skill_similarity(query: str, skill: Any) -> float:
 #: replay, unlike the 114 forged needs behind the tool weights above. The number
 #: is 1.0 because it is known to work, not because it was measured.
 SKILL_WEIGHTS = RoutingWeights(
-    text=1.0, success=1.0, trust=0.0, cost=0.0, over_trigger=0.0, gate=0.0)
+    text=1.0, success=1.0, trust=0.0, gate=0.0)
 
 
 class SkillRouter:

@@ -338,8 +338,14 @@ context but `force=True` still runs it. `rehab()` puts it back on trial.
 
 ```
 score = w_text·similarity + w_success·success_rate + w_trust·state_trust
-        − w_cost·cost_penalty − w_over·over_trigger_penalty
 ```
+
+`cost` and `over_trigger` were terms here until 2026-09-28, when the library
+was measured and both scored a constant for all 120 tools — `cost_hint` is
+"cheap" everywhere and nothing re-probes a forged tool against its
+`TriggerProbe`, so `trigger_misses` stays 0. They were removed rather than
+weighted at zero: a tunable weight on a constant is a knob that can only make
+retrieval worse, and `amend_self` would have had no signal to notice it by.
 
 **Every freedom is declared, and each declaration is classified.** Two presets
 ship — `full` (the default: nothing denied) and `supervised` — selected with

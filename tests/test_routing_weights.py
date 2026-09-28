@@ -96,16 +96,39 @@ class TestTheShape:
         reg.register(_tool("fresh", "d", calls=0))
         assert BehaviourRouter(reg).rank("d")[0].breakdown["gate"] == 1.0
 
-    def test_the_terms_that_cannot_vary_default_to_zero(self):
-        """cost and over_trigger are 0.0 for all 120 tools on the ledger.
+    def test_the_terms_that_cannot_vary_are_gone_not_zero(self):
+        """cost and over_trigger were 0.0 for all 120 tools; the fields are gone.
 
-        A weight on a term that cannot vary is not evidence. Asserted as a
-        default so re-introducing one is a deliberate act with a reason.
+        The 09-27 fix set them to zero and left them settable. That is a knob
+        with no signal behind it: `amend_self` could raise it and make retrieval
+        worse with nothing to notice it by, which is the same shape as the
+        weights this file exists to pin. Measured 2026-09-28: `cost_hint` is
+        "cheap" for 120/120 tools and `trigger_misses` is 0 for 120/120.
         """
         w = RoutingWeights()
-        assert w.cost == 0.0 and w.over_trigger == 0.0
-        # and the additive success term too: it acts through the gate instead
+        assert not hasattr(w, "cost") and not hasattr(w, "over_trigger")
+        assert "cost" not in w.to_dict() and "over_trigger" not in w.to_dict()
+        # and the additive success term stays 0.0: it acts through the gate
         assert w.success == 0.0
+
+    def test_a_retired_weight_is_refused_by_name_not_by_silence(self):
+        """An amendment naming a retired knob gets told why, not "unknown key".
+
+        "unknown" and "retired" are different answers. The first sends the
+        caller looking for a typo; the second tells it the measurement removed
+        the term.
+        """
+        from autoforge.agent import _coerce_weights
+        for name in ("cost", "over_trigger"):
+            parsed, err = _coerce_weights({name: 0.7}, RoutingWeights())
+            assert parsed is None and err is not None, name
+            assert name in err and "retired" in err, (name, err)
+
+    def test_the_live_weights_still_amend(self):
+        """What is left is still editable -- the retirement is not a lockout."""
+        from autoforge.agent import _coerce_weights
+        parsed, err = _coerce_weights({"trust": 0.2}, RoutingWeights())
+        assert err is None and parsed.trust == 0.2
 
     def test_the_tiebreak_is_too_small_to_reorder_relevance(self):
         """Its whole justification: it separates equals and touches nothing else."""
