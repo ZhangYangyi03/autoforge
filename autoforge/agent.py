@@ -811,6 +811,60 @@ class _Unarbitrated:
         return ""
 
 
+def _claim_check_of(spec) -> dict[str, Any]:
+    """The claim gate's row from a tool's stored verification record.
+
+    Read out of `spec.verification` rather than recomputed: the point of the
+    badge is that it says what was recorded when the tool was sealed, not what
+    would be recorded if the tool were run again now.
+    """
+    record = getattr(spec, "verification", None) or {}
+    for check in record.get("checks", []) or []:
+        if isinstance(check, dict) and check.get("name") == "claim":
+            return check
+    return {}
+
+
+def claim_badge(spec) -> str:
+    """One token on the tool list for what the claim gate said, or nothing.
+
+    Nothing when there is no claim row (tools sealed before the gate existed)
+    and nothing when the gate had no rail to perturb. Both are honest blanks:
+    the first because no claim was checked, the second because none was made.
+    What must never be blank is a tool that claims to measure something and
+    failed the controls — that one says claim=FAIL on every listing.
+    """
+    check = _claim_check_of(spec)
+    if not check:
+        return ""
+    evidence = check.get("evidence") or {}
+    if not evidence.get("applicable"):
+        return ""
+    return "claim=pass" if check.get("passed") else "claim=FAIL"
+
+
+def claim_record(spec) -> str:
+    """The claim gate's findings for one tool, in the words a reader acts on.
+
+    "claim: 6/6" says nothing about which control moved and which did not, and
+    the whole point of this gate is that a green battery can sit on top of a
+    wrong answer. So the findings are printed rather than summarised.
+    """
+    check = _claim_check_of(spec)
+    if not check:
+        return ""
+    evidence = check.get("evidence") or {}
+    if not evidence.get("applicable"):
+        return "claim gate: not applicable — " + (
+            (evidence.get("findings") or [{}])[0].get("detail", "no rail declared"))
+    out = [f"claim gate [{'PASS' if check.get('passed') else 'FAIL'}] "
+           f"kind={evidence.get('kind', '?')} rail={evidence.get('rail', '')!r}"]
+    for finding in evidence.get("findings", []) or []:
+        out.append("  %s claim/%s: %s" % ("ok  " if finding.get("ok") else "FAIL",
+                                          finding.get("name"), finding.get("detail", "")))
+    return "\n".join(out)
+
+
 @dataclass
 class ForgeAgent:
     llm: LLMClient
@@ -2295,7 +2349,15 @@ class ForgeAgent:
                 # whole round away -- see `_operator_said_something`.
                 should_abort=self._operator_wants_the_floor,
             )
-            self._record("forge", {"need": need, "ok": res.ok})
+            # The claim verdict travels with the forge event, so "this tool
+            # measures something" is answerable from the ledger rather than by
+            # re-running the gate. Put on the event rather than inside the
+            # report because the event is what my_history reads back, and a
+            # sealed tool whose only record of the gate is inside a nested
+            # report is a fact nothing downstream can find.
+            claim = (self.verifier.claim_report.to_dict()
+                     if getattr(self.verifier, "claim_report", None) else None)
+            self._record("forge", {"need": need, "ok": res.ok, "claim": claim})
             if res.aborted:
                 self._interrupted_needs.add(" ".join(need.lower().split()))
                 # Deliberately not "the forge failed". Nothing was judged, so
@@ -2725,11 +2787,15 @@ class ForgeAgent:
             rep = self.registry.report()
             if not rep["tools"]:
                 return "No tools yet."
-            lines = [
-                f"  {s['name']} [{s['state']}] sr={s['stats']['success_rate']} "
-                f"calls={s['stats']['calls']} — {s['description'][:60]}"
-                for s in rep["tools"]
-            ]
+            lines = []
+            for s in rep["tools"]:
+                spec = self.registry.get(s["name"])
+                badge = claim_badge(spec)
+                lines.append(
+                    f"  {s['name']} [{s['state']}]"
+                    + (f" {badge}" if badge else "")
+                    + f" sr={s['stats']['success_rate']} "
+                    f"calls={s['stats']['calls']} — {s['description'][:60]}")
             return f"Tools ({rep['total']}, states {rep['by_state']}):\n" + "\n".join(lines)
 
         self._add(ToolSpec(
@@ -2771,8 +2837,10 @@ class ForgeAgent:
                     if carried else
                     "This one was demoted to a name on the list, so the schema"
                     " below is what the request does not carry.")
+            claim = claim_record(spec)
             return (f"{spec.name} [{spec.state.value}] from {spec.source or '?'}"
-                    f"\n{head}\n\n{schema}")
+                    f"\n{head}\n\n{schema}"
+                    + (f"\n\n{claim}" if claim else ""))
 
         self._add(ToolSpec(
             name="describe_tool",

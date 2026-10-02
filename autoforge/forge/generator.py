@@ -391,6 +391,13 @@ Rules:
   a real query; for a parser, a real well-formed string; for arithmetic, real
   numbers and the expected result. If you cannot state a valid input and its
   answer, you do not yet understand the tool well enough to write it.
+- DECLARED PARAMETERS ARE CLAIMS. Giving a parameter an `enum` ("enum": [...])
+  or making it a boolean declares that the answer depends on it: the verifier
+  flips it and requires the output to move. A flag that only affects formatting
+  or is accepted and ignored must declare itself -- {"type": "boolean",
+  "x-claim": "cosmetic"} -- because a declared rail the tool does not read fails
+  the tool. Never declare a rail you will not read, and never leave the only
+  input you vary unmarked.
 - TOTALITY — the verifier enforces this and rejects the tool if you break it:
   never raise, and never return None. On input you cannot process, return a
   short string starting "INVALID:" with the reason, e.g.

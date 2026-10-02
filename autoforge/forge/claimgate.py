@@ -102,22 +102,49 @@ class ClaimReport:
 
 # -- reading the tool's own declarations ----------------------------------
 
+def _is_cosmetic(schema: dict[str, Any]) -> bool:
+    """Does the tool declare this parameter as one nothing may depend on?
+
+    A flag that only affects formatting is a real design, and a gate that
+    insists every boolean moves the answer would be inventing a requirement.
+    But that is the *tool's* claim to make, in a way a machine can read, not
+    something the gate may assume on its behalf -- assuming it is what turned
+    the sensitivity check into a comment. `"x-claim": "cosmetic"` is that
+    declaration.
+    """
+    value = schema.get("x-claim", schema.get("x_claim", ""))
+    return str(value).strip().lower() == "cosmetic"
+
+
+def find_rails(spec: ToolSpec) -> list[tuple[str, list[Any], bool]]:
+    """Every declared rail: (name, values, declared_cosmetic), in schema order."""
+    props = (spec.parameters or {}).get("properties") or {}
+    out: list[tuple[str, list[Any], bool]] = []
+    for name, schema in props.items():
+        if not isinstance(schema, dict):
+            continue
+        enum = schema.get("enum")
+        if isinstance(enum, list) and len(enum) >= 2:
+            out.append((name, list(enum), _is_cosmetic(schema)))
+        elif schema.get("type") == "boolean":
+            out.append((name, [True, False], _is_cosmetic(schema)))
+    return out
+
+
 def find_rail(spec: ToolSpec) -> tuple[str, list[Any]]:
     """The parameter the tool is supposed to be sensitive to, and its values.
 
     An enum is a declaration with two or more named values; a boolean is the
     two-valued degenerate case. First match wins, in schema order, so the
     choice is stable across runs rather than dependent on dict ordering.
+
+    A parameter the tool declares cosmetic (`"x-claim": "cosmetic"`) is not a
+    rail: it is the tool saying in advance that nothing may depend on it, which
+    is a statement this gate can hold it to.
     """
-    props = (spec.parameters or {}).get("properties") or {}
-    for name, schema in props.items():
-        if not isinstance(schema, dict):
-            continue
-        enum = schema.get("enum")
-        if isinstance(enum, list) and len(enum) >= 2:
-            return name, list(enum)
-        if schema.get("type") == "boolean":
-            return name, [True, False]
+    for name, values, cosmetic in find_rails(spec):
+        if not cosmetic:
+            return name, values
     return "", []
 
 
@@ -363,6 +390,13 @@ class ClaimGate:
         out = str(getattr(result, "output", ""))
         if out.strip().upper().startswith("INVALID"):
             return False, "returned INVALID on its own declared sample"
+        if not out.strip():
+            # An empty answer is not an answer. Measured 2026-10-02 while
+            # hardening the rail check: a predict tool that returned "" for one
+            # rail value and "" for the other compared equal, so "same call
+            # twice gave the same answer" and the rails above it went green on a
+            # tool that had stopped answering at all. No output is not output.
+            return False, "returned nothing at all, which is not an answer"
         return True, out
 
     def gate(self, spec: ToolSpec, sample_args: dict[str, Any] | None = None) -> ClaimReport:
@@ -373,6 +407,22 @@ class ClaimGate:
             rep.findings.append(ClaimFinding("gated", True, "claim gate disabled or no code"))
             return rep
         if kind == "none":
+            rails = find_rails(spec)
+            if rails:
+                # Every rail it declares is marked cosmetic. That is a tool with
+                # no rail wearing the costume of one, and it must not print as
+                # "nothing to check here" -- un-probed is not passed.
+                rep.applicable = True
+                rep.rail = rails[0][0]
+                rep.passed = False
+                rep.findings.append(ClaimFinding(
+                    "no_binding_rail", False,
+                    "every declared rail (%s) is marked `x-claim: cosmetic`, so this "
+                    "gate has nothing it is allowed to perturb. A tool whose only "
+                    "inputs are ones it says cannot matter has no rail; that is not "
+                    "the same as having nothing to measure, and it is not passed."
+                    % ", ".join(r[0] for r in rails)))
+                return rep
             rep.findings.append(ClaimFinding(
                 "no_rail", True,
                 "no declared rail (an enum or boolean parameter, or a target/prediction "
@@ -423,15 +473,19 @@ class ClaimGate:
         sens = ClaimFinding(
             "rail_sensitivity", bool(moved),
             f"changing {rail!r} changed the answer" if moved else
-            f"changing {rail!r} left the answer bit-identical: the parameter is "
-            f"declared but not read, so the answer does not depend on what it claims to",
+            (f"changing {rail!r} left the answer bit-identical: the parameter is "
+             f"declared, not marked cosmetic, and not read. A declared rail the tool "
+             f"ignores is a claim about itself that the tool contradicts -- and this "
+             f"was the one check standing between a constant-returning predict tool "
+             f"and a verified seal, so it is not advisory."),
             {"from": first[:160], "to": str(third)[:160]})
-        # A rail the tool is *supposed* to ignore is a real design (a flag that
-        # only affects formatting). It is recorded, not failed -- failing it
-        # would be the gate inventing a requirement. What is never allowed is
-        # the two deterministic/order rails below.
-        sens.ok = True
-        sens.detail += " [advisory]"
+        # Binding since 2026-10-02. It was advisory until then, on the theory
+        # that some flags are cosmetic -- and the measured cost of that theory
+        # is in the paragraph above: a predict tool that returns "42.00" every
+        # time scored 4/4 findings green and passed the gate, because a constant
+        # is deterministic, order-stable, and its unread rail was forgiven. The
+        # theory is still served, by the tool's own `x-claim: cosmetic`
+        # declaration rather than by the gate's guess.
         rep.findings.append(sens)
         # 3. order invariance, when the tool reads a table.
         key = _csv_arg(args)
@@ -718,4 +772,4 @@ def check_claim(spec: ToolSpec, sandbox, *, sample_args: dict[str, Any] | None =
 
 
 __all__ = ["ClaimFinding", "ClaimReport", "ClaimGate", "check_claim",
-           "find_rail", "find_kind"]
+           "find_rail", "find_rails", "find_kind"]

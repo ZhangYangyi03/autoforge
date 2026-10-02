@@ -374,6 +374,13 @@ class ForgePipeline:
         self._emit("forge_done", {
             "need": need, "ok": result.ok, "rounds": result.rounds,
             "name": getattr(result.spec, "name", None),
+            # The claim verdict on the terminal event, where a reader looks for
+            # "what happened to this forge". `forge_attempt` carries the whole
+            # report, but the attempt is per-round and the claim verdict is the
+            # one line somebody actually wants: did the tool that came out of
+            # this measure anything, or does it only look like it does.
+            "claim": (self.verifier.claim_report.to_dict()
+                      if getattr(self.verifier, "claim_report", None) else None),
             **({"replace_conflict": result.replace_conflict}
                if result.replace_conflict else {}),
         })

@@ -180,3 +180,111 @@ def test_disabled_gate_does_not_run_code():
                  {"csv_text": CSV, "target_col": "label", "pred_col": "pred"})
     rep = ClaimGate(Boom(), run=False).gate(spec, {"csv_text": CSV})
     assert rep.passed and rep.kind != "none"
+
+
+# ---------------------------------------------------------------------------
+# The predict shape. Added 2026-10-02, after the first version of this file
+# tested the *audit* shape thoroughly and left the other half of the gate
+# effectively untested -- which is how a constant-returning predict tool came
+# out green on 4/4 findings.
+# ---------------------------------------------------------------------------
+
+PREDICT_PARAMS = {
+    "type": "object",
+    "properties": {"csv_text": {"type": "string"}, "use_log": {"type": "boolean"}},
+    "required": ["csv_text"],
+}
+
+PREDICT_CSV = "sample,counts\n" + "\n".join(f"{i},{i * i % 37 + 3}" for i in range(24))
+
+#: Returns the same number whatever it is handed: no table is read, the rail is
+#: not read. Deterministic, order-stable, and therefore green under every
+#: control except the one that asks whether the answer comes from the input.
+CONSTANT_PREDICT = """\
+def const_predict(csv_text='', use_log=True):
+    return "PREDICTED_DEPTH: 42.00 | confidence 0.90"
+"""
+
+HONEST_PREDICT = """\
+import csv, io, math
+def honest_predict(csv_text='', use_log=True):
+    rows = [r for r in csv.reader(io.StringIO(csv_text)) if any(c.strip() for c in r)]
+    if len(rows) < 3:
+        return "INVALID: need a header and two rows"
+    head = [h.strip().lower() for h in rows[0]]
+    if "counts" not in head:
+        return "INVALID: no counts column"
+    ci = head.index("counts")
+    vals = []
+    for r in rows[1:]:
+        try:
+            vals.append(float(r[ci]))
+        except (ValueError, IndexError):
+            pass
+    if len(vals) < 3:
+        return "INVALID: fewer than three numeric rows"
+    m = sum(vals) / len(vals)
+    v = sum((x - m) ** 2 for x in vals) / len(vals)
+    if use_log:
+        v = math.log(v + 1.0)
+    return "PREDICTED_DEPTH: %.2f | confidence 0.90" % (v + m)
+"""
+
+
+def _predict_spec(name, code, params=None, sample=None):
+    return _spec(name, code, params or PREDICT_PARAMS,
+                 sample if sample is not None else {"csv_text": PREDICT_CSV, "use_log": True})
+
+
+def test_a_constant_predict_tool_is_caught_by_its_own_declared_rail():
+    """The measured hole in the first version of this gate.
+
+    `const_predict` declares `use_log` (so it has a rail), ignores its table and
+    ignores the rail. Nothing reads the answer's *origin*, so a tool that is a
+    constant scored green: deterministic, order-stable, and its unread rail was
+    forgiven as "advisory". It is not advisory any more.
+    """
+    spec = _predict_spec("const_predict", CONSTANT_PREDICT)
+    rep = _gate(spec)
+    assert rep.kind == "predict"
+    assert not rep.passed, rep.summary()
+    assert "rail_sensitivity" in {f.name for f in rep.failed}
+
+
+def test_an_honest_predict_tool_passes():
+    spec = _predict_spec("honest_predict", HONEST_PREDICT)
+    rep = _gate(spec)
+    assert rep.passed, [f.to_dict() for f in rep.failed]
+    assert "rail_sensitivity" in {f.name for f in rep.findings}
+
+
+def test_an_empty_answer_is_not_an_answer():
+    """"" for one rail value and "" for the other compare equal."""
+    empty = """\
+def empty_predict(csv_text='', use_log=True):
+    return ""
+"""
+    spec = _predict_spec("empty_predict", empty)
+    rep = _gate(spec)
+    assert not rep.passed
+    assert "baseline" in {f.name for f in rep.failed}
+
+
+def test_a_tool_that_declares_every_rail_cosmetic_is_not_passed():
+    """No binding rail is a finding, not a pass.
+
+    "Nothing to perturb" is honest when nothing was declared. A tool that
+    declares rails and marks all of them cosmetic is a tool with no rail wearing
+    the costume of one -- and it must not print as "nothing to check here".
+    """
+    params = {
+        "type": "object",
+        "properties": {"csv_text": {"type": "string"},
+                       "use_log": {"type": "boolean", "x-claim": "cosmetic"}},
+        "required": ["csv_text"],
+    }
+    spec = _predict_spec("cosmetic_only", HONEST_PREDICT, params)
+    rep = _gate(spec)
+    assert rep.applicable is True
+    assert not rep.passed
+    assert "no_binding_rail" in {f.name for f in rep.failed}
