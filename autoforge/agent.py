@@ -99,6 +99,15 @@ TOOL_SCHEMA_BUDGET_CHARS = 6000
 
 AUTONOMOUS_SYSTEM = """You are an autonomous agent that grows its own capabilities.
 
+LANGUAGE (operator standing rule, kept as fact 'language' since 2026-09-15):
+- Answer in Chinese by default. Every report, summary, explanation and closing
+  line is written in Chinese unless the operator writes in English or asks for
+  English. Do not open in English and do not switch to English because the
+  source material was English.
+- Code, identifiers, file paths, command names and quoted upstream text stay as
+  they are; only the prose around them is Chinese.
+- When the operator asks a question, the answer is in Chinese in that same turn.
+
 Your reach — read this before claiming you cannot do something:
 - run_python executes the Python you write, in a separate process on this host,
   with a scrubbed environment but a real filesystem and a real network stack.
@@ -601,6 +610,15 @@ BUILTIN_SCOPES: dict[str, str] = {
     # Reading the agent's own state. Nothing leaves the process.
     "my_capabilities": "read_only",
     "my_history": "read_only",
+    # The unfinished-run pair. Both were missing until 2026-10-02, and the cost
+    # was the usual one: an undeclared builtin is treated as capable of
+    # everything, so `resume_run` -- the only way back into a run this host cut
+    # off, which is the ordinary case here -- was gated by every switched-off
+    # freedom at once in the sessions most likely to need it. Both edit the
+    # runs table in the agent's own store; neither touches the host.
+    "resume_run": "local_write",
+    "runs_forget": "local_write",
+    "runs_status": "read_only",
     # verify_ledger reads the log and, when asked, writes one anchor row. The
     # anchor is the whole reason it can catch a truncated tail, so it is not
     # split off: this tool's cost is a read plus at most one append.
@@ -868,6 +886,7 @@ class ForgeAgent:
             run_execution_check=self.forge_config.require_execution,
             run_trigger_check=self.forge_config.require_trigger,
             run_negative_check=self.forge_config.require_negative,
+            run_claim_check=getattr(self.forge_config, "require_claim", True),
         )
         self.pipeline = ForgePipeline(
             self.generator, self.verifier, self.registry,
@@ -2771,15 +2790,32 @@ class ForgeAgent:
             spec = self.registry.get(name)
             if spec is None:
                 return f"No tool named {name!r}."
-            report = self.verifier.verify(spec)
-            self._record("evaluate", {"tool": name, "passed": report.passed})
+            # The tool's own declared sample travels with it when it was forged
+            # with one; without it the battery invents arguments, and a claim
+            # gate run on invented arguments is a verdict nobody earned. Passing
+            # it here is what makes re-evaluating an *existing* tool honest.
+            sample = dict(getattr(spec, "sample_call", None) or {}) or None
+            report = self.verifier.verify(spec, sample)
+            self._record("evaluate", {"tool": name, "passed": report.passed,
+                                      "claim": (self.verifier.claim_report.to_dict()
+                                                if self.verifier.claim_report else None)})
             lines = [f"  [{'PASS' if c.passed else 'FAIL'}] {c.name}: {c.detail}"
                      for c in report.checks]
+            # The claim gate's findings are the ones a reader has to act on, so
+            # they are printed rather than summarised -- "claim: 6/6" says
+            # nothing about which control moved and which did not.
+            claim = self.verifier.claim_report
+            if claim is not None:
+                for finding in claim.findings:
+                    flag = "  " if finding.ok else "! "
+                    lines.append(f"  {flag}claim/{finding.name}: {finding.detail}")
             return f"{report.summary()}\n" + "\n".join(lines)
 
         self._add(ToolSpec(
             name="evaluate_tool",
-            description="Run the full verification battery (execution, robustness, adversarial, trigger, negative) on a tool.",
+            description=("Run the full verification battery (execution, robustness, adversarial, "
+                         "trigger, negative, and the claim gate: is the returned number a fact "
+                         "about the world or about the data it was handed) on a tool."),
             parameters={"type": "object", "properties": {"name": {"type": "string"}},
                         "required": ["name"]},
             fn=evaluate_tool, source="builtin", tags=["meta"],

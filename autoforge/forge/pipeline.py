@@ -98,6 +98,13 @@ class ForgeConfig:
     require_execution: bool = True
     require_trigger: bool = True
     require_negative: bool = True
+    #: The claim gate: the tool is run more than once, on its own declared
+    #: sample, and its answer must survive a repeat, a row permutation, and a
+    #: shuffled-label control. On by default, because a tool that returns a
+    #: number nobody checked is the failure this framework exists to prevent --
+    #: `audit_predictive_claim_csv` passed every check it had on 2026-10-02
+    #: while returning PASS on a label-leaked dataset.
+    require_claim: bool = True
 
 
 class ForgePipeline:
@@ -114,8 +121,17 @@ class ForgePipeline:
     ) -> None:
         self.generator = generator
         self.verifier = verifier
-        self.registry = registry
         self.config = config or ForgeConfig()
+        # `config.require_claim` is the switch the pipeline owns; the verifier
+        # owns the switch it consults. Binding them here means a caller who
+        # turned the gate off in ForgeConfig cannot still get a claim verdict
+        # from a verifier built with the default -- and, the way it actually
+        # bit, a caller who built the verifier *before* the pipeline (the CLI
+        # does exactly that) cannot silently stay on the old battery. Explicit
+        # argument wins over config when the verifier was built with one.
+        if hasattr(verifier, "run_claim_check"):
+            verifier.run_claim_check = bool(self.config.require_claim)
+        self.registry = registry
         self.sandbox = sandbox or verifier.sandbox
         # None means "no policy attached": every gate below fails open, which
         # is what the forge pipeline did before the policy existed. Attaching
@@ -413,6 +429,20 @@ class ForgePipeline:
             source="generated",
             probes=g.probes,
             effect_signature=g.effect_signature,
+            # Both of these were dropped here until 2026-10-02, and dropping
+            # them made the whole positive-case apparatus inert on the live
+            # forge path. `check_execution` reads `spec.sample_call` and does
+            # nothing with `g.sample_call`; the generator was required by its
+            # own prompt to emit one, the field existed, the check consulted it
+            # -- and the translation between them was missing. Measured: every
+            # one of the 141 tools on this machine's ledger was verified with no
+            # positive example at all, which is exactly the vacuity the
+            # `check_execution` docstring says was fixed. It was fixed in the
+            # check and never connected to the pipeline. Found by the claim gate,
+            # which reported "un-probed" on a tool whose generator had supplied
+            # a perfectly good sample.
+            sample_call=dict(g.sample_call or {}),
+            sample_expect=g.sample_expect or "",
             tags=g.tags,
             state=ToolState.DRAFT,
         )
@@ -420,6 +450,23 @@ class ForgePipeline:
     @staticmethod
     def _feedback(report: VerificationReport) -> str:
         lines = [f"- {c.name}: {c.detail}" for c in report.failed]
+        # A claim-gate failure is a different kind of message from "it crashed".
+        # The tool will not be fixed by making it more robust; it will be fixed
+        # by connecting the answer to the inputs, or by not claiming to measure
+        # something it does not measure. Saying so here is the difference between
+        # three rounds of hardening a broken instrument and one round of repair.
+        for check in report.failed:
+            if check.name != "claim":
+                continue
+            findings = (check.evidence or {}).get("findings") or []
+            for finding in findings:
+                if finding.get("ok"):
+                    continue
+                lines.append(f"  control {finding.get('name')}: {finding.get('detail')}")
+            lines.append(
+                "  The battery above asks whether the code runs; this control asks "
+                "whether its answer depends on its inputs. Fix the dependency, or "
+                "stop returning a number you did not derive.")
         return "Failed checks:\n" + "\n".join(lines)
 
     @staticmethod

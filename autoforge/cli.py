@@ -364,6 +364,11 @@ def _build(cfg: dict, *, meta_cognition: bool = True) -> ForgeAgent:
         run_adversarial_check=not cfg["fast"],
         run_trigger_check=not cfg["fast"],
         run_negative_check=not cfg["fast"],
+        # Deliberately NOT tied to --fast. --fast skips the two LLM-driven
+        # checks because they cost a model call; the claim gate costs a few
+        # sandbox runs, and skipping it is how a tool that answers every
+        # question with the same number gets sealed as verified.
+        run_claim_check=True,
     )
     agent = ForgeAgent(
         llm=llm,

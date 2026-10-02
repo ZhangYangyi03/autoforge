@@ -7,6 +7,9 @@ Five orthogonal checks, in order of increasing cost:
   C. adversarial   — can it survive an LLM attacker? (adversarial gate)
   D. trigger       — when the need arises, will the agent call this tool?
   E. negative      — when the need is absent, will it stay quiet?
+  F. claim         — is the number it returns a fact about the world, or a fact
+                     about the data it was handed? (reproducibility, order
+                     invariance, and a known-answer control on its own labels)
 
 Question D+E is the "Constraint Tax" and "over-triggering" problems. Question B
 guards against the exact bug found in the live demo (ISBN prefix contamination).
@@ -28,6 +31,7 @@ from .fuzzer import RobustnessResult, run_robustness_checks
 from .sandbox import Sandbox
 from .manifest import (apply_declaration, intent_for, reconcile,
                        CapabilityManifest, ManifestRefused)
+from .claimgate import ClaimReport, check_claim
 
 
 def _plane():
@@ -108,6 +112,7 @@ class ToolVerifier:
         run_adversarial_check: bool = True,
         run_trigger_check: bool = True,
         run_negative_check: bool = True,
+        run_claim_check: bool = True,
         trigger_trials: int = 1,
         adversary: AdversarialGate | None = None,
         require_robustness_rate: float = 0.8,
@@ -120,11 +125,14 @@ class ToolVerifier:
         #: Peak bytes / CPU / processes the kernel charged the last run, filled
         #: by check_execution and reconciled into the report.
         self.measurements: dict[str, Any] = {}
+        #: Filled by the claim gate; None when it did not run.
+        self.claim_report: ClaimReport | None = None
         self.run_execution_check = run_execution_check
         self.run_robustness_check = run_robustness_check
         self.run_adversarial_check = run_adversarial_check
         self.run_trigger_check = run_trigger_check
         self.run_negative_check = run_negative_check
+        self.run_claim_check = run_claim_check
         self.trigger_trials = trigger_trials
         self.adversary = adversary
         self.require_robustness_rate = require_robustness_rate
@@ -388,6 +396,20 @@ class ToolVerifier:
             negatives = [p.negative_query for p in spec.probes if p.negative_query]
             if negatives:
                 checks.append(self.check_negative(spec, negatives[0]))
+
+        # F. The claim gate. Last because it is the only check that has to
+        # *run the tool more than once*, and first in importance because the
+        # other five can all be green while the answer is wrong. A tool with no
+        # declared rail is recorded as not-applicable rather than passed: the
+        # battery must never let "we did not look" print as "it is fine".
+        if self.run_claim_check and spec.code:
+            claim = check_claim(spec, self.sandbox, sample_args=sample_args)
+            self.claim_report = claim
+            checks.append(CheckResult(
+                "claim", bool(claim.passed), claim.summary(),
+                claim.to_dict()))
+        else:
+            self.claim_report = None
 
         passed = bool(checks) and all(c.passed for c in checks)
         report = VerificationReport(spec.name, passed, checks)

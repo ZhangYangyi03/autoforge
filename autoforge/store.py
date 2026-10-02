@@ -42,6 +42,14 @@ _COLUMNS = dict(
     source="TEXT NOT NULL DEFAULT 'human'",
     generator="TEXT NOT NULL DEFAULT ''",
     probes="TEXT NOT NULL DEFAULT '[]'",
+    #: The concrete valid call the tool declared for itself. Persisted so a gate
+    #: that runs *after* the forge -- a re-audit, or the claim gate when a tool
+    #: is re-verified on load -- has something real to run it on. Its absence on
+    #: every row written before 2026-10-02 is why the claim gate reports those
+    #: tools as un-probed rather than passing them: `_infer_args` invents
+    #: arguments, and re-running a real gate on invented arguments would seal a
+    #: verdict nobody earned.
+    sample_call="TEXT NOT NULL DEFAULT '{}'",
     effect_signature="TEXT NOT NULL DEFAULT ''",
     state="TEXT NOT NULL DEFAULT 'draft'",
     tags="TEXT NOT NULL DEFAULT '[]'",
@@ -182,6 +190,11 @@ class ToolRecord:
     generator: str
     probes: list[TriggerProbe]
     effect_signature: str
+    #: The valid call the tool declared, persisted so a gate that runs after the
+    #: forge has something real to run it on. Defaulted rather than required:
+    #: every row written before 2026-10-02 has none, and a missing field must
+    #: read as "un-probed", never as "no sample needed".
+    sample_call: dict[str, Any]
     state: ToolState
     tags: list[str]
     cost_hint: str
@@ -204,6 +217,7 @@ class ToolRecord:
             generator=spec.generator,
             probes=spec.probes,
             effect_signature=spec.effect_signature,
+            sample_call=dict(spec.sample_call or {}),
             state=spec.state,
             tags=spec.tags,
             cost_hint=spec.cost_hint,
@@ -240,6 +254,7 @@ class ToolRecord:
             generator=self.generator,
             probes=self.probes,
             effect_signature=self.effect_signature,
+            sample_call=dict(self.sample_call or {}),
             state=self.state,
             stats=st,
             verification=self.verification,
@@ -328,6 +343,11 @@ class ToolStore:
     #: now, and one of them may well be older code than the other.
     _ADDED_COLUMNS = (
         ("tool_versions", "session", "TEXT NOT NULL DEFAULT ''"),
+        # The declared valid call, so a gate that runs after the forge has real
+        # arguments to run on. Applied here rather than by editing the DDL alone:
+        # CREATE TABLE IF NOT EXISTS does nothing to a table that is already
+        # there, and this table is 131 rows deep on this machine.
+        ("tools", "sample_call", "TEXT NOT NULL DEFAULT '{}'"),
     )
 
     def _ensure_columns(self) -> None:
@@ -494,10 +514,10 @@ class ToolStore:
             self._conn.execute(
                 """INSERT OR REPLACE INTO tools
                 (name, version, description, parameters, code, entry,
-                 source, generator, probes, effect_signature, state,
-                 tags, cost_hint, created_at, verification, stats,
+                 source, generator, probes, effect_signature, sample_call,
+                 state, tags, cost_hint, created_at, verification, stats,
                  old_versions, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     record.name, record.version, record.description,
                     _j(record.parameters), record.code, record.entry,
@@ -505,7 +525,8 @@ class ToolStore:
                         {"query": p.query, "expect": p.expect, "negative_query": p.negative_query}
                         for p in record.probes
                     ]),
-                    record.effect_signature, record.state.value,
+                    record.effect_signature, _j(record.sample_call or {}),
+                    record.state.value,
                     _j(record.tags), record.cost_hint,
                     record.created_at, _j(record.verification),
                     _j(record.stats), _j(record.old_versions),
@@ -544,6 +565,7 @@ class ToolStore:
                     generator=r["generator"],
                     probes=_probes_from_list(_unjson(r["probes"])),
                     effect_signature=r["effect_signature"],
+                    sample_call=_unjson(r["sample_call"]) if "sample_call" in r.keys() else {},
                     state=ToolState(r["state"]),
                     tags=_unjson(r["tags"]),
                     cost_hint=r["cost_hint"],
