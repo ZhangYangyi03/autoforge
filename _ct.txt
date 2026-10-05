@@ -1,0 +1,70 @@
+kind audit rail ('higher_is_better', [True, False])
+{
+ "tool": "audit_predictive_claim_csv",
+ "kind": "audit",
+ "applicable": true,
+ "passed": true,
+ "rail": "higher_is_better",
+ "findings": [
+  {
+   "name": "baseline",
+   "ok": true,
+   "detail": "verdict on its own sample: PASS",
+   "evidence": {
+    "output": "VERDICT: PASS | GATE1 reproduce ok (r=0.657, order_dev=0.0e+00) | GATE2 perturb ok (drop=0.004) | GATE3 distribution ok (sd=0.2635, tie=0.01) | GATE4 coverage ok (usable=1.00, minority=0.40, rows=240,"
+   }
+  },
+  {
+   "name": "deterministic",
+   "ok": true,
+   "detail": "same call twice gave the same verdict and numbers",
+   "evidence": {
+    "first": "VERDICT: PASS | GATE1 reproduce ok (r=0.657, order_dev=0.0e+00) | GATE2 perturb ok (drop=0.004) | GATE3 distribution ok (sd=0.2635, tie=0.01) | GATE4 coverage ok (usable=1.00, minority=0.40, rows=240,",
+    "second": "VERDICT: PASS | GATE1 reproduce ok (r=0.657, order_dev=0.0e+00) | GATE2 perturb ok (drop=0.004) | GATE3 distribution ok (sd=0.2635, tie=0.01) | GATE4 coverage ok (usable=1.00, minority=0.40, rows=240,"
+   }
+  },
+  {
+   "name": "order_invariance",
+   "ok": true,
+   "detail": "verdict stable under row order (PASS)",
+   "evidence": {
+    "baseline": "PASS",
+    "permuted": "PASS"
+   }
+  },
+  {
+   "name": "label_permutation",
+   "ok": true,
+   "detail": "labels shuffled -> FAIL (0.657 -> 0.049): the audit is really reading the labels",
+   "evidence": {
+    "baseline_verdict": "PASS",
+    "permuted_verdict": "FAIL",
+    "baseline_number": 0.657,
+    "permuted_number": 0.049
+   }
+  },
+  {
+   "name": "control_pair",
+   "ok": true,
+   "detail": "known-positive -> SUSPECT, known-negative -> FAIL: the audit tells a perfect predictor from a useless one",
+   "evidence": {
+    "known_positive": 1.0,
+    "known_negative": -0.038,
+    "sample": "VERDICT: SUSPECT | GATE1 reproduce ok (r=1.000, order_dev=0.0e+00) | GATE2 perturb ok (drop=0.001) | GATE3 distribution WARN (sd=0.4890, tie=0.60) | GATE4 coverage ok (usable=1.00, minority=0.40, rows"
+   }
+  },
+  {
+   "name": "spike_recovery",
+   "ok": true,
+   "detail": "injected half-the-answer into the prediction: reading 0.657 -> 0.973 (+0.316), the channel is alive",
+   "evidence": {
+    "before": 0.657,
+    "after": 0.973,
+    "delta": 0.316,
+    "dose": 0.5,
+    "verdict_before": "PASS",
+    "verdict_after": "PASS"
+   }
+  }
+ ]
+}

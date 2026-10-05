@@ -509,3 +509,16 @@ similarity rather than embeddings — swap `text_similarity` for a vector index
 when the library is big enough to need it. `RoleType.FORGE` is declarative only:
 a topology names a forge role, it does not yet change which tools that child can
 reach.
+
+## Related work by the same author
+
+The same claim -- *a number is meaningless until it is shown to survive its own
+verification* -- is made and measured in other domains:
+
+| repo | the number it refuses to trust |
+| ---- | ---- |
+| [autoforge](https://github.com/ZhangYangyi03/autoforge) | a tool's fitness, until an oracle outside the tool agrees |
+| [agentic-eda](https://github.com/ZhangYangyi03/agentic-eda) | a circuit's area, until equivalence to the reference netlist is proven |
+| [debt-verify](https://github.com/ZhangYangyi03/debt-verify) | a debt clause decision, until it survives the published revision record |
+| [tool-market](https://github.com/ZhangYangyi03/tool-market) | a tool's liveness, until the hash chain says which revision is live |
+| [agent-safety-bench](https://github.com/ZhangYangyi03/agent-safety-bench) | a model's safety compliance, measured rather than assumed |
