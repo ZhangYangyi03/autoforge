@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "autoforge: trustworthy self-made tools for agents"
+abstract: "An agent framework in which tools are created freely but must earn trust: an independent validity gate and non-gameable fitness take the fitness definition and the oracle out of the tested tool's hands. Clean A/B/C ablation on a real model holds tool intactness at 3/3 with the gate on and rots to 0/3 within four generations with it off."
+authors:
+  - family-names: Zhang
+    given-names: Yangyi
+    affiliation: Georgetown University
+repository-code: "https://github.com/ZhangYangyi03/autoforge"
+license: Apache-2.0
+type: software
+keywords: [llm agents, tool verification, self-evolving, agent framework]
