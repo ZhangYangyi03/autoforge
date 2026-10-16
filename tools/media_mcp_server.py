@@ -27,11 +27,17 @@ Two groups of tools, and they are here for different reasons:
   find, and they are worth having somewhere permanent.
 
 **Reads are confined.** `read_local_file` and its siblings resolve every path
-against `MEDIA_MCP_ROOT` (default: the working directory) and refuse anything
-that escapes it. A server that will read any path it is handed is a filesystem
-read primitive wearing a tool name, and the client cannot see that: an imported
-tool's scope is `undeclared` by construction. Confining here is the one place
-the check can actually be made.
+against the roots named in `MEDIA_MCP_ROOT` (default: the working directory) and
+refuse anything that escapes them. A server that will read any path it is handed
+is a filesystem read primitive wearing a tool name, and the client cannot see
+that: an imported tool's scope is `undeclared` by construction. Confining here is
+the one place the check can actually be made.
+
+`MEDIA_MCP_ROOT` takes more than one root, separated by the platform's path
+separator (`;` on Windows, `:` elsewhere), because one is not enough in
+practice: an agent that inspects its own state and its own source needs both the
+store under `~/.autoforge` and the package under site-packages, and those are
+not under a common parent.
 
 The API key is read from this process's own environment. It is never taken from
 the agent's environment -- `MCPClient._env` deliberately does not forward it --
@@ -100,28 +106,39 @@ def text(rid: Any, body: str, is_error: bool = False) -> None:
 # ----------------------------------------------------------------------
 # the sandbox for reads
 # ----------------------------------------------------------------------
-def _root() -> Path:
-    return Path(os.environ.get("MEDIA_MCP_ROOT") or os.getcwd()).resolve()
+def _roots() -> list[Path]:
+    """The directories reads are allowed inside.
+
+    More than one, because a single root cannot cover an agent that inspects
+    both its own store and its own installed source -- those live under
+    `~/.autoforge` and site-packages, with no common parent worth allowing.
+    """
+    raw = os.environ.get("MEDIA_MCP_ROOT") or os.getcwd()
+    parts = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+    return [Path(p).resolve() for p in parts] or [Path(os.getcwd()).resolve()]
 
 
 def confined(path: str) -> Path:
-    """A path inside the root, or a refusal that says what the root is.
+    """A path inside one of the roots, or a refusal that lists them.
 
     Resolved before the check, so `..` and a symlink both land where they
     actually point rather than where they claim to.
     """
     if not path:
         raise ValueError("a path is required")
+    roots = _roots()
     candidate = Path(path)
     if not candidate.is_absolute():
-        candidate = _root() / candidate
+        candidate = roots[0] / candidate
     resolved = candidate.resolve()
-    root = _root()
-    if resolved != root and root not in resolved.parents:
-        raise ValueError(
-            f"{path!r} is outside the readable root {root}. Widen it by setting "
-            f"MEDIA_MCP_ROOT in this server's env block if that is intended.")
-    return resolved
+    for root in roots:
+        if resolved == root or root in resolved.parents:
+            return resolved
+    listed = ", ".join(str(r) for r in roots)
+    raise ValueError(
+        f"{path!r} is outside the readable roots ({listed}). Widen them by "
+        f"setting MEDIA_MCP_ROOT in this server's env block if that is "
+        f"intended.")
 
 
 def read_text(path: str, limit: int = READ_LIMIT) -> str:
@@ -475,7 +492,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "read_local_file",
         "description": (
-            "Read a text file. Confined to the readable root, which is the "
+            "Read a text file. Confined to the readable roots, which are the "
             "working directory unless MEDIA_MCP_ROOT says otherwise."
         ),
         "inputSchema": {
@@ -625,7 +642,8 @@ def handle_call(rid: Any, name: str, args: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    log(f"{SERVER_NAME} {SERVER_VERSION} ready; readable root {_root()}")
+    log(f"{SERVER_NAME} {SERVER_VERSION} ready; readable roots "
+        f"{', '.join(str(r) for r in _roots())}")
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:

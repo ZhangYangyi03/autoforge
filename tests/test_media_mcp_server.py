@@ -22,6 +22,7 @@ Two things are worth pinning beyond "it works":
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -127,6 +128,45 @@ def test_a_file_inside_the_root_is_read(server, tmp_path):
     ok, body = call(server, "read_local_file", path="hello.txt")
     assert ok
     assert body == "inside\n"
+
+
+def test_more_than_one_root_can_be_named(tmp_path):
+    """One root is not enough in practice.
+
+    An agent inspecting both its own store and its own installed source needs
+    two directories that share no useful parent, so the confinement has to
+    accept a list rather than widening to something like the whole drive.
+    """
+    first = tmp_path / "store"
+    second = tmp_path / "package"
+    first.mkdir()
+    second.mkdir()
+    (second / "mod.py").write_bytes(b"x = 1\n")
+
+    config = MCPServerConfig(
+        name="local", command=sys.executable, args=[str(SERVER)],
+        env={"PYTHONPATH": str(REPO),
+             "MEDIA_MCP_ROOT": os.pathsep.join([str(first), str(second)])},
+        timeout=30.0, call_timeout=60.0)
+    client = MCPClient(config)
+    assert client.start(), client.error
+    try:
+        ok, body = render_result(
+            client.call_tool("read_local_file", {"path": str(second / "mod.py")}))
+        assert ok, body
+        assert body == "x = 1\n"
+
+        # ...and a third directory is still refused, so naming two roots did
+        # not turn the check off.
+        third = tmp_path / "elsewhere"
+        third.mkdir()
+        (third / "secret.txt").write_bytes(b"no\n")
+        ok, body = render_result(
+            client.call_tool("read_local_file", {"path": str(third / "secret.txt")}))
+        assert not ok
+        assert "outside the readable roots" in body
+    finally:
+        client.close()
 
 
 # ----------------------------------------------------------------------
