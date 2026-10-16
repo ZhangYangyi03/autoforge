@@ -1,0 +1,611 @@
+--- a/tools/registry.py	2026-10-16 12:28:47.485727200 +0800
++++ b/tools/registry.py	2026-10-16 12:29:24.185025500 +0800
+@@ -17,7 +17,7 @@
+ import time
+ import traceback
+ from dataclasses import dataclass
+-from typing import Any, Callable
++from typing import Any, Callable, Iterable
+ 
+ from .spec import ToolSpec, ToolState
+ 
+@@ -69,6 +69,34 @@
+         # this to include DRAFT so a tool can be tested before it is trusted.
+         self.visible_states = visible_states or {ToolState.PROBATION, ToolState.ACTIVE}
+         self._events: list[dict[str, Any]] = []
++        # -- exposure: which schemas ride in every request ----------------
++        #: Where "when was this last called" comes from. A callable rather than
++        #: a field because the answer outlives this process: the registry's own
++        #: `spec.stats.last_called` is only as good as the last `save_tool`, and
++        #: a call is not a state change, so most calls are never written back.
++        #: The ledger has every call; this is how the ledger gets asked. None
++        #: falls back to `spec.stats.last_called`, which is the right answer for
++        #: a bare registry with no store behind it (tests, embedders).
++        self.last_called_source: Callable[[str], float | None] | None = None
++        #: How many days of silence demote a tool from "carried in full" to
++        #: "named on a list". A week, because the ledger says that is roughly
++        #: the working set: 40 of 204 tools on this machine at 7 days, 143 at
++        #: 14. Read by the exposure cache's key and by the block that explains
++        #: the demotion to the model, so the sentence and the behaviour cannot
++        #: disagree.
++        self.window_days = 7.0
++        #: Names to keep hot whatever the ledger says, set by the caller per
++        #: run. A *past* record cannot answer whether a tool is wanted for
++        #: *this* task, and the run that needs a tool it has not used this week
++        #: is exactly the run whose first turn would otherwise not carry it.
++        self.protect: set[str] = set()
++        #: Calls made through this registry, which is what makes the exposure
++        #: cache below safe to keep: the thing the exposure depends on -- how
++        #: recently each tool was used -- can only change when a call happens.
++        self._calls_seen = 0
++        self._exposure_cache: tuple[Any, ...] | None = None
++        self._exposure_result: tuple[list[dict[str, Any]], list[str],
++                                     dict[str, int]] | None = None
+ 
+     # -- registration -------------------------------------------------
+     def register(self, spec: ToolSpec, *, replace: bool = True) -> ToolSpec:
+@@ -108,6 +136,72 @@
+             include = self.visible_states
+         return [s.schema for s in self._tools.values() if s.state in include]
+ 
++    # -- exposure: what rides in every request, and what is only listed -----
++    def days_since_called(self, name: str) -> float | None:
++        """How long ago this tool was last called, or None if never.
++
++        The ledger first, `spec.stats` second. The order matters: a call is not
++        a state change, so `stats.last_called` only survives processes where
++        something happened to save the tool -- which is to say, almost never.
++        The ledger answers for every call ever made on this machine, which is
++        the only source with enough rows to demote anything honestly.
++        """
++        if self.last_called_source is not None:
++            try:
++                ts = self.last_called_source(name)
++            except Exception:                             # noqa: BLE001
++                ts = None
++            if ts:
++                return max(0.0, (time.time() - float(ts)) / 86400.0)
++        spec = self._tools.get(name)
++        if spec is None or not spec.stats.last_called:
++            return None
++        return max(0.0, (time.time() - spec.stats.last_called) / 86400.0)
++
++    def exposure(self, *, window_days: float | None = None,
++                 protect: "Iterable[str] | None" = None,
++                 include: "set[ToolState] | None" = None
++                 ) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
++        """(hot schemas, cold lines, counts) for the next request.
++
++        Cached until a call happens or the hour turns over, because those are
++        the only two things that can change the answer. Without the cache this
++        would run a query per tool per turn, which is a real cost paid to save a
++        real cost; with it, the prompt it builds is byte-identical between two
++        turns that made no call, which is what the provider's prefix cache needs.
++
++        The hour is in the key because a call is *not* the only thing that moves
++        the answer -- time does. A tool called yesterday is hot for seven days
++        and must go cold on the eighth without anybody calling anything. A cache
++        keyed only on the call counter gets that right for every session that
++        restarts, and wrong for one that stays up: measured from the counter
++        alone, a long-lived session would keep yesterday's working set for as
++        long as it ran. One bucket per hour bounds the error at an hour and
++        re-bills a prompt prefix once an hour, which is nothing against a window
++        measured in days.
++        """
++        from . import exposure as exposure_mod
++
++        if window_days is None:
++            window_days = self.window_days
++        if protect is None:
++            protect = self.protect
++        key = (round(window_days, 4), tuple(sorted(protect)),
++               tuple(sorted(s.value for s in (include or self.visible_states))),
++               self._calls_seen, len(self._tools),
++               int(time.time() // 3600))
++        if self._exposure_cache == key and self._exposure_result is not None:
++            return self._exposure_result
++        result = exposure_mod.split(
++            self.schemas(include=include) if include is not None else self.schemas(),
++            self.days_since_called,
++            window_days=window_days,
++            protect=protect,
++        )
++        self._exposure_cache = key
++        self._exposure_result = result
++        return result
++
+     # -- invocation ----------------------------------------------------
+     def call(self, name: str, arguments: dict[str, Any], *, force: bool = False) -> ToolResult:
+         spec = self._tools.get(name)
+@@ -127,6 +221,12 @@
+         if blocked is not None:
+             return blocked
+ 
++        # Only here: after the state check and after the gate. A tool that was
++        # quarantined or that the operator refused did not run, and counting it
++        # as used would keep a tool hot on the strength of calls it never made.
++        self._calls_seen += 1
++        spec.stats.last_called = time.time()
++
+         started = time.perf_counter()
+         try:
+             if spec.runner is not None:
+--- a/core/agent.py	2026-10-16 12:28:47.942221800 +0800
++++ b/core/agent.py	2026-10-16 12:30:15.763950800 +0800
+@@ -118,6 +118,7 @@
+         steer: Any = None,
+         compactor: Any = None,
+         on_compact: Callable[[Any], None] | None = None,
++        exposure: Any = None,
+     ) -> None:
+         self.llm = llm
+         self.registry = registry
+@@ -139,10 +140,61 @@
+         # deciding a window size for the caller.
+         self.compactor = compactor
+         self.on_compact = on_compact
++        #: Anything with `exposure(protect=...) -> (hot, cold_lines, counts)`:
++        #: the split between tool schemas that ride in every request and tools
++        #: that are only named. Optional, and None means every visible tool is
++        #: sent in full -- the behaviour before this existed, which is what a
++        #: bare loop and every test that does not care about cost should get.
++        #: See `autoforge/tools/exposure.py` for the measured reason it exists.
++        self.exposure = exposure
+         self._terminated: _TerminateSignal | None = None
+         if allow_self_terminate:
+             self._register_terminate_tool()
+ 
++    def _request(self, msgs: list[Message]) -> tuple[list[Message], list[dict[str, Any]]]:
++        """The messages and schemas for one request.
++
++        Two things differ from `msgs` itself, and both are deliberate:
++
++        * only the *hot* tool schemas are sent as tools;
++        * the cold ones ride as one extra user message, placed immediately
++          after the system prompt rather than at the end.
++
++        The position is a cost decision. The provider bills a prompt prefix from
++        cache only while it is byte-identical to the last request, and this
++        block changes exactly when a tool is called -- so putting it early means
++        a turn that calls nothing re-bills nothing, and the growing conversation
++        behind it is the only part that moves. At the end it would sit after the
++        whole conversation and be cached anyway; the reason for the front is
++        that a model reads instructions before the transcript, and a list of
++        what it has is an instruction, not a remark.
++
++        A cold tool stays callable and stays discoverable. What is not sent is
++        its parameter schema, which for 61 tools that were never called is the
++        bulk of what this saves.
++        """
++        if self.exposure is None:
++            return msgs, self.registry.schemas()
++        try:
++            hot, cold_lines, stats = self.exposure.exposure()
++        except Exception:                                     # noqa: BLE001
++            # A cost optimisation must never be the thing that loses the run.
++            # Falling back to sending everything is the pre-existing behaviour:
++            # expensive and correct.
++            return msgs, self.registry.schemas()
++        if not cold_lines:
++            return msgs, hot
++        from ..tools.exposure import manifest_header
++        block = (manifest_header(stats, getattr(self.exposure, "window_days", 7.0))
++                 + "\n" + "\n".join(cold_lines))
++        # Copied, never appended to `msgs`: the transcript on disk is the
++        # conversation, and a block injected per request that became part of the
++        # record would be replayed by a resume as something the person said.
++        req = list(msgs)
++        insert_at = 1 if msgs and msgs[0].role == "system" else 0
++        req.insert(insert_at, Message.user(block))
++        return req, hot
++
+     def _register_terminate_tool(self) -> None:
+         from ..tools.spec import ToolSpec, ToolState
+ 
+@@ -280,9 +332,15 @@
+                     _notify(self.on_compact, event)
+ 
+             _notify(self.on_request, turn)
++            # The exposure split decides what this request carries: only the
++            # hot schemas go as `tools`, and the cold ones ride as a
++            # one-line-each block right after the system prompt. With no
++            # exposure callback this is `(msgs, registry.schemas())`, which is
++            # exactly what the loop sent before the split existed.
++            req_msgs, req_tools = self._request(msgs)
+             try:
+                 resp = self.llm.chat(
+-                    msgs, tools=self.registry.schemas(),
++                    req_msgs, tools=req_tools,
+                     should_abort=self._operator_wants_the_floor,
+                 )
+             except LLMAborted:
+--- a/store.py	2026-10-16 12:28:48.318902900 +0800
++++ b/store.py	2026-10-16 12:29:51.084141400 +0800
+@@ -416,6 +416,36 @@
+             results.append(entry)
+         return results
+ 
++    def last_called_by_tool(self) -> dict[str, float]:
++        """Newest `call` event per tool, from the ledger.
++
++        The ledger is the only complete record of what was used: `call` events
++        are appended for every tool the loop ran, while a tool's own
++        `stats.last_called` is only written back when something saves the tool,
++        which is rare. That asymmetry is why the exposure decision can be made
++        from the ledger and not from the registry.
++
++        One pass over one indexed column. The result is held by the registry
++        until a call happens, so this runs once per tool call, not once per
++        turn, and the prompt does not move between turns that call nothing.
++        """
++        newest: dict[str, float] = {}
++        try:
++            rows = self._conn.execute(
++                "SELECT timestamp, payload FROM forge_events"
++                " WHERE kind='call' ORDER BY id"
++            ).fetchall()
++        except Exception:                                     # noqa: BLE001
++            return newest
++        for r in rows:
++            try:
++                name = _unjson(r["payload"]).get("tool")
++            except Exception:                                 # noqa: BLE001
++                continue
++            if name:
++                newest[name] = float(r["timestamp"])
++        return newest
++
+ 
+     # -- deliberate memory ------------------------------------------------
+     def remember(self, key: str, value: str, tags: list[str] | None = None) -> None:
+--- a/agent.py	2026-10-16 12:28:48.677014600 +0800
++++ b/agent.py	2026-10-16 12:34:57.420862900 +0800
+@@ -30,6 +30,7 @@
+ 
+ import json
+ import os
++import re
+ import sys
+ import time
+ from dataclasses import dataclass, field
+@@ -417,6 +418,12 @@
+     "install_system_task": "system",
+ }
+ 
++#: Tool-schema characters a library may carry in every prompt before a forge is
++#: asked to justify itself. Roughly four characters to the token, so 6000 is
++#: about 1500 tokens per turn, every turn, before the conversation starts. Read
++#: by `_tool_budget_report`.
++TOOL_SCHEMA_BUDGET_CHARS = 6000
++
+ 
+ @dataclass
+ class ForgeAgent:
+@@ -465,6 +472,18 @@
+         self.registry.policy = self.policy
+         self.registry.confirmer = self.confirmer
+ 
++        # The exposure decision reads the ledger, and this is the wire: the
++        # registry asks the store which tools were called when, once per call,
++        # and the answer is what decides which schemas ride in every request.
++        # Bound here rather than in the registry's constructor for the same
++        # reason the control plane is: a bare registry has no ledger to ask.
++        if self.store is not None and hasattr(self.registry, "last_called_source"):
++            self.registry.last_called_source = self._last_called_at
++        #: Cleared per run, and the cache behind `_last_called_at`.
++        self._current_task: str = ""
++        self._last_called_map: dict[str, float] = {}
++        self._last_called_seen: int | None = None
++
+         self.selfmod = SelfModifier(
+             require_rationale=self.policy.require_change_rationale,
+             log_all=self.policy.log_all_changes,
+@@ -616,6 +635,61 @@
+         self.registry.promote(spec.name)
+ 
+     # ------------------------------------------------------------------
++    # the prompt budget: what the library costs every turn
++    # ------------------------------------------------------------------
++    def _tool_schema_chars(self, *, own_only: bool = True) -> int:
++        """Total characters of tool schema that ride in every prompt.
++
++        Measured from the same `schema` property the model is sent, so this
++        cannot drift from what is actually billed. Roughly four characters to
++        the token, so 6000 characters is about 1500 tokens per turn, every
++        turn, before the conversation starts.
++
++        `own_only` (the default) counts the tools this agent added, not the
++        frozen builtin baseline. The baseline is the whole 50-odd tool set the
++        framework ships, it cannot be retired, and on this machine it is ~24.6k
++        characters on its own -- so counting it put the total permanently over
++        the 6,000 cap. The number then described the framework rather than the
++        library it exists to bound, and because the caller treated an
++        over-budget report as a refusal, the forge it was meant to make
++        *justify itself* was instead refused outright, every time, on every
++        machine with the full tool set. Settled 2026-09-15.
++        """
++        total = 0
++        for name in self.registry.names():
++            spec = self.registry.get(name)
++            if spec is None:
++                continue
++            if own_only and (spec.source or "") == "builtin":
++                # Not the agent's to weigh: shipping tools are not a library
++                # decision, and no retire_tool can give this context back.
++                continue
++            try:
++                total += len(json.dumps(spec.schema, ensure_ascii=False))
++            except (TypeError, ValueError):
++                total += len(spec.name) + len(spec.description or "")
++        return total
++
++    def _tool_budget_report(self) -> str:
++        """Empty when there is room; a warning when the forge should justify itself.
++
++        Returns a string rather than raising, because the right response to an
++        over-budget library is not to refuse the work -- the need may be real
++        and urgent -- but to make the agent name what it is trading away. A
++        silent forge at the cap is how a library becomes mostly sediment.
++        """
++        used = self._tool_schema_chars()
++        if used <= TOOL_SCHEMA_BUDGET_CHARS:
++            return ""
++        return (
++            f"Tool schema budget exceeded: {used} chars in the prompt every "
++            f"turn, over the {TOOL_SCHEMA_BUDGET_CHARS}-char budget. Forging "
++            "another adds to a cost that is paid on every request, not once. "
++            "Retire a tool you no longer need (retire_tool) and forge again, or "
++            "state which existing tool this one is worth replacing and why."
++        )
++
++    # ------------------------------------------------------------------
+     # frozen baselines — the exam the mutants do not write
+     # ------------------------------------------------------------------
+     def _baseline_for(self, spec: ToolSpec) -> FrozenBaseline:
+@@ -2993,6 +3067,68 @@
+             except Exception:                    # a bad observer must not run the task
+                 pass
+ 
++    def _hot_protect(self) -> set[str]:
++        """Tools this run must carry in full, whatever the ledger says.
++
++        The ledger answers "what has been used lately", and that is the right
++        question for a cost decision -- but it is a *past* question, and a task
++        can be about something the ledger has never seen. A run whose text names
++        Chromium should carry the browser tools whether or not any of them were
++        called this week; otherwise the first turn of exactly the tasks that
++        need a tool is the one turn that cannot call it in full.
++
++        Deliberately narrow: names appearing whole in the task text, matched on
++        word boundaries. A substring match would keep `see` hot on every task
++        containing "seen", and a set that grows to everything protects nothing.
++        """
++        task = getattr(self, "_current_task", "") or ""
++        if not task:
++            return set()
++        tokens = re.findall(r"[a-z0-9_]+", task.lower())
++        if not tokens:
++            return set()
++        # Word boundaries, which the first draft only half-had: it tested
++        # `name.replace("_", " ") in task` with a plain substring `in`, so a
++        # tool called `see` was protected by the word "seen" and one called
++        # `run` by "running". The boundary is the entire point of this function
++        # -- a set that grows to everything protects nothing -- and the bug
++        # produced exactly the failure the docstring warns about.
++        # So: a single-word name matches a whole token, and a multi-word name
++        # matches a *contiguous* run of tokens. Nothing matches a fragment.
++        words = set(tokens)
++        out = set()
++        for name in self.registry.names():
++            low = name.lower()
++            if low in words:
++                out.add(name)
++                continue
++            parts = low.split("_")
++            if len(parts) < 2:
++                continue
++            width = len(parts)
++            if any(tokens[i:i + width] == parts
++                   for i in range(len(tokens) - width + 1)):
++                out.add(name)
++        return out
++
++    def _last_called_at(self, name: str) -> float | None:
++        """When this tool was last called, from the ledger, newest per tool.
++
++        Cached on the agent rather than on the registry so the registry stays a
++        dict of specs and this stays a fact about the ledger. Invalidated by the
++        registry's own call counter: the only thing that can change an answer
++        here is a call, and every call bumps that counter.
++        """
++        seen = getattr(self.registry, "_calls_seen", 0)
++        if getattr(self, "_last_called_seen", None) == seen:
++            return (self._last_called_map or {}).get(name)
++        try:
++            self._last_called_map = self.store.last_called_by_tool()
++        except Exception:                                     # noqa: BLE001
++            self._last_called_map = {}
++        self._last_called_seen = seen
++        return self._last_called_map.get(name)
++
+     # ------------------------------------------------------------------
+     def apply_role(self, brief: str, role: str = "") -> None:
+         """Take on a role assigned by the agent that spawned this one.
+@@ -3055,10 +3191,21 @@
+         # Also attach it to the trace, so records written by forging and
+         # self-modification stream live too — not just the loop's own events.
+         self._progress = progress
++        # Held for the run and cleared after it: the exposure decision reads it
++        # to keep a tool hot when the task names it, and a task text left behind
++        # would keep the previous run's tools hot forever.
++        self._current_task = task
++        # Read by the exposure filter and cleared with the task: a tool the task
++        # names stays hot even if nothing called it this week, because the run
++        # that needs it is exactly the run whose first turn would otherwise miss
++        # it. Set here rather than inside the loop: this is where the task is.
++        self.registry.protect = self._hot_protect()
+         try:
+             return self._run_locked(task, history, _emit)
+         finally:
+             self._progress = None
++            self._current_task = ""
++            self.registry.protect = set()
+ 
+     def _run_locked(self, task: str, history: list[Message] | None,
+                     _emit: Callable[..., None]) -> AgentResult:
+@@ -3076,6 +3223,11 @@
+             steer=self.steer,
+             compactor=self.compactor,
+             on_compact=self._on_compact,
++            # Where the token bill is decided. Handing the registry over as the
++            # expose callback is what makes "not called in a week" mean "not in
++            # every request"; without it the loop sends every visible schema,
++            # which is what it did before the split existed.
++            exposure=self.registry,
+         )
+         result = agent.run(task, history)
+         self._record("finish", {
+--- /dev/null	2026-10-16 12:35:11.000000000 +0800
++++ b/autoforge/tools/exposure.py
+@@ -0,0 +1,141 @@
++"""Which tool schemas ride in every request, and which are merely listed.
++
++The library is not the prompt. Those became the same thing by accident: every
++tool the registry exposes is serialised into every model call, and nothing ever
++looked at whether the tool had been used. Measured on this machine 2026-09-28:
++204 visible schemas, 106,503 characters, ~33k tokens, paid on every request of
++every turn -- of which 61 tools had never been called once, and 147 of the 148
++tools ever called sat behind them.
++
++The fix is not deletion and not a smaller library. A tool that is never called
++is still worth keeping -- it was forged for a need that may come back -- but it
++does not need its full parameter schema in front of the model to be *findable*.
++So exposure splits in two:
++
++    hot   -- called within the window, plus a floor of tools that carry the
++             interaction itself (run_python, forge_tool, describe_tool, ...).
++             Full schema, as before.
++    cold  -- everything else. Name, parameters and a one-line description:
++             enough to recognise the tool and ask for it by name.
++
++A cold tool is not hidden and not retired. It costs a line, it is callable as
++soon as the model names it, and `describe_tool` hands back the full schema on
++request. The saving is real only because the model does not need to know the
++argument shapes of 61 tools it is not calling this turn -- and the price of
++being wrong is one extra call, not a lost capability.
++
++A third tier is deliberately absent: dropping the name entirely and making the
++model guess from a search box. The market does that, and the reason a name-and-
++line list beats it is that it costs 20 characters and removes the whole class of
++failure where the tool exists and the model never learns it does.
++"""
++from __future__ import annotations
++
++from typing import Any, Callable, Iterable, Sequence
++
++#: The tools that carry the interaction itself. A floor, not a preference: these
++#: are the ones a model reaches for when it does not yet know what it needs, so
++#: they must never be demoted to a name on a list. `run_python` is where a
++#: one-off lookup goes; `forge_tool`/`describe_tool`/`list_tools` are how a cold
++#: tool is found again; `remember`/`recall` carry facts across sessions;
++#: `terminate` ends the run. Everything else earns its place by being called.
++HOT_FLOOR: frozenset[str] = frozenset({
++    "run_python", "describe_tool", "list_tools", "forge_tool", "terminate",
++    "remember", "recall",
++})
++
++#: Description characters kept in the cold list. Long enough to say what the
++#: tool is for, short enough that 120 of them cost less than ten hot schemas.
++COLD_DESC_CHARS = 100
++
++#: Parameter names shown in the cold list. The point of showing any is that
++#: "read_magic_value(path)" is recognisable where "read_magic_value" alone is
++#: only a guess; the point of capping is that the list is one line per tool.
++COLD_PARAM_NAMES = 4
++
++
++def _names(schema: dict[str, Any]) -> list[str]:
++    fn = schema.get("function") if isinstance(schema.get("function"), dict) else schema
++    params = fn.get("parameters") if isinstance(fn, dict) else None
++    if not isinstance(params, dict):
++        return []
++    props = params.get("properties")
++    return list(props) if isinstance(props, dict) else []
++
++
++def _schema_name(schema: dict[str, Any]) -> str:
++    fn = schema.get("function") if isinstance(schema.get("function"), dict) else schema
++    return str(fn.get("name") or "")
++
++
++def _schema_desc(schema: dict[str, Any]) -> str:
++    fn = schema.get("function") if isinstance(schema.get("function"), dict) else schema
++    return str(fn.get("description") or "").strip().split("\n")[0]
++
++
++def cold_line(name: str, schema: dict[str, Any],
++              desc_override: str = "") -> str:
++    """One line standing in for a tool that is not being handed over in full."""
++    params = _names(schema)
++    shown = ", ".join(params[:COLD_PARAM_NAMES])
++    if len(params) > COLD_PARAM_NAMES:
++        shown += ", ..."
++    desc = (desc_override or _schema_desc(schema)).strip().replace("\n", " ")
++    if len(desc) > COLD_DESC_CHARS:
++        desc = desc[:COLD_DESC_CHARS - 1].rstrip() + "\u2026"
++    sig = f"{name}({shown})" if shown else f"{name}()"
++    return f"  - {sig} \u2014 {desc}" if desc else f"  - {sig}"
++
++
++def split(
++    schemas: Sequence[dict[str, Any]],
++    days_since: Callable[[str], float | None],
++    *,
++    window_days: float = 7.0,
++    floor: Iterable[str] = HOT_FLOOR,
++    protect: Iterable[str] = (),
++) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
++    """Split schemas into (hot, cold lines, counts).
++
++    `days_since(name)` returns how long ago the tool was last called, or None if
++    there is no record of it ever being called. A tool with no record is cold --
++    that is the whole point: never called is the strongest evidence available
++    that its argument list does not need to be in front of the model this turn.
++
++    `window_days` bounds the number of schemas by *behaviour*, not by a count.
++    A hard cap needs a tie-break, and every tie-break it could have (name order,
++    cost, age) demotes a tool for a reason unrelated to whether it is wanted. A
++    window demotes for exactly one reason -- nothing reached for it in a week --
++    and self-corrects the moment something does.
++
++    `protect` is the caller's escape hatch: names that must stay hot this run
++    whatever the ledger says (a tool the task text names, a topology's role
++    whitelist). Kept separate from `floor` so a caller's reason and the
++    framework's reason are not folded into one set.
++    """
++    keep = set(floor) | set(protect)
++    hot: list[dict[str, Any]] = []
++    lines: list[str] = []
++    for schema in schemas:
++        name = _schema_name(schema)
++        age = days_since(name)
++        if name in keep or (age is not None and age <= window_days):
++            hot.append(schema)
++        else:
++            lines.append(cold_line(name, schema))
++    stats = {
++        "hot": len(hot),
++        "cold": len(lines),
++        "total": len(schemas),
++    }
++    return hot, lines, stats
++
++
++def manifest_header(stats: dict[str, int], window_days: float) -> str:
++    return (
++        f"Tools you can call but are not carrying in full ({stats['cold']} of "
++        f"{stats['total']}): not called in {window_days:g} days, so only their "
++        "name, arguments and one line are shown. They are callable as they are "
++        "\u2014 use one directly, or call describe_tool(name) for its full "
++        "parameter schema first."
++    )
