@@ -48,6 +48,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -288,17 +289,117 @@ def find_local_wheel(manifest: dict[str, Any]) -> Path | None:
     return None
 
 
-def download_wheel(manifest: dict[str, Any], dest: Path) -> Path | None:
+def _repo_and_tag(url: str) -> tuple[str, str]:
+    """(owner/repo, tag) out of a release download URL.
+
+    `https://github.com/O/R/releases/download/TAG/file` -> `(O/R, TAG)`.
+    Written against the URL rather than a separate manifest field so a manifest
+    built by an older build_wheel.py still resolves.
+    """
+    m = re.search(r"github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/", url)
+    if not m:
+        raise ValueError(f"cannot read repo/tag out of {url!r}")
+    return m.group(1), m.group(2)
+
+
+def _api_get_json(url: str) -> Any:
+    """GET a GitHub API endpoint as JSON, with the headers it insists on."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        # GitHub 403s an API request with no User-Agent, and urllib's default
+        # ("Python-urllib/3.x") is exactly the kind it drops.
+        "User-Agent": "autoforge-install-doctor",
+    })
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def download_via_api(manifest: dict[str, Any], dest: Path) -> Path | None:
+    """The release asset, fetched through api.github.com instead of github.com.
+
+    This exists because the two hosts fail differently here. The sandbox's
+    proxy answers `github.com` CONNECT with **502**, which takes
+    `pip install https://github.com/...` down with it -- so the recorded
+    wheel URL, the one that works everywhere else, works nowhere on this
+    machine. `api.github.com` is allowed through, and a public repo's assets
+    need no token to fetch.
+
+    Two steps: resolve the asset id (the API needs it, and it changes on every
+    re-upload), then GET that asset URL with `Accept: application/octet-stream`
+    -- without that header GitHub answers with a redirect *object* as JSON
+    instead of the bytes.
+    """
     url = manifest["wheel"]["url"]
     try:
+        repo, tag = _repo_and_tag(url)
+    except ValueError as exc:
+        print(f"    {exc}")
+        return None
+    name = manifest["wheel"]["name"]
+    try:
+        rel = _api_get_json(
+            f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+        asset = next((a for a in rel.get("assets", []) if a["name"] == name),
+                     None)
+        if asset is None:
+            print(f"    {name} is not an asset on release {tag}")
+            return None
         import urllib.request
-        with urllib.request.urlopen(url, timeout=120) as r, \
+        req = urllib.request.Request(asset["url"], headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "autoforge-install-doctor",
+        })
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=600) as r, \
                 dest.open("wb") as fh:
             shutil.copyfileobj(r, fh)
     except Exception as exc:                              # noqa: BLE001
-        print(f"    download failed: {type(exc).__name__}: {exc}")
+        print(f"    api download failed: {type(exc).__name__}: {exc}")
         return None
-    return dest if sha256_file(dest) == manifest["wheel"]["sha256"] else None
+    return dest
+
+
+def download_wheel(manifest: dict[str, Any], dest: Path) -> Path | None:
+    """The wheel this install should be, from the network, or None.
+
+    Tries the recorded release URL first -- it is the right one for every
+    machine that can reach github.com -- then falls back to the API, which is
+    the one that works behind a proxy that blocks github.com. Either way the
+    sha256 in the manifest has to match: a wheel that hashes differently is
+    not the build this install tracks, whatever it calls itself.
+    """
+    url = manifest["wheel"]["url"]
+    for label, attempt in (("release url", lambda: _direct(url, dest)),
+                           ("github api", lambda: download_via_api(manifest, dest))):
+        try:
+            got = attempt()
+        except Exception as exc:                          # noqa: BLE001
+            print(f"    {label}: {type(exc).__name__}: {exc}")
+            got = None
+        if got is not None and got.exists() and got.stat().st_size > 0:
+            if sha256_file(got) == manifest["wheel"]["sha256"]:
+                print(f"    obtained via {label} ({got.stat().st_size:,} B, "
+                      f"sha256 ok)")
+                return got
+            print(f"    {label}: sha256 mismatch, discarding")
+            got.unlink(missing_ok=True)
+    print("    no route to the wheel worked")
+    return None
+
+
+def _direct(url: str, dest: Path) -> Path | None:
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "autoforge-install-doctor"})
+    with urllib.request.urlopen(req, timeout=120) as r, dest.open("wb") as fh:
+        shutil.copyfileobj(r, fh)
+    return dest
 
 
 def repair(manifest: dict[str, Any]) -> bool:

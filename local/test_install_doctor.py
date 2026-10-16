@@ -395,6 +395,117 @@ class TestQuarantine(DoctorCase):
 
 
 # ----------------------------------------------------------------------
+# fetching the wheel from the network
+# ----------------------------------------------------------------------
+class TestDownloadWheel(unittest.TestCase):
+    """The wheel, when the local copy is gone.
+
+    `github.com` and `api.github.com` do not fail the same way. The sandbox's
+    proxy answers the CONNECT to github.com with 502, which takes
+    `pip install https://github.com/...` with it -- so the recorded release
+    URL, the one that works everywhere else, works nowhere on this machine.
+    The API route works, and a public repo's assets need no token.
+    """
+
+    URL = ("https://github.com/ZhangYangyi03/autoforge/releases/download/"
+           "local-0.4.2.1/autoforge_agent-0.4.2%2Blocal.1-py3-none-any.whl")
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dltest_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp,
+                                                            ignore_errors=True))
+        import hashlib
+        self.man = fake_manifest()
+        self.man["wheel"] = {
+            "name": "w.whl", "bytes": 4, "url": self.URL,
+            "sha256": hashlib.sha256(b"data").hexdigest(),
+        }
+
+    def test_repo_and_tag_parsed_out_of_the_wheel_url(self) -> None:
+        self.assertEqual(doctor._repo_and_tag(self.URL),
+                         ("ZhangYangyi03/autoforge", "local-0.4.2.1"))
+
+    def test_unparseable_url_is_named_not_swallowed(self) -> None:
+        with self.assertRaises(ValueError):
+            doctor._repo_and_tag("https://example.invalid/w.whl")
+
+    def test_direct_url_tried_first(self) -> None:
+        dest = self.tmp / "w.whl"
+        calls = []
+
+        def fake_urlopen(req, timeout=0):
+            calls.append(getattr(req, "full_url", req))
+            raise OSError("nope")
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen), \
+                mock.patch.object(doctor, "download_via_api",
+                                  lambda m, d: (_ for _ in ()).throw(
+                                      AssertionError("api reached too early"))):
+            got = doctor.download_wheel(self.man, dest)
+        self.assertIsNone(got)
+        self.assertEqual(len(calls), 1)          # direct only, then it stopped
+        self.assertIn("github.com", calls[0])
+        self.assertFalse(dest.exists())
+
+    def test_falls_back_to_the_api_when_the_direct_url_is_blocked(self) -> None:
+        import contextlib, io
+        dest = self.tmp / "w.whl"
+
+        def fake_urlopen(req, timeout=0):
+            url = getattr(req, "full_url", req)
+            if "api.github.com" in url:
+                # the asset itself
+                return contextlib.contextmanager(
+                    lambda: (yield io.BytesIO(b"data")))()
+            raise OSError("Tunnel connection failed: 502 Bad Gateway")
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen), \
+                mock.patch.object(doctor, "_api_get_json",
+                                  lambda u: {"assets": [
+                                      {"name": "w.whl",
+                                       "url": "https://api.github.com/assets/1"}]}):
+            got = doctor.download_wheel(self.man, dest)
+        self.assertIsNotNone(got)
+        self.assertEqual(dest.read_bytes(), b"data")
+
+    def test_a_wheel_with_the_wrong_hash_is_not_the_build(self) -> None:
+        import contextlib, io
+        dest = self.tmp / "w.whl"
+
+        def fake_urlopen(req, timeout=0):
+            return contextlib.contextmanager(
+                lambda: (yield io.BytesIO(b"WRONG")))()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen), \
+                mock.patch.object(doctor, "_api_get_json",
+                                  lambda u: {"assets": [
+                                      {"name": "w.whl", "url": "x"}]}):
+            got = doctor.download_wheel(self.man, dest)
+        self.assertIsNone(got)                    # rejected, not written through
+        self.assertFalse(dest.exists())            # and not left on disk to reuse
+
+    def test_api_request_carries_a_user_agent(self) -> None:
+        """GitHub 403s an API request with no User-Agent, which urllib omits."""
+        seen = {}
+
+        def fake_urlopen(req, timeout=0):
+            seen["ua"] = req.get_header("User-agent")
+            seen["accept"] = req.get_header("Accept")
+            import contextlib
+            return contextlib.contextmanager(lambda: (yield io.BytesIO(
+                b'{"assets": []}')))()
+
+        import io
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            try:
+                doctor._api_get_json("https://api.github.com/x")
+            except Exception:
+                pass
+        self.assertTrue(seen["ua"], seen)
+        self.assertNotIn("urllib", seen["ua"])
+
+
+# ----------------------------------------------------------------------
 # the CLI hook
 # ----------------------------------------------------------------------
 class TestCliHook(unittest.TestCase):
