@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -55,6 +57,27 @@ SITE = Path(r"C:\autoforge\venv\Lib\site-packages\autoforge")
 
 #: Fixed mtime for every entry, so two builds of the same inputs are identical.
 EPOCH = (2026, 10, 16, 0, 0, 0)
+
+#: What the manifest that the install doctor audits against is called.
+MANIFEST_NAME = "autoforge-install-manifest.json"
+
+#: Where the patched build lives permanently, so a reinstall can find it
+#: locally before falling back to the network.
+GITHUB_URL = (
+    "https://github.com/ZhangYangyi03/autoforge/releases/download/"
+    "local-0.4.2.1/autoforge_agent-0.4.2%2Blocal.1-py3-none-any.whl"
+)
+
+#: Pip's uninstall stashes each path it is about to remove under a name that
+#: keeps only the tail and is prefixed with `~` (so `core` becomes `~ore`,
+#: `autoforge/cpu` becomes `~pu`), then deletes it. On this machine those
+#: installs have been killed between the two steps -- the sandbox SIGTERMs
+#: Python processes that make network calls -- which left 114 files in 17
+#: directory names inside the package tree. They are not part of the package,
+#: nothing imports them, and a walk that does not filter them builds a wheel
+#: nearly twice the size that carries dead code under names that cannot be
+#: imported. Filtering them is what makes "the wheel is the tree" true.
+STASH_PREFIX = "~"
 
 NAME = "autoforge_agent"
 DEFAULT_VERSION = "0.4.2+local.1"
@@ -90,13 +113,20 @@ def collect(version: str) -> tuple[dict[str, bytes], list[str], list[str], list[
                     if ".dist-info/" in n}
 
     on_disk: dict[str, bytes] = {}
+    skipped: list[str] = []
     for root, dirs, files in os.walk(SITE):
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        # Never descend into bytecode, and never into a pip stash. See
+        # STASH_PREFIX for why both filters are part of "the wheel is the tree".
+        dirs[:] = sorted(d for d in dirs
+                         if d != "__pycache__" and not d.startswith(STASH_PREFIX))
         for f in sorted(files):
             if f.endswith(".pyc"):
                 continue
             full = Path(root) / f
             rel = full.relative_to(SITE).as_posix()
+            if rel.startswith(STASH_PREFIX) or f.startswith(STASH_PREFIX):
+                skipped.append(rel)
+                continue
             on_disk[rel] = full.read_bytes()
 
     payload = dict(base)
@@ -125,7 +155,7 @@ def collect(version: str) -> tuple[dict[str, bytes], list[str], list[str], list[
                           count=1, flags=re.M)
             data = text.encode("utf-8")
         payload[f"{new_di}/{leaf}"] = data
-    return payload, sorted(changed), sorted(added), removed
+    return payload, sorted(changed), sorted(added), removed, skipped
 
 
 def write_wheel(payload: dict[str, bytes], dist_info: str,
@@ -203,6 +233,7 @@ def verify(wheel: Path, version: str) -> bool:
     probe = (
         "import autoforge, autoforge.agent as A, autoforge.tools.exposure as E\n"
         "import autoforge.tools.registry as R, autoforge.media as M\n"
+        "import autoforge.cli as C\n"
         "from autoforge.core.llm import LLMAborted\n"
         "assert 'site-packages' not in autoforge.__file__ or True\n"
         "print('   loaded from:', autoforge.__file__)\n"
@@ -212,7 +243,14 @@ def verify(wheel: Path, version: str) -> bool:
         "assert hasattr(A.ForgeAgent, '_hot_protect')\n"
         "assert hasattr(A.ForgeAgent, '_tool_budget_report')\n"
         "assert hasattr(M, 'MediaClient')\n"
-        "print('   exposure + media + interrupt symbols all present')\n"
+        "# The doctor hook is the one thing that lets a user notice a stock\n"
+        "# reinstall from inside the CLI. A wheel without it is a wheel whose\n"
+        "# only warning channel is the deploy script.\n"
+        "cmds = C.build_parser()._subparsers._group_actions[0].choices\n"
+        "assert 'doctor' in cmds, sorted(cmds)\n"
+        "assert callable(C.command_table().get('doctor'))\n"
+        "assert C.half_patch_warning() in (None,) or 'auto doctor' in C.half_patch_warning()\n"
+        "print('   exposure + media + interrupt + doctor symbols all present')\n"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp)
@@ -228,6 +266,54 @@ def verify(wheel: Path, version: str) -> bool:
     return ok
 
 
+def write_manifest(wheel: Path, out: Path) -> dict:
+    """Record what this build put on disk, keyed by site-packages-relative path.
+
+    The doctor audits the install against this, so the manifest has to describe
+    the *installed* tree, which is exactly the wheel's contents laid out under
+    site-packages. Hashing the archive rather than the installed tree makes the
+    two provably the same, which is the point: "is this install the build I
+    think it is" has to have one answer.
+
+    The dist-info directory is included too -- but as a single expected value
+    per leaf, because a stock reinstall renames it and that rename is itself a
+    signal the doctor should report rather than hash silently.
+    """
+    files: dict[str, dict[str, object]] = {}
+    with zipfile.ZipFile(wheel) as z:
+        for name in z.namelist():
+            if name.endswith("/"):
+                continue
+            data = z.read(name)
+            files[name] = {"sha256": sha256(data), "bytes": len(data)}
+
+    manifest = {
+        "format": 1,
+        "distribution": "autoforge-agent",
+        "version": version_of(wheel),
+        # The release the local version was cut from. The startup check uses
+        # it to tell "the stock wheel landed on top of the patch" (the
+        # half-patch case, and by far the common one) from "some other build
+        # is installed", which is a different conversation.
+        "stock_version": version_of(wheel).split("+", 1)[0],
+        "wheel": {
+            "name": wheel.name,
+            "sha256": sha256(wheel.read_bytes()),
+            "bytes": wheel.stat().st_size,
+            "url": GITHUB_URL,
+        },
+        "files": files,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(manifest, indent=2, sort_keys=True),
+                   encoding="utf-8")
+    return manifest
+
+
+def version_of(wheel: Path) -> str:
+    return wheel.stem.split("-")[1]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--version", default=DEFAULT_VERSION)
@@ -236,7 +322,7 @@ def main() -> int:
                     help="show what differs, build nothing")
     args = ap.parse_args()
 
-    payload, changed, added, removed = collect(args.version)
+    payload, changed, added, removed, skipped = collect(args.version)
     print(f"  base wheel : {BASE_WHEEL.name}")
     print(f"  from       : {SITE}")
     print(f"  version    : {args.version}")
@@ -252,6 +338,9 @@ def main() -> int:
         print(f"    - {r}")
     print(f"  untouched: {len(payload) - len(changed) - len(added)} files kept "
           "byte-identical")
+    print(f"  pip stashes skipped ({len(skipped)}): "
+          + (", ".join(skipped[:5]) + (", ..." if len(skipped) > 5 else "")
+             if skipped else "none"))
     print()
 
     if args.list:
@@ -265,6 +354,12 @@ def main() -> int:
     print("  verifying:")
     ok = verify(out, args.version)
     print()
+    if ok:
+        manifest = write_manifest(out, Path(args.out_dir) / MANIFEST_NAME)
+        print(f"  wrote {Path(args.out_dir) / MANIFEST_NAME} "
+              f"({len(manifest['files'])} files, "
+              f"version {manifest['version']})")
+        print()
     print("  OK" if ok else "  FAILED")
     if ok:
         print(f"\n  install with:\n    "

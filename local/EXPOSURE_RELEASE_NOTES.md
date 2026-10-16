@@ -132,3 +132,57 @@ bash rollback-exposure.sh
 - **工具调用仍不可中断**：`registry.call` 是同步的，这是 store 里记录的候选修复「C」。
 - **`forge_events` 没有 pid / instance 列**：同一 db 上跑两个 `auto` 进程无法区分。
 - **exposure 只治了 schema 那一半**。token 账单的大头在**前缀缓存**：网关实测缓存命中 ¥0.02/M vs 未命中 ¥1/M（**50 倍**）。exposure 的缓存设计正是为了让无调用轮次的前缀逐字节稳定——但真正的省钱要靠长会话里前缀不变，这需要实际跑起来才看得到。
+
+---
+
+## 8. 已上 GitHub（重装来源本身带补丁）
+
+上一节的「重装 wheel 后跑 `install_exposure.py`」有个前提：那个工作目录还在。**它不在。**
+
+本轮开始时实测确认，安装版已经处于**半补丁状态**——`exposure.py` / `media.py` 还在，
+但 `registry.exposure` 是 `False`、`LLMAborted` 缺失。
+
+### 为什么半补丁是 pip 的正常行为
+
+**pip 卸载时只删旧 RECORD 里列的文件。** 手工新增的文件不在 0.4.2 的 RECORD 里 → 幸存；
+被修改过的文件在 RECORD 里 → 被原版覆盖。于是「文件看着都在，功能没了」——最难发现的形态。
+
+换成新 wheel 再装 stock，连新增文件也会被删（新 RECORD 列了它们），是另一种坏法。**两种都实测到了。**
+
+→ 结论：**补丁必须进 `pip install` 那一行，不能只留在旁边的脚本里。**
+
+### 做法
+
+`build_wheel.py` 从**原始 0.4.2 wheel** 出发，只替换内容不同的 13 个文件，其余 59 个保持逐字节原样；
+重写 METADATA 版本号与 RECORD；固定 mtime 使两次构建可重现。venv 里没有 setuptools / wheel / build，
+直接用 stdlib `zipfile` 写——为了一个文件去装三个依赖不划算。
+
+版本用 `0.4.2+local.1`（PEP 440 local segment）：pip 优先于 stock `0.4.2`，`pip install 0.4.2` 仍可按版本号钉回原版。
+
+### 发布地址
+
+| 东西 | 位置 |
+|:--|:--|
+| **Release**（prerelease，wheel 资产） | https://github.com/ZhangYangyi03/autoforge/releases/tag/local-0.4.2.1 |
+| **分支**（`local/` 下 9 个文件的源码套件） | branch `local/reinstall-kit` @ `a0a5b3e5873b` |
+| tag | `local-0.4.2.1` → 指向同一个 commit |
+
+tag 指向分支那个 commit，所以「资产 → tag → commit → 生成它的脚本」这条链是闭合的。
+tag/release 都带 `local-` 前缀、release 是 prerelease——**故意做成不会被误认成上游 0.4.3**。
+
+### 一键重装
+
+```bash
+C:/autoforge/venv/Scripts/python.exe -m pip install --force-reinstall --no-deps \
+  https://github.com/ZhangYangyi03/autoforge/releases/download/local-0.4.2.1/autoforge_agent-0.4.2%2Blocal.1-py3-none-any.whl
+```
+
+### 往返已实测
+
+| | registry.exposure | LLMAborted | version |
+|:--|:--|:--|:--|
+| 重装 stock wheel | False | False | 0.4.2 |
+| **从 GitHub URL 重装** | **True** | **True** | **0.4.2+local.1** |
+
+资产可达（200，重定向 `release-assets.githubusercontent.com`，字节数与本地一致）；
+装完 35 + 18 测试全绿，红检仍 PASS（51.2%）。

@@ -1,0 +1,306 @@
+{
+  "distribution": "autoforge-agent",
+  "files": {
+    "autoforge/__init__.py": {
+      "bytes": 4145,
+      "sha256": "321ad877f10f030dcfb4905ac35a1b0f994e84d90dd3c50fb45aedd4ab75b60c"
+    },
+    "autoforge/__main__.py": {
+      "bytes": 675,
+      "sha256": "afc37ec45ff75e27ab9476e53bd6621c66e14a7373be0f7f00ef680269acf6f4"
+    },
+    "autoforge/agent.py": {
+      "bytes": 165189,
+      "sha256": "21e6d8577477ab21da2f55e1c3f7e2d7602857c995a6a6f44d954831d561a9df"
+    },
+    "autoforge/autonomy/__init__.py": {
+      "bytes": 374,
+      "sha256": "3d795e2cacdc6f22ad3d6a70c3abb10b8b9e3f5a08ce876f021d628d02ec21d5"
+    },
+    "autoforge/autonomy/confirm.py": {
+      "bytes": 5847,
+      "sha256": "24fdba606859683a8e6ea211c5c0ba7c426d34890c162a360406693d91b26e12"
+    },
+    "autoforge/autonomy/policy.py": {
+      "bytes": 10464,
+      "sha256": "3503da634e93f55ea52a309109c44382cdad00a870f932d72691423a13f169c2"
+    },
+    "autoforge/autonomy/roles.py": {
+      "bytes": 7938,
+      "sha256": "c4352f05931b278ca87e3b7368fe09f56ee682e647406a9c6ca7a3129e83bdde"
+    },
+    "autoforge/autonomy/selfmod.py": {
+      "bytes": 4656,
+      "sha256": "91e424b8dd09567d6a4507241255c516aff104458b2b0bf18a3089f40d426a72"
+    },
+    "autoforge/autonomy/spawn.py": {
+      "bytes": 9035,
+      "sha256": "20b76709dbfb2e793f93ed9f1cbf40c2f05949dfe77c5acaeea09882f9a193ed"
+    },
+    "autoforge/autonomy/topology.py": {
+      "bytes": 8836,
+      "sha256": "4e1d06044f21f76553d7cb0f183090831fa3a4a8eb3fe8d04ff27c3b519088de"
+    },
+    "autoforge/browser.py": {
+      "bytes": 36906,
+      "sha256": "a71f9fba7bd6167268aad2d8da697771b905be57a61885e99650832e356c5270"
+    },
+    "autoforge/cli.py": {
+      "bytes": 54512,
+      "sha256": "971492286919d1782fc576e5c220cd1179e961e499e4f0e0c4d50e00b0beece2"
+    },
+    "autoforge/configfile.py": {
+      "bytes": 3002,
+      "sha256": "200414cfff9d94309a3478a21867b27cedd918e53b5d4efdce39472987839960"
+    },
+    "autoforge/core/__init__.py": {
+      "bytes": 691,
+      "sha256": "845dfd771c9011f9b36ee9a6ca0161b54c1195b2bd50662ce2d72bcbb0c61a86"
+    },
+    "autoforge/core/agent.py": {
+      "bytes": 17540,
+      "sha256": "0dada5716cfe624e1824eb643914c0f09d65aa8a8a7db74007f2fb5251a97693"
+    },
+    "autoforge/core/compaction.py": {
+      "bytes": 32797,
+      "sha256": "98377a0d1d8d7be04ed3c3c3605b14d2019cbde06f00b5b6dfab8c251eb42ee5"
+    },
+    "autoforge/core/lineedit.py": {
+      "bytes": 27949,
+      "sha256": "7e1f9ac83c3c286a66fa27c21b5217197c848954a33fbf3c6ab85b2d9855670c"
+    },
+    "autoforge/core/llm.py": {
+      "bytes": 18845,
+      "sha256": "ccfac034aa42a161dad95831bef1d9c17f2ead1ff75a9d1498fb19919d59897b"
+    },
+    "autoforge/core/message.py": {
+      "bytes": 2713,
+      "sha256": "9a7732463e2436da5301d8813d28c0b6e934b307cc8369efb33e3aff69fd281b"
+    },
+    "autoforge/core/steering.py": {
+      "bytes": 12181,
+      "sha256": "0098887a52edee787c86c0a6a19ebe8da2e8a5bd2200c8edc2a8d5ffa97aa57a"
+    },
+    "autoforge/cpu/__init__.py": {
+      "bytes": 3244,
+      "sha256": "548ba44c1d8a3643560f0c3e333373f48047f56483143bdfb9b3be0271c0ecd2"
+    },
+    "autoforge/cpu/kernel.py": {
+      "bytes": 17710,
+      "sha256": "3b9653954a2e762c072db3c9f1a75e568e7f6752952bda3fcfba5b9877850054"
+    },
+    "autoforge/cpu/ops.py": {
+      "bytes": 26681,
+      "sha256": "43f55ce158b6f894f85c68cddf3e619d97a11c087b5546136dd0ac67fd27a8e9"
+    },
+    "autoforge/cpu/probe.py": {
+      "bytes": 23511,
+      "sha256": "6883b39eeedbf3f041e7f6a099f84102a5e4154c3869a8ae4e56f578d04ccb7b"
+    },
+    "autoforge/cpu/safety.py": {
+      "bytes": 20119,
+      "sha256": "8a5c30358df59a7147c13d9c9b9194cf7c06430fa961370eee253aee60f65753"
+    },
+    "autoforge/cpu/tune.py": {
+      "bytes": 22594,
+      "sha256": "593fdea5a09c55291fe8320c50a4f8c844c98de8ddd1a5ef492bb58bac05e53f"
+    },
+    "autoforge/ecosystem.py": {
+      "bytes": 20643,
+      "sha256": "8b53ada3a3b8b2c29e59737684376eb6a00d60e4b0313a1d7c425d890feedc81"
+    },
+    "autoforge/forge/__init__.py": {
+      "bytes": 671,
+      "sha256": "d131cbcb425e38e21778b9e4cccfa294514597e2d034d7283805520e317fe432"
+    },
+    "autoforge/forge/adversary.py": {
+      "bytes": 7579,
+      "sha256": "2bf34cb7a9b1897a15176a56b4fe3183158420a56629d9844b3591b5d2855c41"
+    },
+    "autoforge/forge/evolution.py": {
+      "bytes": 18975,
+      "sha256": "6a676e61dbbc3a924f6de8e6362099089abbc7fc0bc673ce57c8e0f49230aae4"
+    },
+    "autoforge/forge/fuzzer.py": {
+      "bytes": 9614,
+      "sha256": "2524083adc52b8ae84a2e29e3fc69d59cb444d462ab6804dbb7a88cbd04d8317"
+    },
+    "autoforge/forge/generator.py": {
+      "bytes": 24546,
+      "sha256": "9ab167266f153b09366949ba15d3ac3ab95def3981a2924623217d8badf832b5"
+    },
+    "autoforge/forge/invariance.py": {
+      "bytes": 13845,
+      "sha256": "bb79853f42236994a0565a500b5b5e1d4e0fe1c4319755fdc828e49717d89c0c"
+    },
+    "autoforge/forge/metacog.py": {
+      "bytes": 5959,
+      "sha256": "234c69cec76eda78ff9ee66f139d6fcab6a1ca03c7fac3680e526dac7dd1b5a9"
+    },
+    "autoforge/forge/pipeline.py": {
+      "bytes": 14460,
+      "sha256": "4246bce229b46c8fece728e4b6d01146da0f053ede5e50f71d304100c6066e83"
+    },
+    "autoforge/forge/sandbox.py": {
+      "bytes": 12588,
+      "sha256": "2782e144279c99be813f42e28ea25713d8a8980dfcf39a903cd566271b2ebb8f"
+    },
+    "autoforge/forge/validity.py": {
+      "bytes": 23451,
+      "sha256": "529a029f4e61bcd2b93fa32de6319cfc0120dcc5ad99c8042521d0aad2aa0391"
+    },
+    "autoforge/forge/verifier.py": {
+      "bytes": 15624,
+      "sha256": "50be203802dd05516d4c14094979cb8cc75ab950ecd25cf970a79f95f144e33c"
+    },
+    "autoforge/gpu/__init__.py": {
+      "bytes": 3895,
+      "sha256": "6c28dea08e0165651e2e43c9689544a3d9e6ef0bf8e36468b4c9faa5afa9713c"
+    },
+    "autoforge/gpu/backend_triton.py": {
+      "bytes": 16701,
+      "sha256": "d0f692aa1eccfd642d27ea0e2e6421f7e41262e2a3fc682294b9545ec6618b01"
+    },
+    "autoforge/gpu/bench.py": {
+      "bytes": 962,
+      "sha256": "2ecdf5b8ddab23fc6c0ef618ccc061f8d2184de90ce9cc4d11dcbc9217139500"
+    },
+    "autoforge/gpu/kernel.py": {
+      "bytes": 15657,
+      "sha256": "558e84505a3cb2dc71f298d66b11f007fe530167c6894aea5052a4d5b2574147"
+    },
+    "autoforge/gpu/ops.py": {
+      "bytes": 12573,
+      "sha256": "2cf0f245c100ec91f5ef9365923a6935f5aeaedb516ed1ddc00adab6307389fa"
+    },
+    "autoforge/gpu/probe.py": {
+      "bytes": 10603,
+      "sha256": "f7b2411c4e444fcea387441e0030e8dc16a38b11da53b8d70cf836c6c12891fa"
+    },
+    "autoforge/gpu/safety.py": {
+      "bytes": 9565,
+      "sha256": "ea7076b0fa8d36a7c9f88793a921c433832002442b373853ac9d2170b18cbfc0"
+    },
+    "autoforge/gpu/units.py": {
+      "bytes": 1374,
+      "sha256": "66ae35b96433cabba3c81f2fa02ebb0d36f6d94129c0c194fd1a9f636cf72135"
+    },
+    "autoforge/mcp.py": {
+      "bytes": 46318,
+      "sha256": "4f30a6e95bbd56e216f2d7952cb2929e758c25573f312da8e6a92a11f9a339e6"
+    },
+    "autoforge/measure.py": {
+      "bytes": 14349,
+      "sha256": "5b91330ed3dac519a301d8e0d3be741495025450ceb6ab2599d5419d23ea2621"
+    },
+    "autoforge/media.py": {
+      "bytes": 20607,
+      "sha256": "29dcf6d39a4fd638431d0809413cf2327cdc250eb13cdcc60fd720874ec4bd91"
+    },
+    "autoforge/modes.py": {
+      "bytes": 13354,
+      "sha256": "aedbb1d3c5fd45d1ae26e7808916c4b194e571a27704c627425c3154d54570be"
+    },
+    "autoforge/notify.py": {
+      "bytes": 14567,
+      "sha256": "5e828cfc6634b88f21096c49dbc893bcefa63a421de8b5e87ce24df422985209"
+    },
+    "autoforge/route/__init__.py": {
+      "bytes": 186,
+      "sha256": "b505f16957c193848ff9efc66a5bdd1a0e9d91751d83c9acf68e715434aff1ad"
+    },
+    "autoforge/route/router.py": {
+      "bytes": 7772,
+      "sha256": "9def737bcc8ab7137eee62f8807198ee40b56fe9bf1869697301757c41872820"
+    },
+    "autoforge/schedule.py": {
+      "bytes": 17831,
+      "sha256": "23e7091751e95520d01fc59b3857f678b40a4b622dca6216f4388674f4ca645f"
+    },
+    "autoforge/setup_wizard.py": {
+      "bytes": 9674,
+      "sha256": "92b02aaae5ae1758b33ccfa492bf2d57df11089d5f861e5dacfa1d60923d6de6"
+    },
+    "autoforge/skills.py": {
+      "bytes": 21495,
+      "sha256": "3f6c46abf0171e1156c0d6f821d71bc3668f68c0dfee272c248aba7da8e6cb44"
+    },
+    "autoforge/store.py": {
+      "bytes": 25424,
+      "sha256": "a120aa0fc4a48edf06011e478adb62d6b186a8cd4902a5a3c6c33668b3c851b8"
+    },
+    "autoforge/timing.py": {
+      "bytes": 14817,
+      "sha256": "eb0f178c97155791c0b45b86b5adada7c77581810c06dc155f37a466062fbc8b"
+    },
+    "autoforge/tools/__init__.py": {
+      "bytes": 236,
+      "sha256": "2d5b3d9075f8820177b0459971d4dc36f60f5c405d9628272f603331d2332b1d"
+    },
+    "autoforge/tools/composition.py": {
+      "bytes": 4849,
+      "sha256": "ac59b19f136cdf2a7c94ea109fb7ae204bcc09908134f0ad0b292cf003777884"
+    },
+    "autoforge/tools/exposure.py": {
+      "bytes": 6502,
+      "sha256": "2d783f7e9e588573eb6b4bb3c53e5f599da6b9b00969119828a34edee0227557"
+    },
+    "autoforge/tools/registry.py": {
+      "bytes": 22757,
+      "sha256": "7553e73a0f3eefa019d1480d0fefe05d4b335317fd546c0424200a263b85ba40"
+    },
+    "autoforge/tools/spec.py": {
+      "bytes": 8649,
+      "sha256": "dc09696569f8b6ca8e9e470747ca849f530ebea29453415b76450fa55b128b8a"
+    },
+    "autoforge/vision.py": {
+      "bytes": 11169,
+      "sha256": "7649b67fb691f01d4bb88c6e219d259e9c3cacd853e0a7cc77fcb69f25747179"
+    },
+    "autoforge/web/__init__.py": {
+      "bytes": 104,
+      "sha256": "3c50a5d8f6df38f4c9986964befa34807810158a8ca9222f4e4dc0edceabbc3e"
+    },
+    "autoforge/web/server.py": {
+      "bytes": 26419,
+      "sha256": "09fa1f0b76eab81768ddcbfb6ac00c528d5bedaf1df468e50cd6aa2e28508996"
+    },
+    "autoforge/web/static/index.html": {
+      "bytes": 16626,
+      "sha256": "40b72e6b1c29400d85b7c1238a701333a22beaa806ebab2d4e565eadf72f28c5"
+    },
+    "autoforge/webtools.py": {
+      "bytes": 57717,
+      "sha256": "3f55e624eee14a979639baed194f0f0cb61dafd32823f41e21e1924c5eadcb26"
+    },
+    "autoforge_agent-0.4.2+local.1.dist-info/METADATA": {
+      "bytes": 21983,
+      "sha256": "e32709fb17ccd93714e9bdcfb9d4953179b7227d76d3aeb8f786a1f496c16971"
+    },
+    "autoforge_agent-0.4.2+local.1.dist-info/RECORD": {
+      "bytes": 5513,
+      "sha256": "dc7663aae7981550e7b2fbd46d9636dec1803f9ad371d64b25668221ade109b0"
+    },
+    "autoforge_agent-0.4.2+local.1.dist-info/WHEEL": {
+      "bytes": 91,
+      "sha256": "61532836a2b3111b7ec23519c09df7c41180c27165fb872a6d8913b566b88ad1"
+    },
+    "autoforge_agent-0.4.2+local.1.dist-info/entry_points.txt": {
+      "bytes": 75,
+      "sha256": "513b817fb3ae361d33a5bc88a3a6a1c3d6e2f23e46bece4be8305a237ef31687"
+    },
+    "autoforge_agent-0.4.2+local.1.dist-info/top_level.txt": {
+      "bytes": 10,
+      "sha256": "83287c54729cfc6f0d8aeee4b71e1d60ccefce231d27736d91f36ebbc025c59d"
+    }
+  },
+  "format": 1,
+  "stock_version": "0.4.2",
+  "version": "0.4.2+local.1",
+  "wheel": {
+    "bytes": 390542,
+    "name": "autoforge_agent-0.4.2+local.1-py3-none-any.whl",
+    "sha256": "4b3dbd7e208891973350d210796a62561f70598108448251c041399c14169a80",
+    "url": "https://github.com/ZhangYangyi03/autoforge/releases/download/local-0.4.2.1/autoforge_agent-0.4.2%2Blocal.1-py3-none-any.whl"
+  }
+}
