@@ -73,6 +73,7 @@ from .browser import (
     WebSocketError,
     launch_browser,
 )
+from .media import MediaError, media_from_config
 from .notify import Notifier, NotifyError, channels_from_config
 from .vision import VisionError, vision_from_config
 from .route.arbiter import Arbiter
@@ -714,6 +715,13 @@ BUILTIN_SCOPES: dict[str, str] = {
     "browser_screenshot": "local_write",
     "see": "network",
     "vision_status": "read_only",
+    # Making an image or a clip reaches a model and writes a file. The scope is
+    # `network` rather than `write` because the file lands in the agent's own
+    # media directory and nowhere the caller named -- the same reasoning that
+    # keeps `see` out of `write`.
+    "draw": "network",
+    "animate": "network",
+    "media_status": "read_only",
     # The task table is a file the agent owns. Writing it is a local write;
     # reading back the agenda is not.
     "schedule_add": "local_write",
@@ -991,6 +999,11 @@ class ForgeAgent:
         # only read into a client. An agent that is never asked to look never
         # costs anything for being able to.
         self.vision, self._vision_problem = vision_from_config(load())
+        # The other half of the same idea: a client that can *make* a picture
+        # or a clip. Built the same way and for the same reason -- reading the
+        # config into a client costs nothing, and the endpoint is only
+        # contacted when a tool is actually called.
+        self.media, self._media_problem = media_from_config(load())
         self._browser: Browser | None = None
         self._browser_proc: Any = None
         self._browser_endpoint = os.environ.get(
@@ -1110,6 +1123,7 @@ class ForgeAgent:
         self._tool_runs()
         self._tool_browser()
         self._tool_vision()
+        self._tool_media()
         self._tool_code()
 
     def _import_package(self, path: str) -> str:
@@ -5128,6 +5142,114 @@ class ForgeAgent:
             ),
             parameters={"type": "object", "properties": {}},
             fn=vision_status, source="builtin", tags=["vision", "media"],
+        ))
+
+    def _tool_media(self) -> None:
+        """Making a picture or a clip. The half of multimodality that writes
+        bytes instead of reading them.
+
+        Deliberately next to `_tool_vision`, because the two are only useful
+        together: a generated image is checkable by nothing except looking at
+        it, so the honest way to use `draw` is to follow it with `see`.
+        """
+
+        def _missing() -> str:
+            reason = self._media_problem or "no media endpoint is configured"
+            return (f"Cannot generate anything: {reason}. Set media.base_url in "
+                    f"the config (or AUTOFORGE_MEDIA_BASE_URL) and, if the "
+                    f"gateway needs one, media.api_key.")
+
+        def draw(prompt: str, model: str = "", size: str = "",
+                 save: str = "") -> str:
+            if not self.media:
+                return _missing()
+            try:
+                made = self.media.generate_image(prompt, model=model, size=size,
+                                                 save=save or None)
+            except MediaError as exc:
+                return f"Could not draw that: {exc}"
+            self._record("draw", {"prompt": prompt, "model": model})
+            return (f"{made.report()}\n"
+                    f"Nothing here can tell whether it is the picture you "
+                    f"meant -- use `see` on {made.path} if that matters.")
+
+        def animate(prompt: str, model: str = "", size: str = "",
+                    save: str = "") -> str:
+            if not self.media:
+                return _missing()
+            try:
+                made = self.media.generate_video(prompt, model=model, size=size,
+                                                 save=save or None)
+            except MediaError as exc:
+                return f"Could not render that: {exc}"
+            self._record("animate", {"prompt": prompt, "model": model})
+            return (f"{made.report()}\n"
+                    f"Task {made.task_id} is finished; a video takes minutes, "
+                    f"so a caller that wants to keep working should start it "
+                    f"early rather than wait.")
+
+        def media_status() -> str:
+            lines = [self.media.report() if self.media
+                     else "media: not configured"]
+            if self._media_problem:
+                lines.append(f"  config problem: {self._media_problem}")
+            return "\n".join(lines)
+
+        self._add(ToolSpec(
+            name="draw",
+            description=(
+                "Generate an image from a text prompt and write it to a file. "
+                "Returns the path. Use it for a diagram, an icon, a mockup, or "
+                "a figure that has no text equivalent. The file is written "
+                "before this returns, so the path is safe to hand to another "
+                "tool -- and to `see`, which is the only way to check the "
+                "result actually looks like what was asked for."
+            ),
+            parameters={"type": "object", "properties": {
+                "prompt": {"type": "string",
+                           "description": "what to draw, described plainly"},
+                "model": {"type": "string",
+                          "description": "override the configured image model"},
+                "size": {"type": "string",
+                         "description": "e.g. 1024x1024 (note: images use 'x', "
+                                        "video uses '*')"},
+                "save": {"type": "string",
+                         "description": "path to write to; a name is chosen if "
+                                        "this is omitted"},
+            }, "required": ["prompt"]},
+            fn=draw, source="builtin", tags=["media", "vision"],
+        ))
+        self._add(ToolSpec(
+            name="animate",
+            description=(
+                "Generate a short video from a text prompt. Slower than `draw` "
+                "by orders of magnitude -- minutes, not seconds -- because it "
+                "is a task on the far side that is polled to completion. Use it "
+                "when motion is the point; use `draw` for anything static."
+            ),
+            parameters={"type": "object", "properties": {
+                "prompt": {"type": "string",
+                           "description": "what to render, including the motion"},
+                "model": {"type": "string",
+                          "description": "override the configured video model"},
+                "size": {"type": "string",
+                         "description": "e.g. 1280*720 (note: video uses '*', "
+                                        "images use 'x')"},
+                "save": {"type": "string",
+                         "description": "path to write to; a name is chosen if "
+                                        "this is omitted"},
+            }, "required": ["prompt"]},
+            fn=animate, source="builtin", tags=["media", "vision"],
+        ))
+        self._add(ToolSpec(
+            name="media_status",
+            description=(
+                "Whether the agent can generate images or video at all, which "
+                "models and endpoint it would use, and where files land. Call "
+                "it before promising to draw something."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=media_status, source="builtin", tags=["media", "vision"],
         ))
 
     def _tool_code(self) -> None:

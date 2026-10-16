@@ -248,7 +248,7 @@ def vision_from_config(cfg: dict[str, Any]) -> tuple[VisionClient | None, str]:
                 or cfg.get("base_url") or "")
     api_key = (vision.get("key") or vision.get("api_key")
                or os.environ.get("AUTOFORGE_VISION_API_KEY")
-               or cfg.get("key") or "")
+               or cfg.get("api_key") or cfg.get("key") or "")
 
     if not vision.get("enabled", True):
         return None, "vision is disabled in the config"
