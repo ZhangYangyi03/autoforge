@@ -44,7 +44,7 @@ the part that is specific to this machine:
 
      The consequence: the MCP server must be started by the agent process itself,
      not from inside run_python or a forged tool. Started from outside the job,
-     a full analysis of C:\Windows\System32\where.exe completes in ~70 s.
+     a full analysis of C:/Windows/System32/where.exe completes in ~70 s.
 
   4. Leave an honest report of what was verified.
 
