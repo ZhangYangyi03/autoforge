@@ -1,0 +1,119 @@
+# Alerting rules.
+#
+# Each rule here is a question you would otherwise have to ask the dashboard, and
+# the threshold is chosen so that a firing rule means "a person should look" —
+# not "a number moved". A rule that fires on normal traffic is a rule that gets
+# silenced, and a silenced rule is worse than no rule because it is trusted.
+groups:
+  - name: toolmarket-availability
+    rules:
+      - alert: ToolMarketApiDown
+        # `for: 1m` rather than 0: a single failed scrape is a restart, a
+        # deploy, or a slow moment, and paging on it trains people to ignore the
+        # alert that matters.
+        expr: up{job="toolmarket-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "toolmarket API is not scrapeable"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for 1 minute.
+            `/health` is process-local and touches no dependency, so an
+            unreachable target is the process itself — check for an OOM kill
+            before checking Postgres.
+
+      - alert: ToolMarketDependencyDown
+        # Readiness is 200 only when the store *and* the cache answer, so this is
+        # the state where the API returns 503s while looking perfectly healthy to
+        # anything watching /health. The metric is sampled by the API's own
+        # gatherer at scrape time — see the note in toolmarket/api/main.py on why
+        # it is not a blackbox `probe_success`.
+        expr: toolmarket_dependency_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.component }} is not answering"
+          description: >-
+            The API is up but {{ $labels.component }} failed a trivial call at
+            scrape time. Check the corresponding container before restarting the
+            API: restarting the app does not fix a database, and it does destroy
+            the evidence in the app.
+
+  - name: toolmarket-errors
+    rules:
+      - alert: ToolMarketServerErrors
+        expr: >-
+          sum(rate(toolmarket_http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(toolmarket_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: ">5% of requests are 5xx"
+          description: >-
+            Ratio rather than count, because a count threshold is wrong in both
+            directions: it fires on a traffic spike that is being handled
+            correctly, and stays quiet on a low-traffic service that is failing
+            every single request.
+
+      - alert: ToolMarketEventChainBroken
+        # The substrate's whole integrity claim is that the event log is an
+        # append-only hash chain. This is the one alert whose firing means the
+        # product's central guarantee is false, and it is computed from the
+        # registry at scrape time, so it cannot drift from the API's own answer.
+        expr: toolmarket_chain_intact == 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "event hash chain does not verify"
+          description: >-
+            `GET /health` will also report chain_ok=false. Treat the substrate as
+            compromised: something rewrote or reordered the event log.
+
+  - name: toolmarket-throughput
+    rules:
+      - alert: ToolMarketLatencyHigh
+        # p95 from the histogram the middleware actually records, which is why
+        # /metrics exposes buckets rather than only a sum and a count — a mean
+        # latency over a bimodal distribution is the number that hides the
+        # incident.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum(rate(toolmarket_http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s for 10 minutes"
+
+      - alert: ToolMarketRateLimitingClients
+        expr: sum(rate(toolmarket_rate_limited_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "clients are being rate limited"
+          description: >-
+            Sustained 429s are either a misbehaving client or a limit set below
+            what the service legitimately serves. Both need a human; neither is
+            visible in the API's own logs, which is why the limiter counts.
+
+      - alert: ToolMarketEvolutionsFailing
+        expr: >-
+          sum(rate(toolmarket_evolutions_total{outcome="failure"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "evolutions are failing"
+          description: >-
+            An evolution that fails to propose is a model endpoint problem. One
+            that proposes and fails assessment is a candidate-quality problem.
+            Both land in this counter; check `toolmarket_async_tasks` for which
+            stage is stuck.

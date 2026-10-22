@@ -1,0 +1,20 @@
+# Dashboard provisioning.
+#
+# `allowUiUpdates: false` and `foldersFromFilesStructure: false` on purpose: the
+# dashboard in this folder is the one that ships, and a version edited in the
+# browser would live only in the `grafanadata` volume. Anyone who wants a
+# different view should export it and commit it, which is what makes the panel
+# layout reviewable in a diff.
+apiVersion: 1
+
+providers:
+  - name: toolmarket
+    orgId: 1
+    folder: "toolmarket"
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

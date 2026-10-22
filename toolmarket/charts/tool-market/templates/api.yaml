@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tool-market.fullname" . }}-api
+  labels:
+    {{- include "tool-market.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "tool-market.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "tool-market.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "tool-market.serviceAccountName" . }}
+      # Ordering, because a PodSpec has no `depends_on`. See _waitfor.tpl for
+      # why an unmet dependency here is a permanently broken process rather
+      # than a slow one: the app builds its store at import time, so starting
+      # before Postgres exists does not delay the API, it disables it.
+      initContainers:
+        {{- include "tool-market.waitForDeps" . | nindent 8 }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+          env:
+            {{- include "tool-market.substrateEnv" . | nindent 12 }}
+            - name: PORT
+              value: {{ .Values.api.port | quote }}
+          # The two probes are deliberately different endpoints, and the
+          # difference is the point. `/health` touches nothing, so it answers
+          # the only question a liveness probe may ask -- is this process
+          # wedged? `/ready` reports whether the substrate is reachable, so it
+          # answers the question a readiness probe must ask -- should traffic
+          # come here? Probing `/ready` for liveness would restart the API
+          # during a database blip, which fixes nothing and turns a degraded
+          # read into an outage.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tool-market.fullname" . }}-api
+  labels:
+    {{- include "tool-market.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.api.port }}
+      targetPort: http
+  selector:
+    {{- include "tool-market.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api

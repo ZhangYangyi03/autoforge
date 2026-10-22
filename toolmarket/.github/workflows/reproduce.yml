@@ -1,0 +1,60 @@
+name: reproduce
+
+# The README makes measured claims against a pinned engine release. Running them
+# here means a reader does not have to take the author's word for it on a
+# machine the author owns, and that a green suite cannot quietly depend on
+# local state that a fresh clone does not have.
+#
+# Free, and needs no secrets: the engine is fetched from the index at the
+# release pyproject.toml pins, and `tools/check_pinned_engine.py` fails the build
+# if what arrived is not what was pinned.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install this substrate (which pulls the pinned engine)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,api,grpc]"
+
+      - name: the installed engine is the release the pin names
+        run: python tools/check_pinned_engine.py
+
+      # Same reason as in ci.yml: the stubs are generated, so a reproduction that
+      # skips this step does not reproduce the suite — it reproduces the subset
+      # that does not touch gRPC.
+      - name: generate the gRPC stubs
+        run: python tools/grpc_gen.py
+
+      - name: substrate suite
+        run: python -m pytest tests -q
+
+# `engine suite, at that same pinned release` used to live here: it unpacked the
+# engine's sdist from the index and ran the engine's own tests. It earned its
+# keep by going red the moment the engine shipped an sdist whose tests could not
+# be collected (setuptools picks up tests/test*.py but not the conftest.py and
+# shared fakes they import) -- a real packaging defect, found by accident.
+#
+# It was still in the wrong place. This substrate is a *consumer* of that
+# release; making its CI red because a third party's tarball is incomplete
+# couples two projects that way permanently. The check now runs in the engine's
+# own CI (autoforge: .github/workflows/ci.yml, job `sdist`), on every push, where
+# the fix can actually be made. What stays here is what this repo is responsible
+# for: the pinned release is the installed one (check_pinned_engine.py), and this
+# suite passes against it.

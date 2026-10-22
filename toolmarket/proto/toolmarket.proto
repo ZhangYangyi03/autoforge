@@ -1,0 +1,143 @@
+// toolmarket.proto — the second access path onto the same resource substrate.
+//
+// The REST surface in `toolmarket/api/main.py` and this service are peers, not
+// layers: both call exactly one registry/operator method per call and neither
+// is allowed to advance a state or write an event on its own. If a rule ever
+// needs to differ between the two, the rule belongs in the registry, which is
+// the only place it can be enforced for both.
+//
+// The reason a gRPC surface exists at all: the evolution loop is a *typed,
+// streaming-ish, cross-process* conversation. Polling `GET /tasks/{id}` over
+// HTTP is a string-and-JSON protocol stretched over something that wants a
+// schema; a caller in another language gets the task shape only by reading
+// docstrings. Here the shape is in the .proto, and a client in Go or Java gets
+// the same compile-time contract a Python caller gets.
+syntax = "proto3";
+
+package toolmarket.v1;
+
+// -- the substrate ---------------------------------------------------------
+
+message HealthRequest {}
+message HealthResponse {
+  string status = 1;   // "ok" whenever the process is up
+  string version = 2;  // package version, so a stale client is visible
+}
+
+message ReadyRequest {}
+message ReadyResponse {
+  bool ready = 1;         // true only when the store AND the cache answer
+  string store = 2;       // "postgres" | "memory" — which backend answered
+  string cache = 3;       // "redis" | "memory"
+  string detail = 4;      // the failure, when ready == false
+}
+
+// -- resources -------------------------------------------------------------
+
+// ToolContract mirrors protocol/resources.py ToolContract. `parameters` is a
+// JSON object encoded as a string because protobuf has no free-form map of
+// mixed types and re-modelling the schema would put a second definition of it
+// in the world — the same mistake the API refuses to make.
+message ToolContract {
+  string name = 1;
+  string description = 2;
+  string parameters_json = 3;
+  string code = 4;
+  string source = 5;            // "human" | "model"
+  string generator = 6;
+  repeated string invariances = 7;
+  string effect_signature = 8;
+  repeated string tags = 9;
+}
+
+message Resource {
+  string id = 1;
+  string name = 2;
+  string type = 3;              // tool | dataset | ...
+  string state = 4;             // DRAFT | PROBATION | ACTIVE | DEPRECATED | ...
+  string version_status = 5;    // AGP version status
+  string version = 6;           // semver of the current version, e.g. "0.1.0"
+  string contract_json = 7;     // full contract, for clients that want it whole
+  string capability_schema_json = 8;
+  double updated_at = 9;
+  repeated string parents = 10; // lineage parents
+}
+
+message RegisterRequest {
+  ToolContract contract = 1;
+  // `optional` so "unset" is distinguishable from "explicitly false". The REST
+  // surface defaults a new tool's evolving ON; a plain proto3 bool cannot carry
+  // that default, so every client that did not know to set the field would get
+  // it silently OFF and the two front doors would disagree about what a
+  // freshly-registered tool can do. Presence, not a second default.
+  optional bool enable_evolving = 2;
+}
+message RegisterResponse { Resource resource = 1; }
+
+message GetRequest { string resource_id = 1; }
+message GetResponse { Resource resource = 1; }
+
+message ListRequest { string type = 1; string state = 2; }
+message ListResponse { repeated Resource resources = 1; }
+
+message TransitionRequest { string resource_id = 1; string to = 2; string reason = 3; }
+message TransitionResponse { Resource resource = 1; }
+
+message InvokeRequest {
+  string resource_id = 1;
+  string arguments_json = 2;
+  // Forcing an invoke on a non-ACTIVE resource is a deliberate, rare act; the
+  // REST surface spells it `force`, so this one does too, with the same
+  // meaning. Plain bool is right here: `false` is both the proto default and
+  // the intended default, so there is no ambiguity to preserve.
+  bool force = 3;
+}
+message InvokeResponse {
+  bool ok = 1;
+  string result_json = 2;
+  string error = 3;
+}
+
+message LineageRequest { string resource_id = 1; }
+message LineageResponse { repeated string nodes = 1; repeated string edges = 2; } // "a->b"
+
+message EventsRequest { string resource_id = 1; }
+message Event { string kind = 1; string resource_id = 2; double at = 3; string detail_json = 4; }
+message EventsResponse { repeated Event events = 1; }
+
+// -- evolution (the closed loop) -------------------------------------------
+
+message EvolveRequest {
+  string resource_id = 1;
+  string goal = 2;
+  bool commit = 3;
+  string proposer = 4;   // "stub" | a model name
+}
+message EvolveResponse {
+  string task_id = 1;    // poll GetTask
+  string state = 2;
+}
+
+message TaskRequest { string task_id = 1; }
+message TaskResponse {
+  string task_id = 1;
+  string state = 2;      // pending | running | success | failure
+  string result_json = 3;
+  string error = 4;
+}
+
+service ResourceSubstrate {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Transition(TransitionRequest) returns (TransitionResponse);
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  rpc Lineage(LineageRequest) returns (LineageResponse);
+  rpc Events(EventsRequest) returns (EventsResponse);
+
+  rpc Evolve(EvolveRequest) returns (EvolveResponse);
+  rpc GetTask(TaskRequest) returns (TaskResponse);
+}

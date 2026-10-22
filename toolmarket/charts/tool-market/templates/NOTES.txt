@@ -1,0 +1,41 @@
+The tool-market substrate is installed as release {{ .Release.Name }} in
+namespace {{ .Release.Namespace }}.
+
+It is not reachable from your machine yet. The API Service is ClusterIP on
+purpose -- an Ingress is a decision about a hostname and a certificate, not a
+default -- so the way in is a port-forward:
+
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "tool-market.fullname" . }}-api {{ .Values.api.port }}:{{ .Values.api.port }}
+
+then, in another shell:
+
+    curl -s localhost:{{ .Values.api.port }}/ready
+    BASE=http://127.0.0.1:{{ .Values.api.port }} ./deploy/smoke.sh
+
+`/ready` is the endpoint that matters. It reports the backend the API actually
+connected to, so it is how you catch a release that silently fell back to the
+in-memory store -- a stack that answers every probe correctly and forgets
+everything on restart.
+
+{{- if .Values.postgres.enabled }}
+
+Postgres is bundled by this chart. The password was generated at install time
+and lives in the Secret `{{ include "tool-market.substrateSecret" . }}`; it is
+deliberately not printed here, because Helm's NOTES are written to the terminal
+and into CI logs. To read it:
+
+    kubectl -n {{ .Release.Namespace }} get secret {{ include "tool-market.substrateSecret" . }} -o jsonpath='{.data.password}' | base64 -d
+
+{{- else }}
+
+Postgres is external ({{ .Values.externalDatabase.dsn }}), so durability is
+whatever that server's is. Nothing in this release can improve it.
+
+{{- end }}
+
+{{- if not .Values.redis.enabled }}
+
+Redis is external, and the cache and broker indexes are whatever
+`externalRedis.url` names. If it is one instance for all three, a cached
+resource and a task record share a keyspace.
+{{- end }}

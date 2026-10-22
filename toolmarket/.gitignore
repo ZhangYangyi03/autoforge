@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Experiment scratch. The evidence that matters (the JSON / CSV / PNG under
+# experiments/results/) IS tracked on purpose; these are the disposable parts.
+experiments/results/_cache/
+experiments/results/_dbg*/
+experiments/results/_sanity/
+experiments/results/_replay*/
+*.log
+
+# Deployment credentials. Read by deploy/huggingface/deploy.py; must never be
+# committed. `*.env` rather than just this file because the natural mistake is
+# to make a `.env.staging` and assume the ignore rule already covers it.
+.deploy.env
+.env
+*.env
+!.env.example
+
+# Generated gRPC stubs. `python tools/grpc_gen.py` (or `make grpc-gen`) rebuilds
+# them from proto/toolmarket.proto; a committed stub drifts from its .proto the
+# first time someone edits one and forgets the other.
+toolmarket/grpc/gen/
+
+# Local vector-index and scratch from the retrieval work. The index is a build
+# product of the shelf (rebuildable from /resources); eval scripts and their
+# outputs are one-off measurements, not part of the package.
+toolmarket_data/
+toolmarket_data_local/
+*best_config.json
+rerank_cache.json
+toolmarket.db
+boot_test.py
+eval_retrieval*.py
+*.bak
+*.bak_vs

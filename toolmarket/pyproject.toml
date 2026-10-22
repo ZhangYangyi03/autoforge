@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tool-market"
+version = "0.1.0"
+description = "A protocol-registered resource platform for evolvable agent tools. The enforced implementation of the AGP resource substrate, backed by autoforge."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Zhang Yangyi" }]
+keywords = ["agents", "tools", "protocol", "agp", "lifecycle", "provenance"]
+dependencies = [
+    "pydantic>=2.0",
+    # The enforcement engine. Pinned to an exact release because the local
+    # sibling checkout is a dev convenience, not something a fresh clone has.
+    # Without this, `pip install -e .` succeeds and then every import of the
+    # validity gate fails -- which is exactly the failure this line exists to
+    # prevent.
+    # Pin the release, not the branch: `>=` or `@main` would silently fetch a
+    # newer engine and quietly invalidate the reproduction instructions in the
+    # README the next time someone ran them. A release also installs without
+    # git on the box, which a `git+https://` requirement does not.
+    "autoforge-agent==0.4.0",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.27"]
+# The deployment extras. Each one is a separate extra rather than a single
+# "prod" list so a container installs the backends it actually connects to —
+# a Space with no database should not carry psycopg2, and an image that carries
+# a driver it cannot reach is an image with a failure mode nobody can reproduce.
+postgres = ["psycopg2-binary>=2.9"]
+redis = ["redis>=5.0"]
+worker = ["celery>=5.3", "redis>=5.0"]
+# The gRPC surface. `grpcio-tools` is here rather than in a separate
+# `grpc-dev` extra on purpose: the generated stubs are *not* committed (see
+# .gitignore), so installing this extra is the only thing standing between a
+# fresh checkout and an unrunnable surface — and `grpc.server.import_stubs`
+# tells the reader to install exactly this name. Splitting runtime from codegen
+# would make that message wrong the moment someone followed it.
+#
+# `protobuf` is listed explicitly even though `grpcio` pulls it in, because the
+# generated code is compiled against the *runtime* version at build time: an
+# unpinned transitive protobuf is what produces "Descriptors cannot be created
+# directly" from a stub generated weeks earlier.
+grpc = ["grpcio>=1.60", "grpcio-tools>=1.60", "protobuf>=4.25"]
+# No extra needed for observability: /metrics is hand-rendered (toolmarket.metrics).
+dev = ["pytest>=7.0", "httpx>=0.27"]
+all = [
+    "fastapi>=0.110", "uvicorn>=0.27",
+    "psycopg2-binary>=2.9", "redis>=5.0", "celery>=5.3",
+    # In `all` so `pytest tests` collects the whole suite in CI: the gRPC test
+    # imports `grpc` at module scope and the surface's stubs are generated, not
+    # committed, so an `all` without these turns a missing dependency into a
+    # collection error rather than a skipped test.
+    "grpcio>=1.60", "grpcio-tools>=1.60", "protobuf>=4.25",
+    "pytest>=7.0", "httpx>=0.27",
+]
+
+[project.scripts]
+# One command from a checkout or from a URL: `tool-market web`.
+tool-market = "toolmarket.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["toolmarket*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

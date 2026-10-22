@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "tool-market: a protocol-driven resource substrate for evolvable agent tools"
+abstract: "FastAPI/Pydantic/SQLite service in which each tool is a stateful, versioned, lineage-carrying resource. Two orthogonal state axes decouple may-this-run from which-revision-is-live; an append-only SHA-256 hash chain makes the audit trail tamper-evident."
+authors:
+  - family-names: Zhang
+    given-names: Yangyi
+    affiliation: Georgetown University
+repository-code: "https://github.com/ZhangYangyi03/tool-market"
+license: Apache-2.0
+type: software
+keywords: [agent tools, tool registry, fastapi, lifecycle, hash chain]

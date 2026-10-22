@@ -1,0 +1,345 @@
+{
+  "uid": "toolmarket-substrate",
+  "title": "toolmarket — substrate",
+  "description": "The API's own instrumentation, scraped from /metrics. Every panel here is a question the substrate can answer about itself; none of them read the database directly, so nothing on this page can be right about the app while the app is lying.",
+  "tags": ["toolmarket", "substrate"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+        "query": "label_values(toolmarket_http_requests_total, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Event chain",
+      "description": "toolmarket_chain_intact. The substrate's central guarantee is that the event log is an append-only hash chain. A 0 here means something rewrote or reordered history and every other number on this page is suspect.",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_chain_intact{instance=~\"$instance\"}",
+          "instant": true,
+          "legendFormat": "chain"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "BROKEN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "INTACT", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Dependencies",
+      "description": "toolmarket_dependency_up, sampled by the API's gatherer at scrape time. A 0 means /ready is returning 503 while /health still says the process is fine — the state a container runtime will not notice and a caller will.",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_dependency_up{instance=~\"$instance\"}",
+          "instant": true,
+          "legendFormat": "{{component}}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Resources by state",
+      "description": "toolmarket_resources, gathered from the registry at scrape time rather than incremented by every transition — a counter that each path has to remember to bump is a counter that silently disagrees with GET /resources.",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_resources{instance=~\"$instance\"}",
+          "instant": true,
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Build",
+      "description": "toolmarket_build_info. The labels carry the store and cache backends, so the first thing to check when a panel is flat is whether the scraper is looking at the process you think it is — a sqlite/memory process and a postgres/redis one draw very different pictures.",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_build_info{instance=~\"$instance\"}",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/.*/", "values": false }
+      },
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request rate by route",
+      "description": "Toolmarked by the route *template*, not the path. The middleware reads the template off the matched route before the response is sent, which is the only way /resources/{id} does not become one series per resource id.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(toolmarket_http_requests_total{instance=~\"$instance\"}[2m])) by (route)",
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "none" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Latency (p50 / p95 / p99)",
+      "description": "Computed from the middleware's histogram. Quantiles over a mean is the whole reason buckets are exposed: a mean latency hides a bimodal distribution, which is exactly the shape a cache miss or a queue hop produces.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum(rate(toolmarket_http_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(toolmarket_http_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum(rate(toolmarket_http_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p95" }, "properties": [ { "id": "custom.lineWidth", "value": 3 } ] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Responses by status class",
+      "description": "A count, deliberately, and not a ratio: the ratio panel beside it is the alerting one, because a count threshold is wrong in both directions — it fires on a traffic spike being handled correctly and stays quiet on a low-traffic service failing everything.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(toolmarket_http_requests_total{instance=~\"$instance\"}[2m])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 20, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "5.." }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byRegexp", "options": "4.." }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "5xx ratio",
+      "description": "The expression the alert rule uses. Ratio rather than count, because it has to be meaningful at both 1 request/s and 1000.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(toolmarket_http_requests_total{status=~\"5..\",instance=~\"$instance\"}[5m])) / clamp_min(sum(rate(toolmarket_http_requests_total{instance=~\"$instance\"}[5m])), 0.001)",
+          "legendFormat": "5xx ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "In flight / rate limited",
+      "description": "In-flight is a gauge maintained by the middleware's try/finally, so a request that raises still decrements it — a gauge that only decrements on the success path is a gauge that climbs forever after the first 500.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_http_in_flight_requests{instance=~\"$instance\"}",
+          "legendFormat": "in flight"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(toolmarket_rate_limited_total{instance=~\"$instance\"}[2m]))",
+          "legendFormat": "429/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Cache hit ratio",
+      "description": "Only 200s are cached, and a miss is counted even when the cache is disabled — so a flat 0 here means \"the cache is off\", which is a different diagnosis from \"the cache is on and never hits\". The two are distinguished by the build_info label on panel 4.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(toolmarket_cache_lookups_total{result=\"hit\",instance=~\"$instance\"}[5m])) / clamp_min(sum(rate(toolmarket_cache_lookups_total{instance=~\"$instance\"}[5m])), 0.001)",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Evolutions by outcome",
+      "description": "toolmarket_evolutions_total. `proposed` and `rejected` moving together is a candidate-quality problem; proposals failing to appear at all is a model-endpoint problem. The two have different owners, which is why the outcome is a label.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(toolmarket_evolutions_total{instance=~\"$instance\"}[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "failure" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "sum"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Async tasks by state",
+      "description": "Gathered from the shared task store, which is why this panel moves when the *worker* does something — the worker serves no HTTP and has no /metrics of its own. A `running` count that does not fall back to `success` is a worker with a dead broker connection, which `docker compose ps` will still call healthy.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "toolmarket-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "toolmarket_async_tasks{instance=~\"$instance\"}",
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "failure" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi" } }
+    }
+  ]
+}

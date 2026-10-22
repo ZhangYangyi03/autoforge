@@ -1,0 +1,18 @@
+apiVersion: v2
+name: tool-market
+description: >-
+  The AGP resource substrate as a Kubernetes release: the same image the
+  compose stack and the Render service run, configured through the same
+  environment-variable seams (TOOLMARKET_STORE, REDIS_URL, TASK_QUEUE), with
+  Postgres and Redis either bundled by this chart or pointed at services an
+  existing cluster already provides.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+keywords: [agents, tools, agp, substrate, protocol]
+home: https://pypi.org/project/tool-market/
+sources:
+  - https://pypi.org/project/tool-market/
+maintainers:
+  - name: Zhang Yangyi

@@ -1,0 +1,17 @@
+# What the HuggingFace Space build installs.
+#
+# The engine is pinned to the same git ref as pyproject.toml, so the Space and a
+# fresh clone run the same enforcement code — the pin is the project's central
+# provenance claim, and a deployment that resolved a different ref would quietly
+# invalidate it.
+#
+# `gradio` is the Space's own framework (sdk: gradio), not a dependency of the
+# substrate: the API is served by the same `toolmarket.api.main.create_served_app`
+# either way, and gradio is only the front door a Space provides. Note that this
+# does not make the deployment free — HuggingFace requires a PRO subscription for
+# Gradio Spaces too, and only Static Spaces (which cannot run a server) are free.
+pydantic>=2.0
+autoforge @ git+https://github.com/ZhangYangyi03/autoforge.git@d53d3c5fa4dd617bb65857c390c0ac03edcb533e
+fastapi>=0.110
+uvicorn>=0.27
+gradio>=5.0

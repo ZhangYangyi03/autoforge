@@ -1,0 +1,184 @@
+# The full stack, in two layers.
+#
+#   docker compose up -d                      -> api + worker + postgres + redis
+#   docker compose --profile observability up -d   -> + prometheus + grafana
+#
+# The split is not decoration. The core four are what the app needs to be *right*
+# — a database, a cache, a queue, a consumer. Prometheus and Grafana are what you
+# need to *see* it, and they are the two services that would make the stack
+# unusable on a laptop with 3 GB free. A compose file that forces a monitoring
+# stack on every `up` is a compose file people stop running, and a stack nobody
+# runs is a stack whose bugs are found in production.
+#
+# Every knob below is an environment variable the code reads (see the `os.environ`
+# call sites in toolmarket/{store,cache,tasks,ratelimit}.py), so nothing here is
+# a value the code has to be told twice about:
+#
+#   TOOLMARKET_STORE    postgresql:// DSN | :memory: | /path/to.db
+#   REDIS_URL           redis://host:port/db | "none"
+#   TASK_QUEUE          celery | inline
+#   CACHE_TTL           seconds; 0 disables caching
+#   RATE_LIMIT[_WINDOW] requests per window, per client
+name: toolmarket
+
+x-substrate-env: &substrate-env
+  # Credentials come from .env (docker compose reads it automatically). The
+  # defaults are for a throwaway local stack and are intentionally obvious — a
+  # compose file with a "changeme" that nobody changes is worse than one whose
+  # defaults announce that they are defaults.
+  TOOLMARKET_STORE: postgresql://toolmarket:${POSTGRES_PASSWORD:-toolmarket}@postgres:5432/toolmarket
+  REDIS_URL: redis://redis:6379/0
+  TASK_QUEUE: celery
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  CACHE_TTL: "30"
+  RATE_LIMIT: "120"
+  RATE_LIMIT_WINDOW: "60"
+  # Trust X-Forwarded-For *only* because the only way in is through compose's
+  # network. On a host where the app is reachable directly, this would let any
+  # client forge its own identity and pick its own rate-limit bucket.
+  TRUST_PROXY: "1"
+  PYTHONUNBUFFERED: "1"
+
+services:
+  # -- data ---------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: toolmarket
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-toolmarket}
+      POSTGRES_DB: toolmarket
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `-U` and `-d` are not optional: without them this runs as the `postgres`
+      # superuser against the `postgres` database and reports healthy, which is
+      # exactly the state in which the app's own database does not exist yet.
+      test: ["CMD-SHELL", "pg_isready -U toolmarket -d toolmarket"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    profiles: ["", "observability"]
+
+  redis:
+    image: redis:7-alpine
+    # `--save ""` because nothing in this stack treats Redis as durable: the
+    # cache is a cache, the task records are operational, and the broker's queue
+    # is re-submittable. Persisting it would mean an fsync per evolution for the
+    # privilege of restoring a stale cache across restarts.
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    profiles: ["", "observability"]
+
+  # -- application --------------------------------------------------------
+  api:
+    build:
+      context: .
+      target: runtime
+    image: toolmarket:local
+    environment:
+      <<: *substrate-env
+      PORT: "8000"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 10s
+    profiles: ["", "observability"]
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    image: toolmarket:local
+    # One forked child, not the default of `ncpu`: this box has 8 cores and a
+    # laptop with 3 GB free does not want 8 copies of the substrate resident to
+    # serve a queue that is empty. `--concurrency` is the knob to turn up when the
+    # queue is actually deep.
+    command: ["celery", "-A", "toolmarket.worker:celery_app", "worker",
+              "--loglevel=info", "--concurrency=1", "--prefetch-multiplier=1"]
+    environment:
+      <<: *substrate-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # `inspect ping` is the only probe that proves the worker is consuming
+      # rather than merely alive — a worker whose connection to the broker has
+      # died still has a running process.
+      test: ["CMD-SHELL",
+             "celery -A toolmarket.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 30s
+    profiles: ["", "observability"]
+
+  # -- observability (`--profile observability`) --------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 6 hours of retention, not the default 15 days: this stack is for showing
+      # that the instrument works, and a local TSDB that grows unboundedly is a
+      # disk-space incident waiting for the demo to be over.
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      # Anonymous viewer access so a screenshot or a shared link works without
+      # anybody having to be handed a password. The admin password comes from
+      # .env; the default is here to make the first login obvious rather than to
+      # be secure, and the service is not published anywhere but localhost.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-toolmarket}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+    profiles: ["observability"]
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:

@@ -1,0 +1,31 @@
+# Grafana data source provisioning.
+#
+# Provisioned rather than clicked, because a dashboard that only exists in a
+# Grafana volume is a dashboard that cannot be reproduced by the next person to
+# clone the repo — and the whole point of this stack is that `docker compose
+# --profile observability up` gives anyone the same view.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # The fixed UID is load-bearing: the provisioned dashboard JSON references
+    # datasources by uid, not by name. Without it, a fresh volume resolves the
+    # datasource to whatever Grafana assigns and every panel in the dashboard
+    # opens on "Datasource Prometheus was not found".
+    uid: toolmarket-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Match the scrape interval. A shorter time interval makes Grafana request
+      # sub-resolution data and draw a step shape that is not in the data.
+      timeInterval: 15s
+      httpMethod: POST
+    editable: false
+
+  # The substrate's own store, as a second datasource, is deliberately not
+  # provisioned. Postgres here holds the source of truth; a dashboard that queries
+  # it directly would be answering "what does the database say" while the panels
+  # beside it answer "what did the process report", and the first time those two
+  # disagree the dashboard becomes the argument instead of the evidence.

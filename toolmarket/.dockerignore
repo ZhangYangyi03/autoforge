@@ -1,0 +1,60 @@
+# What the image build must not see.
+#
+# The rule is not "exclude junk" but "the image must be a function of tracked
+# source and nothing else". Every entry here is something that exists on a
+# developer's disk and would make a locally-built image differ from one built in
+# CI from a clean clone — which is the failure where "it works on my machine"
+# becomes "the image is not reproducible".
+
+.git
+.gitattributes
+.github
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Credentials. The image must never contain them, and COPY is not a place to
+# rely on a .gitignore.
+.deploy.env
+.env
+*.env
+!deploy/env.example
+
+# Python build artefacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.venv
+venv
+
+# Local substrate state and experiment scratch
+*.db
+*.sqlite3
+*.log
+experiments/results/_cache
+experiments/results/_dbg*
+experiments/results/_sanity
+experiments/results/_replay*
+
+# Deployment descriptors are read by the deploy tooling, not by the image
+docker-compose.yml
+render.yaml
+deploy/
+docs/
+
+# Terraform's working directory, and this one is not hygiene — it is a build that
+# cannot succeed without it. `.terraform/` holds the provider binary Terraform is
+# *executing at the moment it streams this context to the daemon*; that binary is
+# ~66 MB of the repo's ~70 MB working tree. The provider uses the legacy build
+# API, which sends the context as one tar stream, and the daemon closes the
+# connection partway through reading it — surfacing as `failed to read
+# dockerfile: unexpected EOF`, an error that names the Dockerfile and is actually
+# about the provider's own executable being read while it runs.
+#
+# `terraform/` wholesale rather than just `.terraform/`: the .tf files describe a
+# stack and are not inputs to the image, so there is no version of this where the
+# image should see them. State files would additionally be a credential leak —
+# `terraform.tfstate` holds the Postgres password in cleartext.
+terraform/

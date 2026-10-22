@@ -1,0 +1,129 @@
+{
+  "generations": 1,
+  "model": "stub",
+  "elapsed_s": 11.4,
+  "arms": [
+    {
+      "arm": "A",
+      "label": "A · gate ON",
+      "gate": "NoneType",
+      "hint_preserve": false,
+      "history": [
+        {
+          "generation": 0,
+          "arm": "A",
+          "goal": "(seed)",
+          "tool": "-",
+          "proposed": 0,
+          "vetoed": 0,
+          "committed": false,
+          "fitness": null,
+          "guardrails_mean": 1.0,
+          "integrity": 1.0,
+          "intact": 3,
+          "effect_drift_total": 0
+        },
+        {
+          "generation": 1,
+          "arm": "A",
+          "goal": "Make repeated calls much faster by remembering slugs for inputs it has already seen, so large batches do not recompute.",
+          "tool": "slugify",
+          "proposed": 3,
+          "vetoed": 1,
+          "committed": true,
+          "fitness": 1.0,
+          "admissible": 2,
+          "to_version": "0.1.1",
+          "guardrails_mean": 1.0,
+          "integrity": 1.0,
+          "intact": 3,
+          "effect_drift_total": 0,
+          "tools": [
+            {
+              "tool": "slugify",
+              "probes_kept": 2,
+              "probes_total": 2,
+              "guardrails": 1.0,
+              "effect_drift": 0,
+              "drift_labels": [],
+              "scope": "pure",
+              "version": "0.1.1",
+              "state": "probation",
+              "intact": true
+            },
+            {
+              "tool": "parse_duration",
+              "probes_kept": 2,
+              "probes_total": 2,
+              "guardrails": 1.0,
+              "effect_drift": 0,
+              "drift_labels": [],
+              "scope": "pure",
+              "version": "0.1.0",
+              "state": "active",
+              "intact": true
+            },
+            {
+              "tool": "redact_secrets",
+              "probes_kept": 2,
+              "probes_total": 2,
+              "guardrails": 1.0,
+              "effect_drift": 0,
+              "drift_labels": [],
+              "scope": "pure",
+              "version": "0.1.0",
+              "state": "active",
+              "intact": true
+            }
+          ]
+        }
+      ],
+      "final": {
+        "tools": [
+          {
+            "tool": "slugify",
+            "probes_kept": 2,
+            "probes_total": 2,
+            "guardrails": 1.0,
+            "effect_drift": 0,
+            "drift_labels": [],
+            "scope": "pure",
+            "version": "0.1.1",
+            "state": "probation",
+            "intact": true
+          },
+          {
+            "tool": "parse_duration",
+            "probes_kept": 2,
+            "probes_total": 2,
+            "guardrails": 1.0,
+            "effect_drift": 0,
+            "drift_labels": [],
+            "scope": "pure",
+            "version": "0.1.0",
+            "state": "active",
+            "intact": true
+          },
+          {
+            "tool": "redact_secrets",
+            "probes_kept": 2,
+            "probes_total": 2,
+            "guardrails": 1.0,
+            "effect_drift": 0,
+            "drift_labels": [],
+            "scope": "pure",
+            "version": "0.1.0",
+            "state": "active",
+            "intact": true
+          }
+        ],
+        "intact": 3,
+        "n_tools": 3,
+        "integrity": 1.0,
+        "guardrails_mean": 1.0,
+        "effect_drift_total": 0
+      },
+      "llm_calls": []
+    }
+  ]
+}

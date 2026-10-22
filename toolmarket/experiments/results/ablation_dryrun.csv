@@ -1,0 +1,3 @@
+arm,gate,hint_preserve,generation,tool,goal,proposed,vetoed,committed,fitness,guardrails_mean,intact,effect_drift_total
+A,NoneType,False,0,-,(seed),0,0,False,,1.0000,3,0
+A,NoneType,False,1,slugify,Make repeated calls much faster by remembering slugs for inputs it has already s,3,1,True,1.0,1.0000,3,0

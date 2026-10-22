@@ -1,0 +1,12 @@
+# Normalize every text file to LF so the repo behaves identically on Windows,
+# macOS and Linux; mark the real binaries so git never mangles them.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+
+# Shell launchers must keep LF -- CRLF breaks `sh` on Linux/macOS.
+*.sh text eol=lf
+*.cmd text eol=crlf

@@ -1,0 +1,34 @@
+# Scrape configuration. Two targets, because this stack runs two processes that
+# both serve /metrics, and the whole point of the instrumentation is to be able
+# to tell them apart: `toolmarket_build_info` carries the store and cache backend
+# as labels, so the first thing to check when a panel is flat is whether the
+# scraper is looking at the process you think it is.
+global:
+  # 15s is the default and the right choice here: the buckets in
+  # toolmarket.metrics top out at 5s and are meaningful from 5ms, so a scrape
+  # interval longer than 15s would start aliasing the latency histogram.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    stack: toolmarket-compose
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: toolmarket-api
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: api
+
+  # The worker does not serve HTTP, so there is nothing to scrape from it — this
+  # comment exists because its absence is a question that gets asked. Worker-side
+  # activity is visible through the API's `/metrics`, which reads the shared task
+  # store: `toolmarket_async_tasks{state="running"}` moves because the worker
+  # moved it, and `toolmarket_evolutions_total` is incremented by whichever
+  # process ran the evolution.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

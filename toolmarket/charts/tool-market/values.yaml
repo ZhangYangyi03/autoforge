@@ -1,0 +1,122 @@
+# Values for the tool-market chart.
+#
+# The shape of this file follows one rule: everything the application already
+# reads from the environment keeps its own name here. `TOOLMARKET_STORE`,
+# `REDIS_URL`, `TASK_QUEUE`, `CACHE_TTL`, `RATE_LIMIT`, `RATE_LIMIT_WINDOW`,
+# `TRUST_PROXY` are the seams (see the `os.environ` call sites in
+# toolmarket/{store,cache,tasks,ratelimit}.py). A chart that invents a parallel
+# vocabulary for them is a chart whose values file and whose README can disagree
+# without either one being wrong.
+
+image:
+  # `toolmarket:local` is what `make image` builds and what
+  # `kind load docker-image` puts into a kind cluster. Not pinned to a digest
+  # on purpose: the chart ships with the tree that builds it.
+  repository: toolmarket
+  tag: local
+  # IfNotPresent, because in the kind flow the image is loaded into the node
+  # rather than pushed to a registry. `Never` would also work there and fail
+  # confusingly anywhere else.
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+api:
+  replicas: 1
+  port: 8000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      # No CPU limit, deliberately. A CPU limit makes the process throttled
+      # rather than scheduled, which turns "the machine is busy" into "the
+      # latency is wrong" -- the harder failure to diagnose.
+      memory: 512Mi
+
+worker:
+  replicas: 1
+  # One forked child, matching docker-compose.yml. The knob exists rather than
+  # a constant because the value that is right for a laptop is wrong for a
+  # cluster, and hard-coding either makes the chart wrong for the other.
+  concurrency: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+# -- the substrate's own configuration --------------------------------------
+config:
+  cacheTtl: "30"
+  rateLimit: "120"
+  rateLimitWindow: "60"
+  # `celery`, because this chart always runs a worker. Setting `inline` here
+  # and leaving the worker on would be a release with an idle container in it.
+  taskQueue: celery
+  # Only "1" behind a proxy that terminates the connection. Otherwise any
+  # client picks its own rate-limit bucket by sending an X-Forwarded-For
+  # header, and the limiter stops being per-client without saying so.
+  trustProxy: "0"
+
+postgres:
+  # true  -> this chart runs Postgres and points the app at it.
+  # false -> set externalDatabase.dsn; the shared-substrate case.
+  enabled: true
+  image: postgres:16-alpine
+  user: toolmarket
+  database: toolmarket
+  # Empty means: generate one on first install and read it back from the
+  # Secret on later upgrades. An explicit value here is used verbatim.
+  password: ""
+  persistence:
+    # A PVC, so the resources/events/lineage survive a pod restart -- which is
+    # the entire reason the Postgres backend exists. `make k8s-up` runs on a
+    # kind cluster, whose local-path provisioner satisfies this.
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+externalDatabase:
+  dsn: ""
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  # No persistence, matching compose's `--save ""`: the cache is a cache, the
+  # task records are operational, and the broker's queue is re-submittable.
+  # Persisting it would buy an fsync per evolution to restore a stale cache.
+  maxmemory: 128mb
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+externalRedis:
+  # Used as REDIS_URL. The two below default to it, because a single instance
+  # shared by cache and broker is what most clusters actually have; set them
+  # to distinct database indexes to separate the three namespaces the compose
+  # stack keeps apart (/0 cache, /1 broker, /2 results).
+  url: ""
+  brokerUrl: ""
+  resultBackendUrl: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

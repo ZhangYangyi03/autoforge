@@ -1,0 +1,101 @@
+# Render blueprint: one command to a public URL with a real database and cache.
+#
+#   render.com -> New -> Blueprint -> point at this repo -> Apply
+#
+# Render reads `render.yaml` from the repo root, so this file has to be copied
+# there (or symlinked) before the Blueprint will find it — the `make render-init`
+# target does that, and the README says so. Keeping the authoritative copy under
+# deploy/ rather than at the root is deliberate: the root of this repo is the
+# substrate, and three deployment vendors' descriptors scattered through it make
+# the protocol look like an afterthought to the deployment.
+#
+# The service names below are load-bearing, and this is the part that is easy to
+# get wrong. Render matches Blueprint resources to existing ones *by name*: "if
+# you add the name of an existing service to your Blueprint file, Render attempts
+# to apply the Blueprint's configuration to that existing service". So
+#
+#   * `tool-market` is named to match the web service already in the workspace,
+#     which makes this file *adopt* it — the same URL, now with a database and a
+#     cache wired in — instead of creating a second, parallel service.
+#   * `toolmarket` (no hyphen) is NOT that name. It is also already taken as an
+#     onrender.com subdomain by an unrelated party, so a Blueprint asking for it
+#     would either fail or silently land on a suffixed hostname.
+#
+# What this file cannot do: the free Postgres plan expires after 90 days, and
+# Render's free web service spins down after 15 minutes of inactivity. Both are
+# facts about the plan, not about this file, and they are why the README offers
+# HuggingFace Spaces as the always-on option and this one as the one with a real
+# database behind it.
+#
+# The free Key Value plan has no persistence, which is the same choice
+# docker-compose.yml makes for local Redis (`--save ""`): the cache is a cache,
+# task records are operational, and a broker's queue is re-submittable.
+
+services:
+  # -- the API ------------------------------------------------------------
+  - type: web
+    name: tool-market
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # `/ready`, not `/health`. Render restarts a service whose health check
+    # fails, and restarting an app whose database is unreachable fixes nothing —
+    # it just makes the outage noisier. `/health` is process-local by design, so
+    # it is the wrong probe for anything that acts on the answer.
+    healthCheckPath: /ready
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: TOOLMARKET_STORE
+        fromDatabase:
+          name: tool-market-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: tool-market-cache
+          property: connectionString
+      # Inline queue: the free web plan has no separate worker service to run
+      # Celery in, and an evolution is a few seconds of model latency — short
+      # enough that inline is honest here. Set this to `celery` and add the
+      # worker service below if the plan grows.
+      - key: TASK_QUEUE
+        value: inline
+      - key: CACHE_TTL
+        value: "30"
+      - key: RATE_LIMIT
+        value: "120"
+      - key: RATE_LIMIT_WINDOW
+        value: "60"
+      # Render terminates TLS in front of the container, so the client IP is only
+      # in X-Forwarded-For. Without this the limiter buckets every request under
+      # Render's proxy address, which makes it a global limit rather than a
+      # per-client one — a subtle and completely invisible failure.
+      - key: TRUST_PROXY
+        value: "1"
+
+  # -- cache / broker -----------------------------------------------------
+  - type: keyvalue
+    name: tool-market-cache
+    plan: free
+    region: oregon
+    # 25 MB and LRU: this cache holds single resource records with a 30s TTL, so a
+    # larger instance would be buying headroom for entries that expire before
+    # they are read. `noeviction` here would turn a full cache into failed writes
+    # instead of a miss, which is strictly worse for a cache.
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+databases:
+  - name: tool-market-db
+    plan: free
+    region: oregon
+    databaseName: toolmarket
+    user: toolmarket
+    # Free Postgres on Render has no PITR and no failover. Said out loud here
+    # rather than discovered later: this is a demo-grade database and the README
+    # does not pretend otherwise.
+    postgresMajorVersion: "16"

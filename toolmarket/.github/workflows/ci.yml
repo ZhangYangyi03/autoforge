@@ -1,0 +1,226 @@
+name: ci
+
+# The workflow that gates a merge. `reproduce.yml` answers "does the pinned
+# engine still reproduce the paper's numbers"; this one answers "does the thing
+# build, serve, and hold together". They are separate files because they fail for
+# different reasons and a red X should say which.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Explicit, least-privilege. Without `packages: write` the GHCR push fails with a
+# 403 that reads like an auth problem and is actually a permissions problem.
+permissions:
+  contents: read
+  packages: write
+
+# A new push to a PR cancels the run it supersedes. On a repo where the whole
+# suite takes ~45s this is a small win, but it is the difference between "the
+# checks passed" and "the checks passed, three commits ago".
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  tests:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor declared in pyproject.toml. Testing the floor and the
+        # current release is the point; every minor in between buys nothing and
+        # triples the matrix.
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # `[all]` rather than `[dev]`: the tests exercise the Postgres, Redis and
+      # Celery paths, and the point of running them here is that the code paths a
+      # container takes are the ones CI exercised.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+
+      # The stubs are generated, not committed, so this is a required build step
+      # rather than a convenience. Without it `tests/test_grpc_surface.py` fails
+      # at *collection* — its `import grpc` and its stub import are module-scope —
+      # which reports as one collection error and silently skips the whole
+      # surface, including the REST/gRPC agreement cases that are the only thing
+      # testing the two doors against each other.
+      - name: Generate gRPC stubs
+        run: python tools/grpc_gen.py
+
+      - name: Test
+        run: python -m pytest tests -q
+
+      # A test suite that passes while the module cannot be imported from its
+      # documented entry point is a suite testing a different app.
+      - name: Import smoke checks
+        run: |
+          python -c "import toolmarket, toolmarket.api.main, toolmarket.web"
+          python -c "from toolmarket.api.main import served_app; assert served_app is not None"
+          python -c "import toolmarket.worker"
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      # Hard failures on syntax errors and on the undefined-name class of bug.
+      # F821 is the one that catches a typo in a metrics name or a call to a
+      # function that does not exist — a failure unit tests miss whenever the
+      # branch is not covered, which for error paths is most of the time.
+      - name: ruff
+        run: ruff check --select E9,F63,F7,F82,F821 --output-format github toolmarket tests
+
+  config:
+    name: config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # These files *are* the deployment. A workflow that only tests Python would
+      # let a broken alert expression or an unparseable compose file reach main,
+      # and both fail at the worst possible moment: when somebody is trying to use
+      # the stack.
+      - name: docker compose config
+        run: docker compose config --quiet
+
+      # Mounted at /etc/prometheus, not /p, because prometheus.yml refers to its
+      # rules by absolute path (`/etc/prometheus/alerts.yml`). Mounting elsewhere
+      # makes `check config` fail on a missing rule file — a failure that says
+      # nothing about whether the config is valid.
+      - name: promtool check config
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            check rules /etc/prometheus/alerts.yml
+
+      - name: grafana provisioning + dashboard
+        run: |
+          pip install pyyaml
+          # The same script a developer runs locally, so the checks cannot drift
+          # between CI and the machine where the dashboard is edited. It validates
+          # datasource uids, every metric a panel queries, every metric an alert
+          # queries, and that every alert carries a severity (the routing label).
+          python tools/check_dashboards.py
+
+  image:
+    name: build + push image
+    runs-on: ubuntu-latest
+    needs: [tests, lint, config]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Built and loaded into the local daemon first, so the smoke test below runs
+      # against *this* commit's image rather than against whatever the registry
+      # happens to have. `push: true` and `load: true` cannot be combined on one
+      # buildx invocation, which is why the push is a second step: it re-runs the
+      # same build and hits the GHA cache, costing seconds.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: toolmarket:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A build that succeeds and a container that serves are different claims,
+      # and only the second is the one that matters. Run with **no environment at
+      # all**, so what is exercised is exactly what a reader gets from
+      # `docker run <image>` — including the in-process cache that makes
+      # `POST /evolve/async` pollable.
+      - name: Smoke test the image
+        run: |
+          set -x
+          docker run -d --name smoke -p 8123:8000 toolmarket:ci
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8123/health > /dev/null 2>&1; then ok=yes; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then docker logs smoke; exit 1; fi
+          curl -fsS http://127.0.0.1:8123/health
+          curl -fsS http://127.0.0.1:8123/ready
+          curl -fsS http://127.0.0.1:8123/metrics | grep -q '^toolmarket_build_info'
+          # The labels must report the backends the container actually got. A
+          # process reporting postgres while running sqlite is the exact drift
+          # this metric exists to make impossible.
+          curl -fsS http://127.0.0.1:8123/metrics | grep -q 'store_backend="sqlite"'
+          curl -fsS http://127.0.0.1:8123/metrics | grep -q 'cache_backend="memory"'
+          # The async path must survive the bare-run defaults: an accepted task
+          # whose id cannot be polled is the failure this asserts against, and it
+          # is invisible to any test that only curls /health.
+          # No `-f` here: `tool:missing` does not exist, so this call answers 404
+          # by design, and under `set -e` a failing curl would abort the step
+          # before the assertion below ever runs. This call only fires the
+          # request; the next one is the one that reads the status.
+          curl -sS -X POST http://127.0.0.1:8123/resources/tool:missing/evolve/async \
+            -H 'content-type: application/json' -d '{"goal":"g"}' > /dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8123/resources/tool:missing/evolve/async \
+            -H 'content-type: application/json' -d '{"goal":"g"}')
+          test "$code" = "404"
+          echo "smoke ok"
+
+      - name: Log in to GHCR
+        # Only on a real push to main. A PR from a fork has a read-only
+        # GITHUB_TOKEN, so an unconditional login turns every outside
+        # contribution into a red X for a reason the contributor cannot fix.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short
+            type=ref,event=pr
+
+      - name: Push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

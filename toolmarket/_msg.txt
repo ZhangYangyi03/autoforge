@@ -1,0 +1,31 @@
+mcp: the door stops lying about what it holds, and is honest about what it does not
+
+Two things the live shelf proved wrong, both found by walking it rather than by
+reading it.
+
+1. The served shelf answered one tool. /health over loopback said 16,000; the MCP
+   door said 1. The door read the registry it was handed at process start, and the
+   importer writes to the same SQLite from another process -- so the door answered
+   a snapshot taken before 16,000 rows existed. Reads now refresh:
+   ResourceRegistry.refresh() re-reads when another writer's stamp moved, which
+   costs one indexed aggregate when nothing has. tools/lookup reuses that path, so
+   it too sees what was imported after boot.
+
+2. tools/list pages. Measured on 2026-09-28: 16,400 tools in one reply is ~9 MB, a
+   reply no client can use. 500 per page, ordered by id, cursor = next id (not an
+   offset, so a row added between two calls cannot be skipped). Whole shelf walks
+   in 33 pages / 3.5s.
+
+Also corrected while testing, each against a real failure:
+
+* tools/lookup scored by substring, so `unknown tool: nope` offered
+  mcp_com_snopekgames_godai -- "nope" inside "snopekgames". Matching is now on
+  tokens, with a prefix allowed from three characters up ("resume" has to reach
+  run_resume_report), and a term in the name is worth more than one in the
+  description. A near-miss list that is a coincidence is noise wearing the costume
+  of help.
+* Unknown-tool errors carry the near misses, so a wrong name is a correction and
+  not a dead end.
+
+README: the route table gains the routes that were missing from it (/search,
+/search/health, /discover, /resources/{id}/trust, /mcp) and a section on the door.

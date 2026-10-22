@@ -1,0 +1,22 @@
+# State and provider cache are per-operator and must never be committed.
+#
+# `terraform.tfstate` in particular: it holds the Postgres password in cleartext,
+# because that is what the resource declares. The `sensitive = true` on
+# `postgres_password` keeps the value out of plan output and CI logs, which is a
+# different leak from the state file — and the state file is the one people
+# forget, because it is written by the tool rather than by the author.
+
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+
+# Local overrides. The `.example` is tracked; the real one is not.
+terraform.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

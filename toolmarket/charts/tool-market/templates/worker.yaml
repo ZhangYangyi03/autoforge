@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tool-market.fullname" . }}-worker
+  labels:
+    {{- include "tool-market.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "tool-market.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "tool-market.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: {{ include "tool-market.serviceAccountName" . }}
+      # The worker needs the broker the same way the API needs the database,
+      # and for the same reason (see _waitfor.tpl): without the gate it starts
+      # before Redis is listening and its `inspect ping` probe fails until the
+      # broker appears -- a crash loop that looks like a broken worker.
+      initContainers:
+        {{- include "tool-market.waitForDeps" . | nindent 8 }}
+      # The worker's shutdown is a queue drain, so it gets time to finish the
+      # task in its hands rather than being SIGKILLed mid-evolution.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image's own CMD is uvicorn (it is the API image); the worker is
+          # the same image with a different command, exactly as compose runs
+          # it. One image, two roles, no second build to keep in step.
+          command:
+            - celery
+            - -A
+            - toolmarket.worker:celery_app
+            - worker
+            - --loglevel=info
+            - --concurrency={{ .Values.worker.concurrency }}
+            - --prefetch-multiplier=1
+          env:
+            {{- include "tool-market.substrateEnv" . | nindent 12 }}
+          # `inspect ping` is the only probe that proves the worker is
+          # *consuming* rather than merely alive: a worker whose broker
+          # connection has died still has a running process. It uses
+          # `celery@$HOSTNAME` and NOT the `celery@$$HOSTNAME` that compose
+          # needs -- compose does its own `$VAR` interpolation and so requires
+          # an escaped dollar, while nothing between this YAML and the
+          # container's `sh` interpolates anything. Copying the compose string
+          # here verbatim would address `celery@1234HOSTNAME`, a node that
+          # never exists, and the worker would be reported unhealthy forever
+          # while being perfectly healthy. (The same mistake, in the same
+          # project, was live in terraform/main.tf.)
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - celery -A toolmarket.worker:celery_app inspect ping -d celery@$HOSTNAME --timeout 10
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
