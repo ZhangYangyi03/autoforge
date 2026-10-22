@@ -1,0 +1,25 @@
+name: Feature request
+description: A capability this project should have
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the framework makes hard? Describe the task, not the API you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. A sketch is fine; an argument is better than a design.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds you used, and why they were not good enough.
+    validations:
+      required: false

@@ -522,3 +522,18 @@ verification* -- is made and measured in other domains:
 | [debt-verify](https://github.com/ZhangYangyi03/debt-verify) | a debt clause decision, until it survives the published revision record |
 | [tool-market](https://github.com/ZhangYangyi03/tool-market) | a tool's liveness, until the hash chain says which revision is live |
 | [agent-safety-bench](https://github.com/ZhangYangyi03/agent-safety-bench) | a model's safety compliance, measured rather than assumed |
+
+## Contributing
+
+Contributions are welcome, including bug reports and design arguments that
+contain no code. Start with [CONTRIBUTING.md](CONTRIBUTING.md): it has the setup
+(no API key needed to run the suite), the branch and commit conventions, and
+what CI checks on a pull request.
+
+    git clone https://github.com/ZhangYangyi03/autoforge
+    cd autoforge
+    python -m pip install -e ".[dev]"
+    python -m pytest tests -q
+
+Security issues go to the maintainer privately rather than into a public issue --
+this framework runs code with real filesystem and network reach.

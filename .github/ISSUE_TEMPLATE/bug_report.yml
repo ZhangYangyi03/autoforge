@@ -1,0 +1,34 @@
+name: Bug report
+description: Something behaves differently from how it is documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran, and the full traceback if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: One sentence is enough.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Output of:
+          python -c "import sys, platform; print(sys.version, platform.platform())"
+        plus the autoforge version (`auto --version`, or the version in pyproject.toml).
+    validations:
+      required: true
+  - type: checkboxes
+    id: sandbox
+    attributes:
+      label: Scope
+      options:
+        - label: This involves code the agent runs on the host (sandbox, filesystem or network reach) rather than the CLI or the model call
