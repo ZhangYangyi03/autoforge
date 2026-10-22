@@ -35,7 +35,12 @@ dev = ["pytest>=7", "pytest-xdist", "pyyaml"]
 # user has to find and install, it is a directory in this repo (joined by git
 # subtree, history intact) and a directory in this wheel. `autoforge.embedded`
 # is the only module that puts it on sys.path.
-include = ["autoforge*", "toolmarket*"]
+#
+# `toolmarket.toolmarket*`, not `toolmarket*`: the subtree root also holds its
+# own pyproject.toml and two launch scripts, and shipping those puts a second
+# setuptools project inside an installed package -- enough to confuse pip and
+# every tool that scans site-packages.
+include = ["autoforge*", "toolmarket.toolmarket*"]
 
 [tool.setuptools.package-data]
 # The web UI is one static file, and it is the only thing in this package that is

@@ -85,7 +85,38 @@ jobs:
           print("  imported from:", where)
           print("  UI in the install:", ui)
           PY
-          /tmp/wheelcheck/bin/python -m autoforge --version
+      - name: the wheel carries the market too
+        run: |
+          # Same failure the web UI had, one package further out: a wheel that
+          # omits `toolmarket` installs fine, imports fine, and reports the shelf
+          # as missing on every machine that is not this checkout. The source
+          # joined by subtree, so packaging has to name it explicitly.
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          for need in ("toolmarket/__init__.py", "toolmarket/store.py",
+                       "toolmarket/web.py"):
+              assert need in names, f"{need} missing from {whl}"
+          print("  market in the archive:", whl)
+          PY
+
+          /tmp/wheelcheck/bin/python -m pip install --quiet "$GITHUB_WORKSPACE"/dist/*.whl fastapi uvicorn pydantic
+          cd /tmp
+          # `status` is the verb that has to work without starting anything, and
+          # it is the only one that reports where the market's source came from.
+          /tmp/wheelcheck/bin/python -m autoforge.cli market status --port 59999 \
+            | tee /tmp/market-status.json
+          /tmp/wheelcheck/bin/python - <<'PY'
+          import json
+
+          report = json.load(open("/tmp/market-status.json"))
+          assert report["embedded"] is True, report
+          assert "site-packages" in report["source"].replace("\\", "/"), report["source"]
+          print("  market source in the install:", report["source"])
+          PY
 
       - name: the sdist carries what its own suite imports
         run: |
