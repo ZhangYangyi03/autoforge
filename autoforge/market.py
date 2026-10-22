@@ -78,6 +78,27 @@ def health(url=None, timeout: float = 5.0) -> dict:
         return {"ok": False, "error": ("%s: %s" % (type(exc).__name__, exc))[:200]}
 
 
+def _embedded_command():
+    """`python -m autoforge.cli market up`, if the embedded market can run here.
+
+    The check is on the imports the console actually needs, not on the source
+    tree being present: spawning a process that is certain to die at its first
+    import turns a clear "install the extra" into a 25-second timeout.
+    """
+    try:
+        from autoforge import embedded
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not embedded.available():
+        return None
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except Exception:                                     # noqa: BLE001
+        return None
+    return [sys.executable, "-m", "autoforge.cli", "market", "up"]
+
+
 def _find_launcher():
     explicit = os.environ.get("TOOLMARKET_LAUNCHER")
     if explicit and Path(explicit).is_file():
@@ -104,9 +125,23 @@ def ensure_running(url=None, *, launch: bool = True, timeout: float = STARTUP_TI
         return report
     launcher = _find_launcher()
     if launcher is None:
-        report.update(action="unavailable", ok=False,
-                      error="no launcher found; set TOOLMARKET_LAUNCHER")
-        return report
+        # No sibling checkout to launch. Since the market moved into this repo
+        # (git subtree, `toolmarket/` at the root) the launcher can be this very
+        # package -- `python -m autoforge.cli market up` -- which is the same
+        # command a person runs. Preferring a launcher script when one exists
+        # keeps a developer's separately checked-out market, with its own
+        # store and its own edits, in charge of its own process.
+        embedded = _embedded_command()
+        if embedded is None:
+            report.update(action="unavailable", ok=False,
+                          error="no launcher found; set TOOLMARKET_LAUNCHER "
+                                "(the embedded market needs fastapi and uvicorn: "
+                                "pip install 'autoforge-agent[market]')")
+            return report
+        launcher = None
+        command = embedded
+    else:
+        command = [sys.executable, str(launcher)]
     creationflags = 0
     if os.name == "nt":
         # CREATE_NO_WINDOW, not DETACHED_PROCESS. The launcher is a shell script,
@@ -119,16 +154,17 @@ def ensure_running(url=None, *, launch: bool = True, timeout: float = STARTUP_TI
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(launcher)],
+            command,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-            cwd=str(launcher.parent), creationflags=creationflags,
+            cwd=str(launcher.parent) if launcher is not None else None,
+            creationflags=creationflags,
             start_new_session=(os.name != "nt"))
     except Exception as exc:
         report.update(action="unavailable", ok=False,
                       error=("launch failed: %s: %s" % (type(exc).__name__, exc))[:200])
         return report
     report["pid"] = proc.pid
-    report["launcher"] = str(launcher)
+    report["launcher"] = str(launcher) if launcher is not None else "embedded"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if is_listening(target, timeout=0.5):

@@ -523,6 +523,44 @@ verification* -- is made and measured in other domains:
 | [tool-market](https://github.com/ZhangYangyi03/tool-market) | a tool's liveness, until the hash chain says which revision is live |
 | [agent-safety-bench](https://github.com/ZhangYangyi03/agent-safety-bench) | a model's safety compliance, measured rather than assumed |
 
+## The market ships inside this package
+
+Forging a tool is only half of it; the other half is that other agents can see
+it. That shared shelf used to be a second repo cloned beside this one, with its
+own launcher and two hard-coded absolute paths -- so on any other machine the
+shelf was absent, and a ledger full of `market_sync: ok=false` named a problem
+with no fix a reader could act on. It now lives in this repo at `toolmarket/`
+(joined by git subtree, its 39 commits intact) and is served by this package:
+
+```bash
+auto market                          # the shelf, on 127.0.0.1:8000
+auto market --port 8000 --host 0.0.0.0
+auto market status                   # is it up, where is its store, JSON
+auto market push                     # re-publish every tool on the ledger
+```
+
+`auto market` needs three packages that most users never touch:
+
+```bash
+pip install 'autoforge-agent[market]'
+```
+
+Three things about it are deliberate:
+
+- The store defaults to a **file** (`%LOCALAPPDATA%/autoforge/toolmarket.db`),
+  not `:memory:`. An in-memory shelf forgets every tool on restart, and the
+  symptom is not an error -- it is a shelf listing one tool where it listed
+  eight, which reads as "nobody published anything" rather than "the database
+  was in RAM".
+- The path to the source is **computed** by walking up from
+  `autoforge/embedded/__init__.py`, never written down.
+- The market is put on `sys.path` **only inside** `embedded.importable()`, so a
+  pip-installed `toolmarket` keeps winning outside it.
+
+The shelf is still a peer, not a dependency: a forge never rolls back because
+the market is asleep, and `market_sync` records the outcome so a later run can
+tell "never published" from "published".
+
 ## Contributing
 
 Contributions are welcome, including bug reports and design arguments that

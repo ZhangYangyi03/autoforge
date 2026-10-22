@@ -8,3 +8,10 @@
 # tool-market's reproduce workflow before it moved to the repo that can fix it.
 recursive-include tests *.py
 recursive-include probes *.txt *.md *.py
+
+# The market's own suite is not this distribution's suite, but it is the
+# evidence the embedded copy works, and it is small. Ship it rather than let the
+# tarball claim a market it cannot demonstrate.
+recursive-include toolmarket/tests *.py
+recursive-include toolmarket/toolmarket *.py
+include toolmarket/pyproject.toml

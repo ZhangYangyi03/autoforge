@@ -18,6 +18,10 @@ autoforge = "autoforge.cli:main"
 auto = "autoforge.cli:main"
 
 [project.optional-dependencies]
+# The embedded market console (`auto market`). Listed as an extra rather than as
+# runtime deps because most users never serve a shelf, and the market's own code
+# is only imported inside `autoforge.embedded`.
+market = ["pydantic>=2.0", "fastapi>=0.110", "uvicorn>=0.27"]
 # pyyaml is here, not in the runtime deps: reading a YAML config is optional at
 # runtime (the loader says "pip install pyyaml" when it is absent, and a test
 # drives exactly that path by monkeypatching the import). But the test suite
@@ -27,7 +31,11 @@ auto = "autoforge.cli:main"
 dev = ["pytest>=7", "pytest-xdist", "pyyaml"]
 
 [tool.setuptools.packages.find]
-include = ["autoforge*"]
+# `toolmarket` ships inside this distribution: the market is not a dependency a
+# user has to find and install, it is a directory in this repo (joined by git
+# subtree, history intact) and a directory in this wheel. `autoforge.embedded`
+# is the only module that puts it on sys.path.
+include = ["autoforge*", "toolmarket*"]
 
 [tool.setuptools.package-data]
 # The web UI is one static file, and it is the only thing in this package that is

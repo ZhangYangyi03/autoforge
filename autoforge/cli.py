@@ -1186,6 +1186,104 @@ def cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_market(args: argparse.Namespace) -> int:
+    """`auto market` -- the shared shelf, with nothing to install and no path to set.
+
+    It shipped as a separate repo with its own autostart script that hard coded
+    two absolute directories. Both of those are now facts about this package: the
+    source is `toolmarket/` at the repo root, and the launcher is this command.
+    That matters most in the failure case -- `market_sync: ok=false` on the
+    ledger used to name a problem a reader could not act on.
+
+    `status` has to work on a machine where the shelf is down, so it imports no
+    web framework and it starts nothing.
+    """
+    import json as _json
+
+    from . import embedded
+    from . import market as market_mod
+
+    action = getattr(args, "market_action", "up") or "up"
+
+    if action == "status":
+        url = f"http://{args.host}:{args.port}"
+        report = {
+            "source": str(embedded.source_root()),
+            "embedded": embedded.available(),
+            "store": embedded.store_url(args.store),
+            "url": url,
+            "listening": market_mod.is_listening(url),
+        }
+        if not report["embedded"]:
+            report["missing"] = embedded.missing_reason()
+        if report["listening"]:
+            report["health"] = market_mod.health(url)
+        print(_json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report["listening"] else 1
+
+    if action in ("up", "serve"):
+        url = f"http://{args.host}:{args.port}"
+        if market_mod.is_listening(url):
+            print(_c(_D, f"already listening on {url}"))
+            return 0
+        if not embedded.available():
+            print(_c(_Y, "error:"), embedded.missing_reason())
+            return 2
+        try:
+            embedded.serve(host=args.host, port=args.port, store=args.store,
+                           open_browser=getattr(args, "open_browser", False),
+                           seed_demo=getattr(args, "seed", False))
+        except OSError as exc:
+            print(_c(_Y, "error:"), f"cannot bind {args.host}:{args.port} -- {exc}")
+            return 1
+        return 0
+
+    if action == "push":
+        # Re-sync every live tool on the ledger. The repair for a ledger full of
+        # `market_sync: ok=false` written while the shelf was down.
+        from .store import ToolStore
+
+        url = f"http://{args.host}:{args.port}"
+        up = market_mod.ensure_running(url)
+        if not up.get("ok"):
+            print(_c(_Y, "error:"), "market is not up:",
+                  up.get("error") or up.get("action"))
+            return 1
+        store = ToolStore()
+        records = list(store.load_all_tools().values())
+        pushed = failed = 0
+        for record in records:
+            spec = record.to_spec()
+            res = embedded.publish(spec, url=url)
+            if res.get("ok"):
+                pushed += 1
+            else:
+                failed += 1
+                print(_c(_D, f"  {record.name}: {res.get('error', 'failed')}"))
+        print(f"  ok {pushed}, failed {failed}, total {len(records)}")
+        return 0 if failed == 0 else 1
+
+    if action == "reset-db":
+        # The one destructive verb, said out loud rather than hidden: the sqlite
+        # default is new, and a way back to an empty shelf has to be a command
+        # instead of a file deletion someone has to guess at.
+        target = embedded.store_url(args.store)
+        prefix = "sqlite:///"
+        path = target[len(prefix):] if target.startswith(prefix) else ""
+        if not path or path == ":memory:":
+            print(_c(_Y, "refusing:"), f"store {target!r} is not a sqlite file")
+            return 2
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"  removed {path}")
+        else:
+            print(f"  nothing at {path}")
+        return 0
+
+    print(_c(_Y, "error:"), f"unknown action {action!r}: up | status | push | reset-db")
+    return 2
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """One-shot task through a chosen mode — the headless twin of the UI."""
     cfg = _config(args)
@@ -1711,6 +1809,23 @@ def build_parser() -> argparse.ArgumentParser:
                                    "(AUTOFORGE_WEB_TOKEN)")
     w.add_argument("--no-browser", action="store_true", help="do not open a browser")
 
+    mk = sub.add_parser(
+        "market",
+        help="the shared tool shelf, served from inside this package")
+    mk.add_argument("market_action", nargs="?", default="up",
+                    help="up (default: serve the console) | status | push | reset-db")
+    mk.add_argument("--host", default=os.environ.get("TOOLMARKET_HOST", "127.0.0.1"),
+                    help="bind address (default 127.0.0.1; 0.0.0.0 to share)")
+    mk.add_argument("--port", type=int,
+                    default=int(os.environ.get("TOOLMARKET_PORT") or "8000"),
+                    help="port (default 8000, the address agents already look for)")
+    mk.add_argument("--store", help="store URL, else TOOLMARKET_STORE / DATABASE_URL, "
+                                    "else a sqlite file beside the ledger")
+    mk.add_argument("--seed", action="store_true",
+                    help="seed the demo catalog (off by default: a shelf, not a demo)")
+    mk.add_argument("--open", dest="open_browser", action="store_true",
+                    help="open a browser once it is up")
+
     r = sub.add_parser("run", help="run one task through a chosen mode, headless")
     r.add_argument("task", nargs="+", help="the task, in plain language")
     r.add_argument("--mode", choices=list(MODES), default="standard")
@@ -1771,6 +1886,7 @@ def command_table() -> dict[str, Any]:
         "setup": cmd_setup,
         "config": cmd_config,
         "web": cmd_web,
+        "market": cmd_market,
         "run": cmd_run,
         "modes": cmd_modes,
         "tick": cmd_tick,
