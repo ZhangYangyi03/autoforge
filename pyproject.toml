@@ -28,7 +28,11 @@ market = ["pydantic>=2.0", "fastapi>=0.110", "uvicorn>=0.27"]
 # reads a real YAML file to prove the happy path, so a machine without pyyaml
 # fails two tests -- which is what a fresh CI runner turned out to be. Declaring
 # it keeps the suite testing what it claims instead of testing this laptop.
-dev = ["pytest>=7", "pytest-xdist", "pyyaml"]
+dev = ["pytest>=7", "pytest-xdist", "pyyaml",
+       # The vault tests are not optional in CI: nine of them exercise the
+       # encrypted credential store, and without this they fail on a fresh
+       # runner instead of skipping, which reads as nine broken features.
+       "cryptography>=41"]
 
 [tool.setuptools.packages.find]
 # `toolmarket` ships inside this distribution: the market is not a dependency a

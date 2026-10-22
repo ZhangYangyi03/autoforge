@@ -8,3 +8,16 @@
 # tool-market's reproduce workflow before it moved to the repo that can fix it.
 recursive-include tests *.py
 recursive-include probes *.txt *.md *.py
+
+# The sdist's own suite drives two things that are not importable modules:
+# `tools/media_mcp_server.py` (spawned as a script by the MCP tests) and the
+# vendored tars tree (read as data, with its licence and hash manifest). Neither
+# is a package, so setuptools carried neither, and the unpacked-sdist job kept
+# failing on files that exist in every checkout.
+recursive-include tools *.py
+recursive-include autoforge/vendor *.py *.txt *.md *.sha256
+# The tars skills are `SKILL.md`, and `graft`-style extension globs cannot say
+# "every file under here". Named explicitly so an upstream rename is a test
+# failure rather than a silently thinner tarball.
+recursive-include autoforge/vendor/tars/skill_system/skills *
+recursive-include autoforge/vendor LICENSE
