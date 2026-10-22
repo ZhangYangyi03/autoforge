@@ -1,0 +1,23 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Credentials — never commit these
+accounts.json
+*.info
+.env
+.env.*
+.wbproxy/
+
+# Local run artifacts
+*.log
+_af_probe.json
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store

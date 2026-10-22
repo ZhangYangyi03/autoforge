@@ -79,6 +79,14 @@ actually in effect, and which layer supplied each value:
 auto config
 ```
 
+> **Option 3 covers subscription endpoints.** If you already pay for an AI
+> subscription — WorkBuddy, ChatGPT Plus, Claude Pro — a local bridge can put it
+> behind an OpenAI-shaped URL and `auto` will talk to it with no provider key at
+> all. [`contrib/wbproxy`](contrib/wbproxy/) is one such bridge: a proxy that
+> serves a WorkBuddy subscription (both its domestic and international gateways)
+> on `http://127.0.0.1:8777/v1`. It is a contributed tool, not part of this
+> package's runtime — nothing in `autoforge/` imports it.
+
 ```
   base_url   https://aiping.cn/api/v1  config C:\Users\you\.autoforge\config.json
   model      DeepSeek-V4.1-Flash       config C:\Users\you\.autoforge\config.json
