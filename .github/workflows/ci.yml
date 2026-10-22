@@ -97,8 +97,11 @@ jobs:
 
           whl = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(whl).namelist()
-          for need in ("toolmarket/__init__.py", "toolmarket/store.py",
-                       "toolmarket/web.py"):
+          # `toolmarket/toolmarket/...` -- the subtree root is `toolmarket/`,
+          # the importable package is inside it. Getting this wrong reads as
+          # "the wheel has no market" when the wheel has had one all along.
+          for need in ("toolmarket/toolmarket/__init__.py", "toolmarket/toolmarket/store.py",
+                       "toolmarket/toolmarket/web.py"):
               assert need in names, f"{need} missing from {whl}"
           print("  market in the archive:", whl)
           PY

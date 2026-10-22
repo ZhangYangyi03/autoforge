@@ -16,7 +16,13 @@ import io
 import re
 
 import pytest
-from PIL import Image, ImageDraw
+
+# Pillow is not a dependency of this package -- it only ever drew the sample
+# PNGs these tests feed the clipboard reader. A CI runner has no PIL, and an
+# ImportError here took the whole suite down at collection instead of skipping
+# the four tests that need a picture.
+pytest.importorskip("PIL")
+from PIL import Image, ImageDraw  # noqa: E402
 
 from autoforge.core import lineedit
 from autoforge.core.agent import image_parts

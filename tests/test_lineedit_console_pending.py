@@ -30,10 +30,19 @@ are the real structs, filled as the console fills them.
 from __future__ import annotations
 
 import ctypes
+import sys
 
 import pytest
 
-from autoforge.core.lineedit import _console_records
+# Module-level, before the import that needs it: `ctypes.windll` does not exist
+# on Linux and the file builds INPUT_RECORD structs at import time, so on a
+# runner without a Windows console this module did not *fail* -- it stopped the
+# whole run at collection, which is how one platform-specific test file made CI
+# red for every push to main since it landed.
+if sys.platform != "win32":
+    pytest.skip("Windows console input records", allow_module_level=True)
+
+from autoforge.core.lineedit import _console_records  # noqa: E402
 
 INPUT_RECORD, _ = _console_records()
 
