@@ -21,6 +21,15 @@ def _scrub(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "profile"))
 
 
+#: The rule below is the *Windows* one, and it cannot be exercised on a runner
+#: that has no %USERPROFILE% layout: on Linux the same function correctly
+#: answers $XDG_DATA_HOME-or-~, which is a different fact. Skipped rather than
+#: weakened -- the alternative is a pytest.approx of a path, which pins nothing.
+windows_only = pytest.mark.skipif(os.name != "nt",
+                                  reason="pins the Windows AppData/Local fallback")
+
+
+@windows_only
 def test_no_localappdata_falls_back_to_the_appdata_local_root(tmp_path, monkeypatch):
     """Without LOCALAPPDATA the mount is still under .../AppData/Local.
 
@@ -73,6 +82,7 @@ def test_an_explicit_answer_beats_the_search(tmp_path, monkeypatch):
     assert bus_mod.default_bus_dir() == wanted
 
 
+@windows_only
 def test_a_split_is_reported_and_the_write_still_goes_where_it_was_told(tmp_path, monkeypatch):
     """Diagnosis is a report, never a redirect.
 

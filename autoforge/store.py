@@ -329,11 +329,33 @@ class ToolStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False,
                                      timeout=float(_SQLITE_BUSY_TIMEOUT_S))
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=%d"
                            % int(_SQLITE_BUSY_TIMEOUT_S * 1000))
+        # Order matters, and so does the retry. Switching the journal mode needs
+        # a lock the busy handler does not always wait on: on a runner where two
+        # interpreters open a brand new file at the same instant, the second one
+        # raised "database is locked" from this very statement with a 15s busy
+        # timeout already set. Retried here, briefly, because losing the race to
+        # create the database is not a reason to lose the write.
+        self._set_wal_with_retry()
         self._conn.executescript(_DDL)
         self._ensure_columns()
+
+    def _set_wal_with_retry(self, attempts: int = 8) -> None:
+        """`journal_mode=WAL`, waiting out another process creating the file.
+
+        Only this pragma is retried: it is the one statement in the constructor
+        that takes an exclusive lock. Everything else is a normal write and the
+        busy timeout already covers it.
+        """
+        for i in range(attempts):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or i == attempts - 1:
+                    raise
+                time.sleep(0.05 * (i + 1))
 
     #: Columns added to a table that already shipped. SQLite has no
     #: "ADD COLUMN IF NOT EXISTS", so each is attempted and the duplicate-column

@@ -240,8 +240,17 @@ def _need_media() -> Any:
 # the tools
 # ----------------------------------------------------------------------
 def t_generate_image(args: dict[str, Any]) -> str:
+    # The prompt is checked before the client is: `_need_media()` complains
+    # about an unconfigured endpoint, and on a machine with nothing configured
+    # that complaint arrived instead of "a prompt is required" -- the answer to
+    # the wrong question, for a call whose only fault was the argument.
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("a prompt is required; the schema lists it, and an "
+                         "empty one is refused by the model after the request "
+                         "has been paid for")
     made = _need_media().generate_image(
-        str(args["prompt"]),
+        prompt,
         model=str(args.get("model") or ""),
         size=str(args.get("size") or ""),
         save=args.get("save") or None)

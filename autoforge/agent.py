@@ -1393,7 +1393,14 @@ class ForgeAgent:
             base = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
             qs = _parse.urlencode({"q": need, "k": int(k)})
             req = _url.Request(base.rstrip("/") + "/search?" + qs)
-            with _url.urlopen(req, timeout=8) as resp:
+            # 8 seconds was the right budget for a pure lexical scan and the wrong
+            # one for a market that reranks with a chat model: measured 2026-10-22
+            # at 6.3-8.3s per query on this host, so the better the shelf got at
+            # ranking, the more reliably this lookup timed out and recorded
+            # "no answer". Waiting longer costs one pre-forge step; timing out
+            # costs the whole duplicate check.
+            budget = float(_os.environ.get("TOOLMARKET_SEARCH_TIMEOUT") or 30.0)
+            with _url.urlopen(req, timeout=budget) as resp:
                 data = _json.loads(resp.read().decode("utf-8", "replace"))
         except Exception as exc:                          # noqa: BLE001
             self._record("market_semantic_lookup", {
@@ -1410,9 +1417,15 @@ class ForgeAgent:
         # The endpoint says so itself when its best hit is below its own
         # threshold. Taking it at its word is the difference between a ranked
         # list and a claim.
+        mode = data.get("mode") if isinstance(data, dict) else None
         if conf.get("confident") is False:
+            # `mode` is recorded because "no candidates" and "bm25-only, because
+            # the dense leg is dead" are the same empty list and different
+            # diseases. On 2026-10-22 the second one hid behind the first for
+            # weeks.
             self._record("market_semantic_lookup", {
-                "need": need, "ok": True, "confident": False, "hits": []})
+                "need": need, "ok": True, "confident": False, "mode": mode,
+                "hits": []})
             return []
         scored: list[dict[str, Any]] = []
         for item in results:
@@ -5297,8 +5310,13 @@ class ForgeAgent:
             # Per call, via `replace`: the sandbox is shared with the forge and
             # the verifier, so a timeout written onto it would outlive the call
             # that asked for it and rewrite someone else's budget.
+            # A snippet yields to ANY line from the operator, not only to
+            # `/stop`. This is the one long step where giving way costs
+            # nothing: the code is re-run in seconds, whereas a forge that
+            # gives way has thrown away minutes of work -- which is why the
+            # forge asks the narrower question and this does not.
             box = replace(self.sandbox, timeout=cap,
-                          abort_check=self._operator_wants_the_floor)   # only a /stop kills a run
+                          abort_check=self._operator_should_yield)
             try:
                 res = box.run(wrapped, "main")
             except Exception as exc:                              # noqa: BLE001
@@ -6297,10 +6315,14 @@ class ForgeAgent:
             task = runs_mod.resume_prompt(journal.mark)
             history = list(journal.mark.messages)
         done = False
+        # NO `return` inside this try. A `return` runs the finally and then
+        # leaves -- so everything after it, including the `finish` event and the
+        # `run` row, was dead code: the ledger had no run rows at all and the
+        # trace had no finish event, which is why "did this run stop because the
+        # operator said /stop?" could not be answered from either record.
         try:
             result = agent.run(task, history)
             done = True
-            return result
         finally:
             # A record left standing is the whole mechanism, so it is removed
             # only when the loop genuinely reached a result. A run that raised,
