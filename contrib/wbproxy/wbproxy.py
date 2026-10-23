@@ -125,6 +125,19 @@ REFRESH_MARGIN_S = 120.0
 #: Pinning the region makes "which plan am I on" a property of the deployment.
 WBPROXY_REGION = os.environ.get("WBPROXY_REGION", "").strip().lower()
 
+#: How accounts are chosen. Mirrors dsh-xdpool's `distribution` setting:
+#:   sticky      -- one account per conversation (default here, keeps the
+#:                  upstream prompt prefix cacheable)
+#:   round-robin -- consecutive requests rotate, spend spreads evenly
+#: Overridable per process with WBPROXY_DISTRIBUTION.
+WBPROXY_DISTRIBUTION = os.environ.get(
+    "WBPROXY_DISTRIBUTION", "sticky").strip().lower()
+
+#: How many conversation bindings to remember. dsh-xdpool caps its sticky map
+#: for the same reason: it grows once per conversation, so an unbounded map is
+#: a slow leak in a long-lived process.
+STICKY_AFFINITY_LIMIT = 256
+
 #: The last request's shape, kept so a rejection can be read against what was
 #: actually sent. Not the body itself -- it may carry a conversation.
 _LAST_BODY: dict[str, Any] = {}
@@ -207,7 +220,13 @@ class Account:
         #: Set when the account has been proven unable to chat (as opposed to
         #: merely unable to authenticate). Excluded from rotation, kept visible.
         self.chat_unsupported: str = ""
+        #: Account-wide cooldown, unix seconds. A limit that is not about one
+        #: model lands here; a per-model limit lands in `model_cooldowns`.
         self.cooldown_until: float = 0.0
+        #: {model_id: unix_seconds}. The gateway meters per account AND per
+        #: model, so a 429 on one id must not take the others down with it.
+        #: Same shape and semantics as dsh-xdpool's `account.modelCooldowns`.
+        self.model_cooldowns: dict[str, float] = {}
         self.last_used: float = 0.0
 
     # -- region / endpoints ------------------------------------------------
@@ -403,13 +422,41 @@ class Bridge:
         #: the catalogs on demand; a miss means "no catalog has told us yet",
         #: which must not narrow the pool.
         self._index: dict[str, set[str]] = {}
+        #: conversation key -> account id. Sticky, so one conversation keeps
+        #: one upstream session (prefix cache) instead of spraying five.
+        #: Bounded by STICKY_AFFINITY_LIMIT; oldest evicted first.
+        self.affinity: dict[str, str] = {}
+        #: How accounts are chosen: `sticky` or `round-robin`.
+        self.distribution: str = (WBPROXY_DISTRIBUTION
+                                  if WBPROXY_DISTRIBUTION in ("sticky", "round-robin")
+                                  else "sticky")
 
     # -- rotation ----------------------------------------------------------
-    def eligible(self, region: str | None = None) -> list[Account]:
+    # Mirrors dsh-xdpool's WorkBuddyPool: `available()` filters, `acquire()`
+    # picks, and the distribution decides which of the eligible accounts wins.
+    # Only the strategies this proxy needs are ported; the shapes are kept so a
+    # future change can be diffed against the original.
+    def available(self, model: str | None = None,
+                  region: str | None = None) -> list[Account]:
+        """Accounts that can take a request right now.
+
+        A per-model cooldown only keeps THAT model out -- a 429 on
+        `hy4-preview` leaves `hy3` on the same account usable. `region` narrows
+        to one gateway, because a provider only ever sees its own.
+        """
         now = time.time()
-        return [a for a in self.accounts
-                if not a.chat_unsupported and a.cooldown_until <= now
-                and (region is None or a.region == region)]
+        out = []
+        for a in self.accounts:
+            if a.chat_unsupported:
+                continue
+            if a.cooldown_until > now:
+                continue
+            if model is not None and (a.model_cooldowns.get(model) or 0) > now:
+                continue
+            if region is not None and a.region != region:
+                continue
+            out.append(a)
+        return out
 
     def regions_for(self, model: str) -> set[str] | None:
         """Which regions publish `model`. None means "not known", not "none".
@@ -423,22 +470,87 @@ class Bridge:
             return None
         return self._index.get(model) or None
 
-    def pick(self, model: str | None = None) -> Account | None:
-        """Least-recently-used account among those that can serve `model`."""
+    def _round_robin(self, pool: list[Account]) -> Account | None:
+        """The legacy cursor walk, kept for the distribution that asks for it."""
+        if not pool:
+            return None
+        index = self._cursor % len(pool)
+        acct = pool[index]
+        self._cursor = (index + 1) % len(pool)
+        return acct
+
+    def _bind_affinity(self, key: str, account_id: str) -> None:
+        """Remember a binding, keeping LRU order and bounded.
+
+        Bounded because it grows once per conversation: a long-lived process
+        must not accumulate them without limit. The oldest goes first, which is
+        the same order dsh-xdpool's STICKY_AFFINITY_LIMIT eviction uses.
+        """
+        self.affinity.pop(key, None)
+        self.affinity[key] = account_id
+        while len(self.affinity) > STICKY_AFFINITY_LIMIT:
+            oldest = next(iter(self.affinity))
+            if oldest is None:
+                break
+            del self.affinity[oldest]
+
+    def _affinity_account(self, pool: list[Account],
+                          key: str | None) -> Account | None:
+        """The account this conversation is bound to, if it can still serve.
+
+        Returns None both when there is no binding and when the binding is no
+        longer eligible -- the caller then rebinds, which is what makes a
+        rate-limited conversation hop to a fresh account instead of failing.
+        """
+        if not key:
+            return None
+        bound_id = self.affinity.get(key)
+        if bound_id is None:
+            return None
+        bound = next((a for a in pool if a.id == bound_id), None)
+        if bound is None:
+            self.affinity.pop(key, None)
+            return None
+        return bound
+
+    def acquire(self, model: str | None = None,
+                conversation: str | None = None) -> Account | None:
+        """Pick the account to serve one request.
+
+        Follows dsh-xdpool's `acquire` shape: filter, then choose by
+        distribution. `distribution` here is `sticky` by default -- one account
+        per conversation, so the upstream prompt prefix stays cacheable -- and
+        falls back to round-robin when there is no conversation key.
+
+        A model the catalogs place in one region while that region's accounts
+        are all cooling is still worth trying elsewhere: the id may be served on
+        both and only published on one. So a narrowed-to-empty pool falls back
+        to the unfiltered one rather than giving up.
+        """
         regions = self.regions_for(model) if model else None
-        pool = self.eligible()
+        pool = self.available(model=model)
         if regions:
             narrowed = [a for a in pool if a.region in regions]
-            # A model the catalogs place in one region while that region's
-            # accounts are all cooling is still worth trying elsewhere: the id
-            # may be served on both and only published on one.
             pool = narrowed or pool
         if not pool:
             return None
-        pool.sort(key=lambda a: a.last_used)
-        acct = pool[0]
-        acct.last_used = time.time()
+
+        if self.distribution == "sticky":
+            bound = self._affinity_account(pool, conversation)
+            if bound is not None:
+                return bound
+
+        acct = self._round_robin(pool)
+        if acct is None:
+            return None
+        if self.distribution == "sticky" and conversation:
+            self._bind_affinity(conversation, acct.id)
         return acct
+
+    def pick(self, model: str | None = None,
+             conversation: str | None = None) -> Account | None:
+        """Alias for acquire(): the name the chat path uses."""
+        return self.acquire(model, conversation)
 
     # -- model catalog -----------------------------------------------------
     def models(self, refresh: bool = False, region: str | None = None) -> list[dict[str, Any]]:
@@ -573,21 +685,43 @@ class Bridge:
         The account set is narrowed by model first: a request for an id only the
         global catalog lists should not spend a turn failing against a domestic
         account, and the reverse.
+
+        A rate limit is recorded per (account, model) so the next request for
+        that id skips the account that just refused it, rather than hoping LRU
+        happens to move it down the queue.
         """
         model = str(payload.get("model") or "")
         regions = self.regions_for(model)
-        candidate = self.eligible()
+        model = str(payload.get("model") or "")
+        regions = self.regions_for(model)
+        candidate = self.available(model=model)
         if regions:
             narrowed = [a for a in candidate if a.region in regions]
             candidate = narrowed or candidate
-        attempts = max(1, len(candidate)) + 1
+        # dsh-xdpool's `maxTries = accounts + 1`: one pass over every account,
+        # plus one, so a pool that rescanned mid-flight still gets a turn.
+        attempts = len(self.accounts) + 1
         last: tuple[int, dict[str, Any]] = (503, {"error": {
             "message": "no usable WorkBuddy account", "type": "wbproxy_no_account"}})
         for attempt in range(attempts):
-            code, body = self._chat_once(payload)
+            code, body, acct = self._chat_once(payload)
             if code == 200:
                 return code, body
             last = (code, body)
+            # Only a rate limit is about the account rather than the request.
+            # Everything else -- bad model id, refused plan, dead credential --
+            # is the same on every account, so rotating would only burn
+            # attempts. dsh-xdpool penalises the same way: it records the
+            # cooldown and lets the loop's next `available()` skip that pair.
+            if acct is not None and _is_rate_limit(code, body):
+                wait = _rate_limit_wait(body) or DEFAULT_COOLDOWN_S
+                if model:
+                    acct.model_cooldowns[model] = time.time() + wait
+                    log(f"{acct.label} rate-limited on {model}; "
+                        f"cooling that pair for {wait:.0f}s")
+                else:
+                    acct.cooldown_until = time.time() + wait
+                    log(f"{acct.label} rate-limited; cooling for {wait:.0f}s")
             if attempt < attempts - 1:
                 delay = 4.0 * (attempt + 1)
                 log(f"attempt {attempt + 1}/{attempts} -> {code}; "
@@ -595,12 +729,17 @@ class Bridge:
                 time.sleep(delay)
         return last
 
-    def _chat_once(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def _chat_once(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any], Any]:
+        """One attempt. Returns (code, body, account-or-None) so the caller can
+        record a rate limit against the account that actually served."""
         model = str(payload.get("model") or "auto")
-        acct = self.pick(model)
+        conversation = _conversation_key(
+            [m for m in payload.get("messages") or []
+             if isinstance(m, dict)])
+        acct = self.acquire(model, conversation)
         if acct is None:
             return 503, {"error": {"message": "no usable WorkBuddy account",
-                                   "type": "wbproxy_no_account"}}
+                                   "type": "wbproxy_no_account"}}, None
 
         messages = []
         for m in payload.get("messages") or []:
@@ -677,11 +816,11 @@ class Bridge:
             out_code = _translated_status(exc.code, detail)
             return out_code, {"error": {
                 "message": f"workbuddy http {exc.code}: {detail}",
-                "type": "wbproxy_upstream"}, "_status": out_code}
+                "type": "wbproxy_upstream"}, "_status": out_code}, acct
         except Exception as exc:                       # noqa: BLE001
             return 502, {"error": {
                 "message": f"workbuddy unreachable: {exc}",
-                "type": "wbproxy_transport"}, "_status": 502}
+                "type": "wbproxy_transport"}, "_status": 502}, acct
 
         try:
             content, tool_calls, usage, finish = _consume_sse(resp)
@@ -694,6 +833,10 @@ class Bridge:
         message: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # Name the account on success too, not only on failure. Without this
+        # line a clean run is invisible in the log, and "is sticky actually
+        # holding?" becomes unanswerable without it.
+        log(f"served by {acct.label} ({acct.region}) model={model}")
         return 200, {
             "id": f"chatcmpl-wb-{int(time.time() * 1000)}",
             "object": "chat.completion",
@@ -703,7 +846,57 @@ class Bridge:
                          "finish_reason": finish or ("tool_calls" if tool_calls else "stop")}],
             "usage": usage or {},
             "_status": 200,
-        }
+        }, acct
+
+
+#: How long to cool an account when the gateway reports a limit without naming
+#: a reset instant. dsh-xdpool clamps a provider's own figure to a floor rather
+#: than trusting it; a missing figure gets a working default instead of an
+#: unbounded one.
+DEFAULT_COOLDOWN_S = 60.0
+
+
+def _is_rate_limit(code: int, body: dict[str, Any]) -> bool:
+    """Is this failure about the account being throttled?
+
+    Both spellings: HTTP 429, and the gateway's own business code 6004 which
+    arrives under HTTP 400 and would otherwise read as a request defect.
+    """
+    if code == 429:
+        return True
+    detail = ""
+    if isinstance(body, dict):
+        detail = str((body.get("error") or {}).get("message", ""))
+    return "6004" in detail or "频率限制" in detail or "frequency limit" in detail.lower()
+
+
+def _rate_limit_wait(body: dict[str, Any]) -> float | None:
+    """The reset instant the gateway named, as seconds from now.
+
+    The gateway words it two ways -- an epoch-milliseconds field and a
+    localised sentence. dsh-xdpool recognises both for the same reason: a
+    cooldown guessed when the server stated one is a cooldown that is wrong.
+    """
+    import re
+    detail = ""
+    if isinstance(body, dict):
+        detail = str((body.get("error") or {}).get("message", ""))
+    if not detail:
+        return None
+
+    m = re.search(r'"(?:resetAt|reset_at|resetTime|reset_time)"\s*:\s*(\d{13})', detail)
+    if m:
+        return max(1.0, (int(m.group(1)) / 1000.0) - time.time())
+
+    m = re.search(r"reset at (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
+    if m:
+        from datetime import datetime
+        try:
+            when = datetime.strptime(m.group(1).replace(" ", "T"), "%Y-%m-%dT%H:%M:%S")
+            return max(1.0, when.timestamp() - time.time())
+        except ValueError:
+            return None
+    return None
 
 
 def _conversation_key(messages: list[dict[str, Any]]) -> str | None:
@@ -872,6 +1065,58 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _sse(self, code: int, body: dict[str, Any], model: str) -> None:
+        """Answer `stream: true` with an OpenAI-shaped SSE stream.
+
+        `Bridge.chat` folds the upstream stream into one completion, so the
+        pieces this replays are synthetic: one content delta, then a finish
+        chunk. Clients that require `finish_reason` before they settle (pi-ai,
+        and therefore Toonflow) otherwise report "Stream ended without
+        finish_reason" and discard the text they already received.
+        """
+        body = {k: v for k, v in body.items() if not k.startswith("_")}
+        self.send_response(code)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(chunk: dict[str, Any]) -> None:
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        if code != 200 or "error" in body:
+            # The upstream failure keeps its status; the stream carries the
+            # reason so a streaming client can surface it instead of hanging.
+            emit({"error": body.get("error") or {"message": "upstream failed"}})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
+        chunk_id = body.get("id") or f"chatcmpl-wb-{int(time.time() * 1000)}"
+        created = body.get("created") or int(time.time())
+        choice = (body.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls")
+        finish = choice.get("finish_reason") or "stop"
+
+        base = {"id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": body.get("model") or model}
+
+        if content:
+            emit({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": content},
+                                       "finish_reason": None}]})
+        if tool_calls:
+            emit({**base, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls},
+                                       "finish_reason": None}]})
+        # ACT: usage rides the final chunk because OpenAI only emits it there
+        # when `stream_options.include_usage` is set, and pi-ai reads it either way.
+        emit({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+              "usage": body.get("usage") or {}})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def do_GET(self) -> None:
         path = self.path.rstrip("/")
         if path in ("/v1/models", "/models"):
@@ -919,6 +1164,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": f"bad body: {exc}"}})
             return
         code, body = self.bridge.chat(payload)
+        if payload.get("stream") is True:
+            self._sse(code, body, str(payload.get("model") or ""))
+            return
         self._json(code, body)
 
 
@@ -1012,7 +1260,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         mine = by_region.get(acct.region) or rows
         probe = next((r["id"] for r in mine if r.get("credits") == 0),
                      mine[0]["id"] if mine else "hy3")
-        code, body = bridge._chat_once(
+        code, body, _acct = bridge._chat_once(
             {"model": probe, "messages": [{"role": "user", "content": "ok"}],
              "max_tokens": 16})
         if code == 200:
