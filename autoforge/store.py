@@ -50,6 +50,13 @@ _COLUMNS = dict(
     #: arguments, and re-running a real gate on invented arguments would seal a
     #: verdict nobody earned.
     sample_call="TEXT NOT NULL DEFAULT '{}'",
+    #: The substring a correct answer to `sample_call` must contain. Stored
+    #: beside the call because the two are ONE exam: a persisted call with no
+    #: expectation can only be re-run, never re-judged, and a re-audit that can
+    #: only ask "did it run" is exactly the vacuity `check_execution` exists to
+    #: end. Absent on every row written before 2026-10-24, which is why those
+    #: read as un-probed rather than passed.
+    sample_expect="TEXT NOT NULL DEFAULT ''",
     effect_signature="TEXT NOT NULL DEFAULT ''",
     state="TEXT NOT NULL DEFAULT 'draft'",
     tags="TEXT NOT NULL DEFAULT '[]'",
@@ -195,6 +202,12 @@ class ToolRecord:
     #: every row written before 2026-10-02 has none, and a missing field must
     #: read as "un-probed", never as "no sample needed".
     sample_call: dict[str, Any]
+    #: What a correct answer to `sample_call` must contain. Kept as its own
+    #: field, not folded into `verification`: this is the *declaration*, and
+    #: `verification` is what the battery concluded from it. Losing the
+    #: declaration means a later re-audit cannot re-judge, only re-run.
+    #: Defaulted rather than required, for the rows written before it existed.
+    sample_expect: str
     state: ToolState
     tags: list[str]
     cost_hint: str
@@ -218,6 +231,7 @@ class ToolRecord:
             probes=spec.probes,
             effect_signature=spec.effect_signature,
             sample_call=dict(spec.sample_call or {}),
+            sample_expect=spec.sample_expect or "",
             state=spec.state,
             tags=spec.tags,
             cost_hint=spec.cost_hint,
@@ -255,6 +269,7 @@ class ToolRecord:
             probes=self.probes,
             effect_signature=self.effect_signature,
             sample_call=dict(self.sample_call or {}),
+            sample_expect=self.sample_expect or "",
             state=self.state,
             stats=st,
             verification=self.verification,
@@ -370,6 +385,11 @@ class ToolStore:
         # CREATE TABLE IF NOT EXISTS does nothing to a table that is already
         # there, and this table is 131 rows deep on this machine.
         ("tools", "sample_call", "TEXT NOT NULL DEFAULT '{}'"),
+        # The expectation that makes `sample_call` an exam rather than a demo.
+        # Same reason as the row above: an existing table is not touched by
+        # `CREATE TABLE IF NOT EXISTS`, and the rows already in it have a call
+        # with nothing to judge it against.
+        ("tools", "sample_expect", "TEXT NOT NULL DEFAULT ''"),
     )
 
     def _ensure_columns(self) -> None:
@@ -537,9 +557,10 @@ class ToolStore:
                 """INSERT OR REPLACE INTO tools
                 (name, version, description, parameters, code, entry,
                  source, generator, probes, effect_signature, sample_call,
+                 sample_expect,
                  state, tags, cost_hint, created_at, verification, stats,
                  old_versions, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     record.name, record.version, record.description,
                     _j(record.parameters), record.code, record.entry,
@@ -548,6 +569,7 @@ class ToolStore:
                         for p in record.probes
                     ]),
                     record.effect_signature, _j(record.sample_call or {}),
+                    record.sample_expect or "",
                     record.state.value,
                     _j(record.tags), record.cost_hint,
                     record.created_at, _j(record.verification),
@@ -588,6 +610,11 @@ class ToolStore:
                     probes=_probes_from_list(_unjson(r["probes"])),
                     effect_signature=r["effect_signature"],
                     sample_call=_unjson(r["sample_call"]) if "sample_call" in r.keys() else {},
+                    # `r.keys()` rather than a direct read: a store opened by
+                    # older code (or a row read before the migration ran) has
+                    # no such column, and a missing expectation must read as
+                    # "un-probed" rather than raise on load and cost the tool.
+                    sample_expect=(r["sample_expect"] or "") if "sample_expect" in r.keys() else "",
                     state=ToolState(r["state"]),
                     tags=_unjson(r["tags"]),
                     cost_hint=r["cost_hint"],
