@@ -535,6 +535,44 @@ class LLMToolGenerator:
         # Shape normalisation (bare type names, properties-as-string) is owned by
         # GeneratedTool.__post_init__ -- one choke point, every caller.
 
+        # The positive case, which the prompt calls "THE EXAM".
+        #
+        # Both fields were DROPPED here until 2026-10-24: the prompt demanded
+        # them, `GeneratedTool` declared them, `_to_spec` forwarded them and
+        # `check_execution` read them -- and this constructor never passed them
+        # through. Every tool on the ledger therefore verified with
+        # "NO VALID SAMPLE CALL was declared, so correctness is unprobed", so
+        # the whole battery could only ask "does it run", which a tool that
+        # returns one constant answers perfectly.
+        #
+        # `sample_call` is coerced rather than trusted: models emit it as an
+        # object, but also as a JSON string, and occasionally as a single
+        # scalar when the tool takes one argument. A wrong shape must not cost
+        # the round -- it degrades to "unprobed", which the verifier already
+        # reports honestly.
+        raw_sample = data.get("sample_call")
+        sample_call: dict[str, Any] = {}
+        if isinstance(raw_sample, dict):
+            sample_call = {str(k): v for k, v in raw_sample.items()}
+        else:
+            # A string is ambiguous: it is either the object serialised as JSON
+            # ("{\"text\": \"banana\"}") or a bare scalar for a one-argument
+            # tool ("banana"). Try the object reading first and fall through to
+            # the scalar one, rather than treating "not a dict" as "nothing" --
+            # which is what silently dropped the exam for the scalar shape.
+            parsed = None
+            if isinstance(raw_sample, str) and raw_sample.strip():
+                parsed = extract_json_any(raw_sample)
+            if isinstance(parsed, dict):
+                sample_call = {str(k): v for k, v in parsed.items()}
+            elif raw_sample is not None and not isinstance(raw_sample, (list, bool)):
+                scalar = parsed if parsed is not None else raw_sample
+                # Name it after the tool's only required parameter, so a bare
+                # value still becomes a callable example instead of a drop.
+                required = params.get("required") if isinstance(params, dict) else None
+                if isinstance(required, list) and len(required) == 1:
+                    sample_call = {str(required[0]): scalar}
+
         return GeneratedTool(
             name=name,
             description=_s("description"),
@@ -542,6 +580,8 @@ class LLMToolGenerator:
             parameters=params,
             entry=_s("entry") or name,
             probes=probes,
+            sample_call=sample_call,
+            sample_expect=_s("sample_expect"),
             effect_signature=_s("effect_signature", "pure") or "pure",
             tags=[str(t) for t in tags] if isinstance(tags, list) else [],
             rationale=_s("rationale"),

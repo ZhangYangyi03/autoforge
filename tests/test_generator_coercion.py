@@ -214,3 +214,74 @@ def test_union_type_does_not_escape_into_a_tool_schema():
             {"type": "object", "properties": {"p": {"type": declared}}}
         )["properties"]["p"]["type"]
         assert got == expected, (declared, got)
+
+
+# ── the positive case ("THE EXAM") must survive the parse ────────────────────
+#
+# `sample_call` and `sample_expect` are what `check_execution` judges
+# correctness by. The prompt demands them, `GeneratedTool` declares them,
+# `_to_spec` forwards them and the verifier reads them -- but the constructor
+# in `LLMToolGenerator._from_json` never passed them through, so every forged
+# tool was verified with "NO VALID SAMPLE CALL was declared, so correctness is
+# unprobed". Measured on this host: four tools in a row, all `active`, none of
+# them ever checked against a real answer.
+#
+# These tests pin the wiring, not the prompt: a model that follows the prompt
+# perfectly must not have its exam dropped on the floor.
+
+def test_sample_call_object_reaches_the_generated_tool():
+    tool = gen({**BASE,
+                "probes": [{"query": "q", "expect": "call"}],
+                "sample_call": {"x": "hello"},
+                "sample_expect": "hello"}).generate("x")
+    assert tool.sample_call == {"x": "hello"}
+    assert tool.sample_expect == "hello"
+
+
+def test_sample_call_serialised_as_json_string_is_parsed():
+    """Models sometimes stringify the object; that is not a reason to drop it."""
+    tool = gen({**BASE,
+                "probes": [{"query": "q", "expect": "call"}],
+                "sample_call": '{"x": "hello"}',
+                "sample_expect": "hello"}).generate("x")
+    assert tool.sample_call == {"x": "hello"}
+
+
+def test_sample_call_as_bare_scalar_uses_the_only_required_parameter():
+    """A one-argument tool may answer with just the value.
+
+    `BASE` declares `x` without `required`, so this case also proves the
+    fallback does not invent a parameter name it was not given.
+    """
+    with_required = {**BASE,
+                     "parameters": {"type": "object",
+                                    "properties": {"x": {"type": "string"}},
+                                    "required": ["x"]},
+                     "probes": [{"query": "q", "expect": "call"}],
+                     "sample_call": "hello",
+                     "sample_expect": "hello"}
+    tool = gen(with_required).generate("x")
+    assert tool.sample_call == {"x": "hello"}
+
+    without_required = {**BASE,
+                        "probes": [{"query": "q", "expect": "call"}],
+                        "sample_call": "hello",
+                        "sample_expect": "hello"}
+    # No declared required list means no name to hang the value on: staying
+    # empty is honest (the verifier reports "unprobed"), inventing "x" is not.
+    assert gen(without_required).generate("x").sample_call == {}
+
+
+def test_absent_sample_call_stays_unprobed_rather_than_invented():
+    tool = gen({**BASE, "probes": [{"query": "q", "expect": "call"}]}).generate("x")
+    assert tool.sample_call == {}
+    assert tool.sample_expect == ""
+
+
+def test_sample_expect_survives_without_sample_call():
+    """The two are independent: an expectation with no call is still recorded."""
+    tool = gen({**BASE,
+                "probes": [{"query": "q", "expect": "call"}],
+                "sample_expect": "42"}).generate("x")
+    assert tool.sample_call == {}
+    assert tool.sample_expect == "42"
