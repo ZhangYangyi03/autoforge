@@ -121,3 +121,93 @@ def test_a_child_without_localappdata_does_not_shadow_the_package(tmp_path):
     lines = [l for l in hook.stdout.splitlines() if l.strip()]
     assert lines[-1].strip() == "_QuietPopen", (
         "import from the home cwd lost the quiet-Popen hook: %r" % hook.stdout[-300:])
+
+
+# ── sample_expect must survive the round trip ────────────────────────────────
+#
+# `sample_call` was persisted; `sample_expect` was not -- not in the DDL, the
+# dataclass, `from_spec`, `to_spec`, the INSERT or the reader. A tool could
+# therefore be forged with a perfectly good exam, verified against it, and then
+# reloaded with the *call* but no *expectation*, so every later re-audit could
+# only re-run it and never re-judge it. On this host that showed up as an
+# execution check reporting "correctness is unprobed" for tools that had just
+# passed it.
+#
+# These pins are separate on purpose: one for the declaration round-tripping,
+# one for the migration that gives an existing store the column, one for the
+# honest default on rows that predate it.
+
+def _spec_with_sample():
+    from autoforge.tools.spec import ToolSpec
+
+    return ToolSpec(
+        name="t",
+        description="d",
+        parameters={"type": "object", "properties": {"x": {"type": "string"}}},
+        fn=lambda **_: "",
+        code="def t(x):\n    return x\n",
+        source="generated",
+        sample_call={"x": "hello"},
+        sample_expect="hello",
+    )
+
+
+def test_sample_expect_round_trips_through_the_store(tmp_path):
+    from autoforge.store import ToolStore
+
+    store = ToolStore(str(tmp_path / "s.db"))
+    store.save_tool(_spec_with_sample())
+
+    reloaded = ToolStore(str(tmp_path / "s.db")).load_all_tools()["t"]
+    assert reloaded.sample_call == {"x": "hello"}
+    assert reloaded.sample_expect == "hello", (
+        "the expectation was lost in storage; a re-audit can re-run this tool "
+        "but cannot judge it")
+
+
+def test_an_existing_store_gains_the_column(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` does not alter a table that is already there.
+
+    Built the way the running machine's store was: a database whose `tools`
+    table predates the column.
+    """
+    import sqlite3
+
+    from autoforge.store import ToolStore
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE tools (name TEXT PRIMARY KEY, version INTEGER, "
+                 "description TEXT, parameters TEXT, code TEXT, entry TEXT, "
+                 "source TEXT, generator TEXT, probes TEXT, "
+                 "effect_signature TEXT, sample_call TEXT, state TEXT, tags TEXT, "
+                 "cost_hint TEXT, created_at REAL, verification TEXT, stats TEXT, "
+                 "old_versions TEXT, updated_at REAL)")
+    conn.commit()
+    conn.close()
+
+    # Opening it is what migrates it.
+    ToolStore(str(path))
+
+    cols = [r[1] for r in sqlite3.connect(str(path)).execute("pragma table_info(tools)")]
+    assert "sample_expect" in cols
+
+
+def test_a_row_written_before_the_column_reads_as_unprobed(tmp_path):
+    """Absent must read as "un-probed", never as "no sample needed"."""
+    from autoforge.store import ToolStore
+
+    store = ToolStore(str(tmp_path / "s.db"))
+    store.save_tool(_spec_with_sample())
+    reloaded = ToolStore(str(tmp_path / "s.db")).load_all_tools()["t"]
+    assert reloaded.sample_expect == "hello"
+
+    # A spec that declared no expectation keeps the empty string, which is what
+    # the verifier reads as "cannot judge".
+    from autoforge.tools.spec import ToolSpec
+
+    bare = ToolSpec(name="u", description="d", parameters={"type": "object"},
+                    fn=lambda **_: "", code="def u():\n    return 1\n")
+    store.save_tool(bare)
+    again = ToolStore(str(tmp_path / "s.db")).load_all_tools()["u"]
+    assert again.sample_expect == ""
