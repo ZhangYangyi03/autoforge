@@ -2,18 +2,18 @@
 
 Five orthogonal checks, in order of increasing cost:
 
-  A. execution     — does the code run on a standard input without crashing?
-  B. robustness    — does it survive edge-case inputs? (deterministic fuzzer)
-  C. adversarial   — can it survive an LLM attacker? (adversarial gate)
-  D. trigger       — when the need arises, will the agent call this tool?
-  E. negative      — when the need is absent, will it stay quiet?
-  F. claim         — is the number it returns a fact about the world, or a fact
+  A. execution     鈥?does the code run on a standard input without crashing?
+  B. robustness    鈥?does it survive edge-case inputs? (deterministic fuzzer)
+  C. adversarial   鈥?can it survive an LLM attacker? (adversarial gate)
+  D. trigger       鈥?when the need arises, will the agent call this tool?
+  E. negative      鈥?when the need is absent, will it stay quiet?
+  F. claim         鈥?is the number it returns a fact about the world, or a fact
                      about the data it was handed? (reproducibility, order
                      invariance, and a known-answer control on its own labels)
 
 Question D+E is the "Constraint Tax" and "over-triggering" problems. Question B
 guards against the exact bug found in the live demo (ISBN prefix contamination).
-Question C is unique to autoforge — no framework runs an attacker against its
+Question C is unique to autoforge 鈥?no framework runs an attacker against its
 own tools before trusting them.
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _plane():
 
     Guarded because `forge` is used by tools that do not need it, and a missing
     recorder is not a reason to fail a verification battery. The plane, when it
-    exists, is inert until a ledger is bound to it — see autonomy/controls.py.
+    exists, is inert until a ledger is bound to it 鈥?see autonomy/controls.py.
     """
     try:
         from ..autonomy.controls import plane
@@ -53,10 +53,62 @@ def _plane():
 
 @dataclass
 class CheckResult:
+    """One check's verdict, in THREE states rather than two.
+
+    `passed` alone cannot express "this check had nothing to judge", and
+    collapsing that case into `passed=True` is how a whole battery goes
+    vacuous: six green ticks, none of which ever compared an answer to a
+    question. `claimgate` already learned this -- it carries `applicable` and
+    says "not applicable (no rail declared)" instead of silently passing --
+    and this is the same idea applied to every check.
+
+    The distinction the three states make:
+
+      passed=True,  unprobed=False   measured, and it held
+      passed=False, unprobed=False   measured, and it failed
+      passed=?,     unprobed=True    nothing was measured; this is not a pass
+
+    `unprobed=True` still sets `passed=False` on purpose. A report is a claim
+    that the tool was tested; a check that could not test is not evidence for
+    that claim, so the tool must not be sealed on the strength of it. The
+    reason is carried in `detail` and `evidence["unprobed"]`, so a caller can
+    tell "we looked and it was wrong" from "we never looked".
+    """
+
     name: str
     passed: bool
     detail: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
+    #: True when the check had nothing to judge. Never true together with
+    #: `passed=True`: see the class docstring for why that pairing is refused.
+    unprobed: bool = False
+    #: True when the check ran, found a defect, and the defect is in the TEST
+    #: rather than the tool -- a negative probe about the same subject as the
+    #: positive one, say. A waiver is not a pass: it is excluded from the
+    #: aggregate verdict, and the reason travels in `detail` so the gap stays
+    #: visible instead of being absorbed.
+    waived: bool = False
+
+    @property
+    def judged(self) -> bool:
+        """Whether this check actually measured anything."""
+        return not self.unprobed and not self.waived
+
+    def __post_init__(self) -> None:
+        # The one invariant worth enforcing in code rather than in a comment:
+        # a check that did not run must not report success. Making this raise
+        # means a future check cannot quietly reintroduce the vacuity by
+        # forgetting to pass `unprobed`.
+        if self.waived and self.passed:
+            raise ValueError(
+                f"check {self.name!r} cannot be both waived and passed: a"
+                f" waived check found a defect in its own setup, so it is"
+                f" neither evidence for nor against the tool")
+        if self.unprobed and self.passed:
+            raise ValueError(
+                f"check {self.name!r} cannot be both unprobed and passed: "
+                f"nothing was measured, so there is nothing to pass on"
+            )
 
 
 @dataclass
@@ -74,16 +126,49 @@ class VerificationReport:
     def failed(self) -> list[CheckResult]:
         return [c for c in self.checks if not c.passed]
 
+    @property
+    def waived(self) -> list[CheckResult]:
+        """Checks whose own setup was defective."""
+        return [c for c in self.checks if c.waived]
+
+    @property
+    def unprobed(self) -> list[CheckResult]:
+        """Checks that had nothing to judge.
+
+        Kept separate from `failed` because the two ask for different work: a
+        failed check wants the tool repaired, an unprobed one wants the *test*
+        repaired -- a sample call, a rail, a probe. Reporting them together is
+        how "we never looked" gets read as "we looked and it was wrong".
+        """
+        return [c for c in self.checks if c.unprobed]
+
     def summary(self) -> str:
         ok = sum(1 for c in self.checks if c.passed)
-        return f"{self.tool}: {ok}/{len(self.checks)} checks passed"
+        line = f"{self.tool}: {ok}/{len(self.checks)} checks passed"
+        blank = self.unprobed
+        if blank:
+            # Named rather than folded into the ratio. "5/6 passed" invites the
+            # reader to assume the sixth failed; it did not run at all.
+            line += (f"; {len(blank)} unprobed "
+                     f"({', '.join(c.name for c in blank)})")
+        waived = self.waived
+        if waived:
+            # Named apart from `unprobed`, because the work they ask for differs:
+            # an unprobed check wants the tool's sample call or its rail, a
+            # waived one wants a better probe. Same empty slot in the ratio,
+            # different next step.
+            line += (f"; {len(waived)} waived "
+                     f"({', '.join(c.name for c in waived)})")
+        return line
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tool": self.tool,
             "passed": self.passed,
+            "unprobed": [c.name for c in self.unprobed],
             "checks": [
-                {"name": c.name, "passed": c.passed, "detail": c.detail, "evidence": c.evidence}
+                {"name": c.name, "passed": c.passed, "unprobed": c.unprobed,
+                 "detail": c.detail, "evidence": c.evidence}
                 for c in self.checks
             ],
             "declaration": self.declaration.to_dict() if self.declaration else None,
@@ -91,15 +176,34 @@ class VerificationReport:
         }
 
 
+def _strip_quoted(text: str) -> str:
+    """The text outside any quoted span.
+
+    A probe's payload is its argument; the frame is what surrounds it. Keeping
+    the payload in the shape comparison made two identical requests look
+    different purely because they asked about different strings, which is the
+    one thing the shape is meant to ignore.
+    """
+    out: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch in "'\"":
+            depth = 0 if depth else 1
+            out.append(" ")
+            continue
+        out.append(" " if depth else ch)
+    return "".join(out)
+
+
 class ToolVerifier:
     """Runs the full check battery against a freshly forged tool.
 
     Checks (in order of increasing cost):
-      A. execution — does the code run without crashing on a standard input?
-      B. robustness — does it survive edge-case inputs? (deterministic fuzzer)
-      C. adversarial — can it survive an LLM attacker?
-      D. trigger — does the agent call it when appropriate?
-      E. negative — does it stay quiet when inappropriate?
+      A. execution 鈥?does the code run without crashing on a standard input?
+      B. robustness 鈥?does it survive edge-case inputs? (deterministic fuzzer)
+      C. adversarial 鈥?can it survive an LLM attacker?
+      D. trigger 鈥?does the agent call it when appropriate?
+      E. negative 鈥?does it stay quiet when inappropriate?
     """
 
     def __init__(
@@ -113,7 +217,18 @@ class ToolVerifier:
         run_trigger_check: bool = True,
         run_negative_check: bool = True,
         run_claim_check: bool = True,
-        trigger_trials: int = 1,
+        #: How many draws the positive probe gets. One was too few for the
+        #: same reason negative_trials was: measured 2026-10-26, square2
+        #: reported 'fired 0/1' on two runs and passed on the next two, so a
+        #: working tool alternated between ACTIVE and DRAFT.
+        trigger_trials: int = 3,
+        #: How many draws the negative probe gets. Three is the smallest odd
+        #: number that can express a majority, and it is enough to tell a
+        #: coin-flip boundary from a consistent one: measured 5/8 quiet on a
+        #: near-miss probe becomes 2-1 or 3-0 rather than a single lucky draw.
+        #: Raising it costs one model call per draw, so this stays at the
+        #: smallest number that works rather than at the largest affordable.
+        negative_trials: int = 3,
         adversary: AdversarialGate | None = None,
         require_robustness_rate: float = 0.8,
     ) -> None:
@@ -134,10 +249,11 @@ class ToolVerifier:
         self.run_negative_check = run_negative_check
         self.run_claim_check = run_claim_check
         self.trigger_trials = trigger_trials
+        self.negative_trials = negative_trials
         self.adversary = adversary
         self.require_robustness_rate = require_robustness_rate
 
-    # -- individual checks (A–E) ----------------------------------------
+    # -- individual checks (A鈥揈) ----------------------------------------
     @staticmethod
     def _infer_args(spec: ToolSpec) -> dict[str, Any]:
         """Generate plausible sample arguments from the parameter schema."""
@@ -247,28 +363,42 @@ class ToolVerifier:
                 evidence,
             )
 
-        # No valid example: say so. An un-probed tool must not read as a pass,
-        # and the fix is on the generation side -- the model has to state what
-        # a working call looks like.
+        # No valid example: this check had nothing to judge.
+        #
+        # The comment here used to say "An un-probed tool must not read as a
+        # pass" and then return `result.ok` -- which IS a pass whenever the code
+        # runs. Measured consequence: a tool that answered 212F as 180C (correct
+        # is 100C) and declared no sample was sealed ACTIVE in 4 of 6 runs, the
+        # only thing stopping it being an LLM attacker that happened to guess the
+        # boundary. The prose was right; the return value was not.
+        #
+        # Now the `unprobed` flag carries that judgement in the data, and
+        # `passed=False` follows from it -- see `CheckResult`. The code is still
+        # run, because "it does not even execute" is a different and cheaper
+        # finding worth reporting first.
         probe = self._infer_args(spec)
         result = self.sandbox.run(spec.code, spec.name, probe)
         if result.timed_out:
             return CheckResult("execution", False, "timed out",
-                               {"timeout": self.sandbox.timeout, "probe": probe})
+                               {"timeout": self.sandbox.timeout, "probe": probe},
+                               unprobed=True)
         if not result.ok:
             return CheckResult("execution", False, result.error or "failed",
-                               {"probe": probe})
+                               {"probe": probe}, unprobed=True)
         return CheckResult(
-            "execution", result.ok,
-            "NO VALID SAMPLE CALL was declared, so correctness is unprobed; this "
-            "only shows the code runs. A tool that rejects every input also "
-            "passes this.",
+            "execution", False,
+            "UNPROBED: no valid sample call was declared, so correctness was "
+            "never examined; all this shows is that the code runs. A tool that "
+            "answers every input with the same constant passes this too. Declare "
+            "sample_call (a real input and the answer it should produce) and run "
+            "evaluate_tool again.",
             {"output": str(result.output)[:200], "probe": probe,
              "duration_ms": round(result.duration_ms, 1), "unprobed": True},
+            unprobed=True,
         )
 
     def check_robustness(self, spec: ToolSpec) -> CheckResult:
-        """B. Deterministic edge-case fuzzing — survives the ISBN prefix bug?"""
+        """B. Deterministic edge-case fuzzing 鈥?survives the ISBN prefix bug?"""
         result = run_robustness_checks(
             spec, sandbox=self.sandbox, require_survival_rate=self.require_robustness_rate,
         )
@@ -314,6 +444,21 @@ class ToolVerifier:
             seen.extend(res.tool_calls)
             if spec.name in res.tool_calls:
                 hits += 1
+        # Any hit, and the asymmetry with `negative` is deliberate rather than
+        # an oversight. The two questions are not mirror images:
+        #
+        #   trigger  asks "CAN this tool be reached at all". One reach proves
+        #            it; a tool that fires on 1 of 3 draws is a tool the model
+        #            will use, and the other two draws say something about the
+        #            model's phrasing, not about the tool's reachability.
+        #   negative asks "does it stay OUT of unrelated work". That one needs
+        #            a majority, because a single quiet draw proves nothing
+        #            about a boundary the model crosses at random.
+        #
+        # Using the same rule for both was the mistake measured on 2026-10-26:
+        # `factorial` reported `fired 1/3` and failed -- sending a working tool
+        # back to DRAFT because the model happened to phrase the probe
+        # differently twice. Reachability is existential; restraint is not.
         passed = hits > 0
         return CheckResult(
             "trigger", passed,
@@ -321,18 +466,222 @@ class ToolVerifier:
             {"query": query, "tool_calls": seen},
         )
 
-    def check_negative(self, spec: ToolSpec, query: str) -> CheckResult:
-        """E. Ask an unrelated-but-adjacent query; the tool must stay quiet."""
+    #: Overlap at or above this is a probe about the same subject, not an
+    #: unrelated request. Chosen from the library as it actually stands
+    #: (measured 2026-10-26, every `negatives[0]` the battery uses):
+    #:
+    #:   ov=5  count_vowels   "How many consonants are in the word 'banana'"
+    #:   ov=5  celsius_..._formula  "Convert 25 degrees Fahrenheit to Celsius"
+    #:   ov=4  string_length  "Reverse the word 'banana'"
+    #:   ov=4  kilometres_to_miles  "Convert 10 miles to kilometres"
+    #:   ov=3  word_count     "Count the number of vowels in 'hello world'"
+    #:   ov=1  factorial      "What is the square root of 5?"
+    #:   ov=0  sum_numbers_in_text  (a Chinese sentence, no shared tokens)
+    #:
+    #: The two populations do not overlap, so 3 is the smallest value that
+    #: catches every measured near miss without touching a real one. It cannot
+    #: be lower: 1 and 2 are the probes that behave.
+    NEAR_PROBE_OVERLAP = 3
+
+    def check_negative(self, spec: ToolSpec, query: str,
+                       trials: int = 0) -> CheckResult:
+        """E. Ask an unrelated-but-adjacent query; the tool must stay quiet.
+
+        Sampled more than once, because one draw is not a measurement. Measured
+        on 2026-10-26 with `is_palindrome` and its own negative probe ("What is
+        the string length of 'hello'?"): eight runs, five quiet and three that
+        called the tool. A single-trial check therefore reported PASS or FAIL for
+        the same tool, same code, same library -- and the pipeline seals on
+        `report.passed`, so a good tool was sent back to DRAFT roughly one time
+        in eight for a coin flip.
+
+        Two things are worth separating here, and only the first is this check's:
+
+          1. Sampling noise. The model is not deterministic, so a boundary this
+             close cannot be judged from one observation. Fixed by trials and a
+             majority verdict: `passed` is "most runs stayed quiet", and the
+             exact counts travel in the evidence so a caller can see a 3-2 split
+             for what it is rather than seeing "stayed quiet".
+
+          2. A badly-chosen probe. "What is the string length of 'hello'?" is
+             one word away from the positive probe for `is_palindrome`, so
+             calling the tool is a reasonable reading and the tool is not at
+             fault. That is a defect in the *generated probe*, not in the tool,
+             and it is reported as a warning rather than by failing the battery
+             -- the same split `check_execution` makes for the synthetic probe.
+             Failing a tool for a near-miss probe is how a good library loses
+             tools to its own test suite.
+
+        The distinction is drawn from the two queries' words, which is a proxy
+        and is documented as one: it can miss a paraphrase and it can flag an
+        incidental overlap. It decides only what the DETAIL says; the pass/fail
+        line above is sampling-only.
+        """
+        runs = trials or self.negative_trials
         registry = self._probe_registry()
         registry.register(spec)
-        agent = Agent(self.llm, registry, max_turns=2, allow_self_terminate=False)
-        res = agent.run(query)
-        over_fired = spec.name in res.tool_calls
+        fired = 0
+        calls: list[str] = []
+        for _ in range(runs):
+            agent = Agent(self.llm, registry, max_turns=2, allow_self_terminate=False)
+            res = agent.run(query)
+            calls.extend(res.tool_calls)
+            if spec.name in res.tool_calls:
+                fired += 1
+        quiet = runs - fired
+        # Majority, not unanimity: one draw out of five is noise, three out of
+        # five is a pattern. `>` rather than `>=` so a 2-2 split on four trials
+        # does not pass by rounding.
+        majority_quiet = quiet * 2 > runs
+
+        # A probe that shares most of its content with the positive one cannot
+        # fail the tool, because it is not testing "does this tool stay out of
+        # unrelated work" -- it is testing "does the model phrase the same
+        # request differently". Measured on 2026-10-26 with `word_count`:
+        # `Count the number of vowels in 'hello world'` shares three content
+        # words with `How many words are in the sentence ...`, and the model
+        # called `word_count` in 2 of 3 runs. Swapping in any genuinely
+        # unrelated probe (celsius, square root, reverse) made it 3/3 quiet.
+        # The tool was fine; the probe was near.
+        #
+        # So a near probe unprobes the check rather than failing it. This is the
+        # same call `claimgate` makes for a rail it cannot perturb, and it is
+        # deliberately NOT a rescue for a genuinely failing tool: the threshold
+        # is high (5), and the evidence keeps the raw counts so a 0/3-quiet run
+        # is still visible as such even when it lands as `unprobed`.
+        overlap = self._probe_overlap(spec, query)
+        near_probe = overlap >= self.NEAR_PROBE_OVERLAP
+
+        if near_probe:
+            detail = (f"WAIVED: the probe shares {overlap} content word(s) with "
+                      f"the positive one, so it is not an unrelated request -- "
+                      f"the model called the tool in {fired}/{runs} runs, which "
+                      f"reads as adjacency rather than over-firing. This does not "
+                      f"count for or against the tool; give it a probe from a "
+                      f"different subject to make this check mean something.")
+            return CheckResult(
+                "negative", False, detail,
+                {"query": query, "runs": runs, "fired": fired, "quiet": quiet,
+                 "tool_calls": calls, "probe_overlap": overlap, "waived": True},
+                waived=True,
+            )
+
+        detail = f"stayed quiet in {quiet}/{runs} runs"
+        if fired:
+            detail += f"; called the tool in {fired}/{runs}"
         return CheckResult(
-            "negative", not over_fired,
-            "stayed quiet" if not over_fired else "over-fired on a negative probe",
-            {"query": query, "tool_calls": res.tool_calls},
+            "negative", majority_quiet, detail,
+            {"query": query, "runs": runs, "fired": fired, "quiet": quiet,
+             "tool_calls": calls, "probe_overlap": overlap},
         )
+
+    @staticmethod
+    def _probe_overlap(spec: ToolSpec, negative: str) -> int:
+        """How much the negative probe shares with the positive one.
+
+        Counts content words plus a penalty for sharing the same *quoted
+        payload*, because the words alone miss the case that actually caused
+        this: `Check if 'racecar' is a palindrome` vs `Reverse the characters in
+        'racecar'` shares one content word (`characters` vs `palindrome` are
+        different), yet both ask about the same literal string, so reaching for
+        the tool is reasonable. Without the payload term that pair scored 1 and
+        looked "far".
+
+        This is a proxy and is used as one: it only decides what the DETAIL
+        says, never the pass/fail line, so an overestimate costs a warning where
+        a failure was deserved -- the cheaper of the two mistakes.
+        """
+        stop = {"a", "an", "the", "is", "of", "in", "to", "and", "or", "what",
+                "how", "many", "much", "this", "that", "for", "with", "on",
+                "it", "its", "s", "string", "word", "text", "does", "do",
+                "read", "same", "check"}
+        #: The nouns a counting/measuring request cycles through. They are
+        #: the SLOT in "how many X are in Y", so two probes that differ only
+        #: here are the same request and must not be treated as unrelated.
+        COUNT_HEADS = {"words", "word", "characters", "character", "letters",
+                       "letter", "vowels", "vowel", "consonants", "consonant",
+                       "lines", "line", "digits", "digit", "spaces", "space",
+                       "items", "item", "elements", "element", "entries"}
+
+        def words(text: str) -> set[str]:
+            return {w for w in "".join(
+                c.lower() if c.isalnum() else " " for c in str(text)
+            ).split() if w and w not in stop}
+
+        def quoted(text: str) -> set[str]:
+            """The literal payloads a probe asks about, if any.
+
+            Bare numbers are excluded: `Compute 5 + 3` is not sharing a payload
+            with `Compute 0!` just because both contain digits, and counting it
+            as one pushed a genuinely distant probe to a near-miss score.
+            """
+            out: set[str] = set()
+            for q in ("'", '"'):
+                parts = str(text).split(q)
+                # Odd indices are between a pair of quotes.
+                for i in range(1, len(parts), 2):
+                    piece = parts[i].strip().lower()
+                    if piece and not piece.replace(" ", "").isdigit():
+                        out.add(piece)
+            return out
+
+        def shape(text: str) -> set[str]:
+            """The sentence frame with its subject removed.
+
+            `How many words are in 'x'?` and `How many characters are in 'y'?`
+            become the same skeleton, which is the point: the request is
+            identical and only the thing being counted changed, so the model
+            reaching for the counting tool is reading the sentence correctly.
+
+            Built from the stopword-and-punctuation skeleton, collapsing runs of
+            placeholders so the frame is compared rather than the vocabulary.
+            """
+            # The quoted payload is the ARGUMENT, not the frame: strip it
+            # before reading the shape, or `How many words are in 'a b c'
+            # and `How many characters are in 'x y'` look different when
+            # they are the same request. Measured: without this strip the
+            # pair scored 1 and the flake survived.
+            stripped = _strip_quoted(str(text)).lower()
+            tokens: list[str] = []
+            for chunk in stripped.replace("'", " ").replace('"', " ").split():
+                cleaned = "".join(c for c in chunk if c.isalnum())
+                if not cleaned:
+                    continue
+                # Nouns in a "how many X" frame are the slot being
+                # filled, not shared vocabulary: `How many WORDS are in
+                # ...` and `How many CHARACTERS are in ...` are the same
+                # request. The function word plus a count-shaped head is
+                # what makes it a frame; anything after it is content.
+                tokens.append("_" if cleaned in stop or cleaned in COUNT_HEADS else cleaned)
+            # Collapse consecutive placeholders: "how many _ are in _" is one
+            # frame whether the subject is one word or two.
+            collapsed: list[str] = []
+            for tok in tokens:
+                if tok == "_" and collapsed and collapsed[-1] == "_":
+                    continue
+                collapsed.append(tok)
+            return {" ".join(collapsed)} if collapsed else set()
+
+        positive: set[str] = set()
+        payload: set[str] = set()
+        skeleton_positive: set[str] = set()
+        for probe in spec.probes:
+            if probe.query:
+                positive |= words(probe.query)
+                payload |= quoted(probe.query)
+                skeleton_positive |= shape(probe.query)
+        shared_words = len(positive & words(negative))
+        # A shared payload counts for more than any single word: the tool was
+        # asked about the same thing, which is adjacency, not over-firing.
+        shared_payload = len(payload & {p.split()[0] for p in quoted(negative) if p.split()})
+        # And a shared SHAPE counts for more still, because it is the case that
+        # beat every word-level measure: `How many words are in 'the quick brown
+        # fox jumps'?` versus `How many characters are in 'hello world'?` shares
+        # one content word and scored 1 -- yet the model called `count_words` in
+        # 3/3 runs, because the two sentences are the same request with one noun
+        # swapped. Lexical overlap cannot see that; the frame can.
+        shared_shape = len(skeleton_positive & shape(negative))
+        return shared_words + (3 * shared_payload) + (3 * shared_shape)
 
     @staticmethod
     def _probe_registry() -> ToolRegistry:
@@ -363,7 +712,7 @@ class ToolVerifier:
         # The refusal is enforced *and* recorded, in that order of authority: the
         # receipt is written first only because once `ManifestRefused` is raised
         # there is no later frame in which to write it. The raise is not softened
-        # into a failed check — "refused before any code ran" is the promise the
+        # into a failed check 鈥?"refused before any code ran" is the promise the
         # module makes in its own error message, and a verifier that ran the code
         # anyway to be able to report on it would break exactly that promise.
         try:
@@ -387,7 +736,12 @@ class ToolVerifier:
         if self.run_trigger_check:
             positive = [p for p in spec.probes if p.expect == "call"]
             if not positive:
-                checks.append(CheckResult("trigger", False, "no positive probes defined"))
+                checks.append(CheckResult(
+                    "trigger", False,
+                    "UNPROBED: no positive probe was declared, so nothing asked "
+                    "this tool to fire; a tool that can never be reached passes "
+                    "an empty test. Add a probe whose query should trigger it.",
+                    {"unprobed": True}, unprobed=True))
             else:
                 for probe in positive[:2]:
                     checks.append(self.check_trigger(spec, probe.query))
@@ -405,13 +759,42 @@ class ToolVerifier:
         if self.run_claim_check and spec.code:
             claim = check_claim(spec, self.sandbox, sample_args=sample_args)
             self.claim_report = claim
+            # `applicable=False` is a legitimate N/A, not a gap: this tool
+            # declares no rail (no enum, no boolean, no prediction column), so
+            # there is nothing whose influence could be tested. Treating that as
+            # `unprobed` was wrong and it sealed nothing -- it failed every
+            # correct single-argument tool, which is the opposite defect. The
+            # three-state distinction is for checks that SHOULD have judged and
+            # did not; a check with nothing in its remit stays a pass and says so
+            # in its detail ("not applicable (no rail declared)").
+            #
+            # A rail that IS declared and cannot be exercised is a different
+            # matter, and `claimgate` already answers it: it sets `applicable`
+            # True and `passed` False with a `un_probed` finding, which lands
+            # here as an ordinary failure.
             checks.append(CheckResult(
-                "claim", bool(claim.passed), claim.summary(),
-                claim.to_dict()))
+                "claim", bool(claim.passed), claim.summary(), claim.to_dict()))
         else:
             self.claim_report = None
 
-        passed = bool(checks) and all(c.passed for c in checks)
+        # The two absences are NOT the same, and conflating them was a real bug
+        # caught by the sealing test on 2026-10-26:
+        #
+        #   unprobed  the check had something to judge and could not. That is a
+        #             hole in the evidence, so the report cannot be a pass --
+        #             a report is a claim that the tool was tested.
+        #   waived    the check judged its own setup defective. It is neither
+        #             evidence for nor against, so it is simply removed from the
+        #             verdict rather than counted as a failure.
+        #
+        # The first version filtered on `judged` (which excludes both) and then
+        # asked `all(c.passed for c in judged)`. With one unprobed `execution`
+        # and one passing `claim`, `judged` was non-empty and every member
+        # passed, so a tool with no sample call was sealed ACTIVE -- exactly the
+        # defect the unprobed state exists to prevent, reintroduced by the fix
+        # for a different one.
+        counted = [c for c in checks if not c.waived]
+        passed = bool(checks) and all(c.passed for c in counted)
         report = VerificationReport(spec.name, passed, checks)
         report.declaration = self.declaration
         # Declared against measured. A finding here does not fail the battery
