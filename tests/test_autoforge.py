@@ -60,6 +60,12 @@ def sample_generated() -> GeneratedTool:
             )
         ],
         tags=["text"],
+        # A tool with no declared sample can no longer be sealed: `execution`
+        # reports itself unprobed, and an unprobed check is not a pass. This
+        # fixture passed before that change only because the gap existed, so the
+        # sample belongs here with the rest of the tool's contract.
+        sample_call={"text": "abc"},
+        sample_expect="cba",
     )
 
 
@@ -536,7 +542,15 @@ class TestVerifier:
         )
         report = v.verify(spec)          # sample_args=None -> _infer_args runs
 
-        assert any(c.name == "execution" and c.passed for c in report.checks)
+        # What this test is about is that the battery SURVIVES a malformed
+        # schema, not that `execution` goes green: this spec declares no sample,
+        # so `execution` is legitimately unprobed now. Asserting `passed` here
+        # also held the old vacuity in place -- a green execution tick on a tool
+        # nobody had a valid example for. The two claims are separated below.
+        assert [c.name for c in report.checks][0] == "execution"
+        execution = next(c for c in report.checks if c.name == "execution")
+        assert execution.unprobed is True
+        assert execution.passed is False
         assert spec.parameters["properties"]["isbn"] == {"type": "string"}
 
 

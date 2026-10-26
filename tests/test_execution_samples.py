@@ -173,3 +173,160 @@ class TestEvidence:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── the three-state verdict, and the defect it closes ────────────────────────
+#
+# `test_unprobed_is_not_a_pass` above asserts on `evidence["unprobed"]` and on
+# the detail text, but never on `r.passed`. The name promised more than the
+# assertions checked, and the gap was real: `check_execution` returned
+# `result.ok` for a tool that declared no sample, so an un-probed check read as
+# a pass in every machine-readable field while only the prose said otherwise.
+#
+# Measured on this host before the fix: a tool that answered 212F as 180C
+# (correct: 100C) and declared no sample was sealed ACTIVE in 4 of 6 runs. The
+# only thing that ever stopped it was the LLM attacker guessing the boundary.
+#
+# These tests pin the invariant at the level that decides a tool's fate:
+# `VerificationReport.passed`, and the pipeline transition it gates.
+
+def test_an_unprobed_check_is_not_passed_in_the_data():
+    """The promise `test_unprobed_is_not_a_pass` makes, checked on `passed`."""
+    r = run(ANSWERS, sample_call={})
+    assert r.unprobed is True
+    assert r.passed is False, (
+        "an un-probed execution check must not report passed=True: nothing "
+        "compared an answer to a question, so there is nothing to pass on")
+    assert r.judged is False
+
+
+def test_unprobed_and_passed_cannot_both_be_true():
+    """The invariant is enforced in code, so a future check cannot forget it."""
+    from autoforge.forge.verifier import CheckResult
+
+    with pytest.raises(ValueError):
+        CheckResult("execution", True, "looks fine", {}, unprobed=True)
+
+
+def test_the_report_separates_unprobed_from_failed():
+    """A report must not let a reader confuse "did not run" with "ran and failed"."""
+    from autoforge.forge.sandbox import Sandbox
+    from autoforge.forge.verifier import ToolVerifier
+    from autoforge.tools.spec import ToolSpec
+
+    verifier = ToolVerifier(None, sandbox=Sandbox(timeout=20.0),
+                            run_trigger_check=False, run_negative_check=False,
+                            run_claim_check=False, run_adversarial_check=False,
+                            run_robustness_check=False)
+    spec = ToolSpec(
+        name="isbn10", description="d",
+        parameters={"type": "object", "properties": {"raw": {"type": "string"}}},
+        fn=lambda **_: "", code=ANSWERS, source="human",
+        sample_call={}, sample_expect="",
+    )
+    report = verifier.verify(spec)
+    assert [c.name for c in report.unprobed] == ["execution"]
+    assert [c.name for c in report.failed] == ["execution"]     # unprobed also fails
+    # The summary must name it rather than let "0/1 passed" imply a wrong answer.
+    assert "unprobed" in report.summary().lower(), report.summary()
+
+
+def test_a_sample_less_tool_is_never_sealed_active():
+    """The transition the whole framework exists to protect.
+
+    `ForgePipeline` seals on `report.passed`. If an un-probed execution check
+    counted as a pass, a wrong tool with no declared sample became ACTIVE.
+    """
+    from autoforge.forge.pipeline import ForgeConfig, ForgePipeline
+    from autoforge.forge.sandbox import Sandbox
+    from autoforge.forge.verifier import ToolVerifier
+    from autoforge.tools.registry import ToolRegistry
+    from autoforge.tools.spec import ToolState
+
+    class _Answers:
+        """A generator that hands back one wrong tool, once per round."""
+        def __init__(self) -> None:
+            self.rounds = 0
+
+        def generate(self, need, context=""):
+            from autoforge.forge.generator import GeneratedTool
+            self.rounds += 1
+            return GeneratedTool(
+                name="fahrenheit_to_celsius",
+                description="Convert Fahrenheit to Celsius.",
+                # 212F is 100C; this returns 180. Wrong, and total.
+                code="def fahrenheit_to_celsius(f):\n    return float(f) - 32\n",
+                parameters={"type": "object",
+                            "properties": {"f": {"type": "number"}},
+                            "required": ["f"]},
+                sample_call={},            # ← the defect's precondition
+                sample_expect="",
+            )
+
+    sandbox = Sandbox(timeout=20.0)
+    verifier = ToolVerifier(
+        None, sandbox=sandbox,
+        run_execution_check=True,
+        run_robustness_check=False,
+        run_adversarial_check=False,
+        run_trigger_check=False,
+        run_negative_check=False,
+        run_claim_check=False,
+    )
+    registry = ToolRegistry()
+    pipeline = ForgePipeline(_Answers(), verifier, registry, sandbox=sandbox,
+                             config=ForgeConfig(max_rounds=1))
+    result = pipeline.forge("convert fahrenheit to celsius")
+    assert not result.ok, (
+        "a tool with no declared sample was sealed despite its correctness "
+        "never having been examined")
+    sealed = registry.get("fahrenheit_to_celsius")
+    assert sealed is None or sealed.state is not ToolState.ACTIVE
+
+
+def test_an_unprobed_check_blocks_even_when_another_check_passes():
+    """The exact shape that reintroduced the defect on 2026-10-26.
+
+    `execution` was unprobed and `claim` passed. The first version of the
+    three-state fix filtered on `judged` -- which excludes unprobed -- and then
+    asked `all(c.passed for c in judged)`. With `claim` in that list and passing,
+    the report came out `passed=True` and a tool with no declared sample was
+    sealed ACTIVE. The belt-and-braces `all(...)` did not save it, because the
+    unprobed check had been filtered out of the list it iterated.
+
+    A single-check test cannot catch that: with only `execution` present, its
+    `passed=False` fails the `all(...)` whichever way the unprobed term goes.
+    This test needs a SECOND, passing check to reproduce it.
+    """
+    from autoforge.core.llm import MockLLMClient
+    from autoforge.forge.sandbox import Sandbox
+    from autoforge.forge.verifier import ToolVerifier
+    from autoforge.tools.spec import ToolSpec
+
+    v = ToolVerifier(
+        MockLLMClient(handler=lambda *a, **k: None),
+        sandbox=Sandbox(timeout=20.0),
+        run_execution_check=True,
+        run_robustness_check=False,
+        run_adversarial_check=False,
+        run_trigger_check=False,
+        run_negative_check=False,
+        run_claim_check=True,          # ← the second, passing check
+    )
+    spec = ToolSpec(
+        name="fahrenheit_to_celsius", description="Convert F to C.",
+        parameters={"type": "object", "properties": {"f": {"type": "number"}},
+                    "required": ["f"]},
+        fn=lambda **_: "",
+        # 212F is 100C; this returns 180, and declares no sample.
+        code="def fahrenheit_to_celsius(f):\n    return float(f) - 32\n",
+        source="generated", sample_call={}, sample_expect="",
+    )
+    report = v.verify(spec)
+    assert [c.name for c in report.unprobed] == ["execution"]
+    assert any(c.passed for c in report.checks), (
+        "this test is only meaningful when some other check passes")
+    assert report.passed is False, (
+        "an unprobed execution check must block the battery even when another "
+        "check passes: the report is a claim that the tool was TESTED, and "
+        "nothing compared an answer to a question")
