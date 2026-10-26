@@ -365,7 +365,18 @@ def run_isolated(
         # pinning those would change the number the guard reports.
         env.setdefault("OPENBLAS_NUM_THREADS", "4")
         env.setdefault("OPENBLAS_DEFAULT_NUM_THREADS", "4")
-        cmd = [sys.executable, "-m", "autoforge.cpu.safety",
+        # The module name is derived, not hardcoded. Upstream this file lives at
+        # `autoforge.cpu.safety`, but the service hosting it imports the same
+        # source as `autoforge_svc.cpu.safety` -- and a hardcoded
+        # `-m autoforge.cpu.safety` made every guarded run die with
+        #   ModuleNotFoundError: No module named 'autoforge'
+        # which the guard then reported as `crashed`, i.e. as a defect in the
+        # kernel rather than in the harness. `__name__` is the name this module
+        # was actually imported under, so `-m` resolves it the same way.
+        module = __name__
+        if module == "__main__":                            # pragma: no cover
+            module = "autoforge.cpu.safety"
+        cmd = [sys.executable, "-m", module,
                "--payload", str(payload), "--out", str(out)]
 
         started = __import__("time").perf_counter()

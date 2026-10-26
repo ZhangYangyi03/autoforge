@@ -501,20 +501,35 @@ class Sandbox:
     def _probe(self) -> dict[str, Any]:
         """A real round-trip, so `reach` can be checked instead of believed.
 
-        The file is written to the host temp dir, which is deliberately *not*
-        the per-call cwd — writing inside cwd would prove nothing about escaping
-        it. The name is fixed and the file is removed in the same call.
+        The file is written outside the per-call cwd — writing inside cwd would
+        prove nothing about escaping it — and it is written into the CHILD's
+        temp dir, resolved inside the child.
+
+        That last part is the fix for a self-report that contradicted itself.
+        `effective_env()` drops TMP/TEMP unless they are allow-listed, so the
+        child can resolve a different temp dir from the one this process
+        resolved at import time (measured on this host: here `tempfile` gives
+        C:\Temp, the child's gives one under LOCALAPPDATA). Handing the child
+        the parent's path made it write to its own directory, report ok, and
+        leave this process looking at an empty path in another directory — an
+        answer that said "filesystem OK" and "the file is not there" in the
+        same breath.
+
+        And the claim is confirmed from OUT HERE. A child that deletes its own
+        file and reports success proves it could write; it does not prove the
+        write landed where this process can see it. So the child leaves the
+        file, the parent looks for it, records what it found, and removes it.
         """
-        target = os.path.join(tempfile.gettempdir(), ".autoforge_reach_probe")
+        name = ".autoforge_reach_probe"
         r = self.run(
-            "def probe(home):\n"
-            "    import os, socket\n"
+            "def probe(name):\n"
+            "    import os, socket, tempfile\n"
             "    out = {}\n"
+            "    home = os.path.join(tempfile.gettempdir(), name)\n"
             "    try:\n"
             "        with open(home, 'w', encoding='utf-8') as fh:\n"
             "            fh.write('reach')\n"
             "        back = open(home, encoding='utf-8').read()\n"
-            "        os.remove(home)\n"
             "        out['host_filesystem'] = {'ok': back == 'reach', 'detail': home}\n"
             "    except Exception as e:\n"
             "        out['host_filesystem'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
@@ -524,11 +539,36 @@ class Sandbox:
             "        out['network'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
             "    return out\n",
             "probe",
-            {"home": target},
+            {"name": name},
         )
         if not r.ok:
             return {"error": r.error or "probe did not run"}
-        return r.output if isinstance(r.output, dict) else {"error": f"unexpected {r.output!r}"}
+        out = r.output if isinstance(r.output, dict) else {"error": f"unexpected {r.output!r}"}
+
+        # Confirm the write from the parent, in every temp dir either side
+        # could have meant, and clean up whatever is found.
+        child_detail = (out.get("host_filesystem") or {}).get("detail") \
+            if isinstance(out.get("host_filesystem"), dict) else None
+        candidates: list[str] = []
+        if isinstance(child_detail, str) and child_detail:
+            candidates.append(child_detail)
+        mine = os.path.join(tempfile.gettempdir(), name)
+        if os.path.abspath(mine) not in [os.path.abspath(c) for c in candidates]:
+            candidates.append(mine)
+        found = next((c for c in candidates if os.path.exists(c)), None)
+        out["host_filesystem_confirmed_by_parent"] = bool(found)
+        out["host_filesystem_seen_at"] = found
+        for cand in candidates:
+            try:
+                if os.path.exists(cand):
+                    os.remove(cand)
+            except OSError:
+                pass
+        if found is None:
+            out["host_filesystem_note"] = (
+                "the child reported a successful write but no file was visible "
+                "from this process -- treat that report as unproven")
+        return out
 
 
 __all__ = ["Sandbox", "SandboxResult"]
