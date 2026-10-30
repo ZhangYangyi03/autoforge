@@ -47,11 +47,25 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+# The scan-login flow lives beside this file rather than inline: it is three
+# HTTP calls with a five-minute poll between two of them, and mixing that into
+# a proxy that also forwards chat would make both harder to read.
+try:
+    from . import login as login_mod
+except ImportError:                            # run as a script, not a package
+    import login as login_mod
+
+#: Live login sessions, keyed by `state`. Module-level because the request
+#: handler is constructed per request by BaseHTTPRequestHandler and would
+#: otherwise lose every session between two polls.
+_LOGINS: dict[str, Any] = {}
 
 # --------------------------------------------------------------------------
 # WorkBuddy constants -- transcribed from dsh-xdpool/lib/index.js so the two
@@ -1119,6 +1133,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.rstrip("/")
+        if path.startswith("/login/status"):
+            self._login_status()
+            return
         if path in ("/v1/models", "/models"):
             rows = self.bridge.models()
             data = []
@@ -1148,18 +1165,40 @@ class Handler(BaseHTTPRequestHandler):
                              for a in self.bridge.accounts],
                 "accounts_by_region": by_region,
                 "models": len({r["id"] for r in self.bridge.models()}),
+                # Sessions started and not yet resolved, so a caller can see that
+                # a scan is in progress rather than guess from silence.
+                "logins_pending": len([s for s in _LOGINS.values() if not s.done]),
             })
             return
         self._json(404, {"error": {"message": f"unknown path {self.path}"}})
 
+    def _login_status(self) -> None:
+        """`GET /login/status?state=...` -- one session's state, no token in it."""
+        query = urllib.parse.urlsplit(self.path).query
+        params = dict(urllib.parse.parse_qsl(query))
+        state = params.get("state") or ""
+        if not state:
+            # Listing every pending session is what a "am I logged in yet?"
+            # caller needs when it lost the state.
+            self._json(200, {"sessions": [s.snapshot() for s in _LOGINS.values()]})
+            return
+        session = _LOGINS.get(state)
+        if session is None:
+            self._json(404, {"error": {"message": "unknown or expired login state"}})
+            return
+        self._json(200, session.snapshot())
+
     def do_POST(self) -> None:
         path = self.path.rstrip("/")
+        if path.startswith("/login/start"):
+            self._login_start()
+            return
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self._json(404, {"error": {"message": f"unknown path {self.path}"}})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception as exc:                       # noqa: BLE001
             self._json(400, {"error": {"message": f"bad body: {exc}"}})
             return
@@ -1169,10 +1208,159 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(code, body)
 
+    def _login_start(self) -> None:
+        """`POST /login/start {"region":"cn"|"intl"}` -- begin a scan login.
+
+        Returns the URL immediately and polls in a background thread. A request
+        handler cannot sit for five minutes waiting for somebody to find their
+        phone, and a scan that timed out should not have held a connection to
+        find that out.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception as exc:                       # noqa: BLE001
+            self._json(400, {"error": {"message": f"bad body: {exc}"}})
+            return
+        region = str(body.get("region") or body.get("product") or "cn")
+        try:
+            product = login_mod.product_for(region)
+        except login_mod.KVError as exc:
+            self._json(400, {"error": {"message": str(exc),
+                                       "regions": sorted(login_mod.REGION_ALIASES)}})
+            return
+        try:
+            session = login_mod.start(product)
+        except login_mod.KVError as exc:
+            self._json(502, {"error": {"message": f"could not start a login: {exc}"}})
+            return
+
+        _LOGINS[session.state] = session
+
+        def _wait() -> None:
+            try:
+                token = session.wait()
+                _persist_login(session, token)
+            except Exception:                          # noqa: BLE001
+                # wait() already recorded the reason on the session; a background
+                # thread must not print a traceback into a server's stderr on a
+                # login the user abandoned.
+                pass
+
+        threading.Thread(target=_wait, name="wbproxy-login", daemon=True).start()
+
+        self._json(200, {
+            "state": session.state,
+            "region": session.region,
+            "product": product.id,
+            "label": product.label,
+            # The whole point: a plain web link the caller opens or shows.
+            "authUrl": session.auth_url,
+            "poll": "/login/status?state=%s" % session.state,
+            "note": ("Open that URL and sign in. Poll the status URL until "
+                     "pending is false; the credential is written to the "
+                     "account store when it lands."),
+        })
+
+
 
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
+def _store_path() -> Path:
+    """The account store this program owns (not the DSH cache it also reads)."""
+    return Path.home() / ".wbproxy" / "accounts.json"
+
+
+def _persist_login(session: Any, token: dict[str, Any]) -> None:
+    """Write a freshly scanned credential into this program's own store.
+
+    Written to `~/.wbproxy/accounts.json` rather than into dsh-xdpool's cache:
+    that directory belongs to another program and is rebuilt from the desktop
+    app's own files on every scan, so a credential written there would be
+    treated as a stale snapshot and lose the freshness comparison. dsh-xdpool
+    keeps scan credentials in its own state, and the equivalent here is this
+    file.
+
+    Fields match what `Account.__init__` reads -- `expiresAtMs`, not `expiresAt`,
+    because the store is written by this program and read back by this program.
+    """
+    target = _store_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = {"accounts": []}
+    if target.exists():
+        try:
+            doc = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:                                  # noqa: BLE001
+            doc = {"accounts": []}
+    accounts = doc.setdefault("accounts", [])
+
+    account = session.account or {}
+    nickname = (account.get("nickname") or account.get("nickName")
+                or account.get("userId") or account.get("uid") or "")
+    uid = str(account.get("userId") or account.get("uid") or "")
+    expires_ms = _expiry_ms(token)
+    domain = str(token.get("domain") or "") or session.product.api_domain
+
+    # Same product + same uid is the same person, so a re-scan replaces rather
+    # than appends. When the uid is unknown, the entry is kept: an unidentified
+    # duplicate is cheaper than a deleted account.
+    entry = {
+        "id": str(uuid.uuid4()),
+        "label": str(nickname) or str(session.product.label),
+        "region": session.region,
+        "credential": {
+            "accessToken": str(token.get("accessToken") or ""),
+            "refreshToken": str(token.get("refreshToken") or ""),
+            "domain": domain,
+            "uid": uid,
+            "expiresAtMs": expires_ms,
+        },
+    }
+    kept = []
+    replaced = False
+    for old in accounts:
+        old_cred = old.get("credential") or {}
+        same_person = (uid and str(old_cred.get("uid") or "") == uid
+                       and str(old.get("region") or "") == session.region)
+        if same_person and not replaced:
+            entry["id"] = old.get("id") or entry["id"]
+            kept.append(entry)
+            replaced = True
+            continue
+        kept.append(old)
+    if not replaced:
+        kept.append(entry)
+    doc["accounts"] = kept
+
+    target.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+    try:
+        os.chmod(target, 0o600)
+    except Exception:                                      # noqa: BLE001
+        pass
+    log("login written to %s (%s)" % (target, session.product.label))
+
+
+def _expiry_ms(token: dict[str, Any]) -> int:
+    """The credential's expiry in milliseconds, from whichever field it used."""
+    for key in ("expiresAtMs", "expiresAt", "expires_at", "expiresIn"):
+        raw = token.get(key)
+        if raw in (None, "", 0):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        # `expiresIn` is a duration, the others an instant. Anything below a
+        # plausible epoch is read as a duration, because a real timestamp from
+        # this decade is ~1.8e12 and a duration is small.
+        if value < 1e12:
+            return int((time.time() + value) * 1000)
+        return int(value)
+    return 0
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     accounts = load_accounts()
     if not accounts:
@@ -1274,12 +1462,70 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_login(args: argparse.Namespace) -> int:
-    """Add a credential by hand, for users with no DSH install.
+    """Add an account -- by scanning, or by pasting a token.
 
-    The desktop app's own files cannot be read: their tokens are AES-256-GCM
-    envelopes keyed from the OS keystore, and opening them means reimplementing
-    that derivation per platform. Pasting is the honest alternative.
+    Scanning is the default and needs nothing installed: it is three HTTP calls
+    and a token minted for this program. Pasting remains for a token lifted from
+    somewhere the scan cannot reach, and for a headless box whose browser is on
+    another machine.
+
+    Both end at the same store, so `doctor` treats them identically.
     """
+    if getattr(args, "paste", False):
+        return _login_paste()
+    return _login_scan(getattr(args, "region", "cn") or "cn")
+
+
+def _login_scan(region: str) -> int:
+    try:
+        product = login_mod.product_for(region)
+    except login_mod.KVError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        session = login_mod.start(product)
+    except login_mod.KVError as exc:
+        print(f"could not start a login: {exc}", file=sys.stderr)
+        return 1
+
+    print()
+    print(f"  {product.label}  ({login_mod.region_label(product)})")
+    print("  Open this and sign in with the app you already use:")
+    print()
+    print(f"    {session.auth_url}")
+    print()
+    # If a browser can be opened, do it; the URL is printed either way, because
+    # a headless host must still be able to paste it elsewhere.
+    if not getattr(sys, "ps1", None) and sys.stdout.isatty():
+        try:
+            import webbrowser
+            webbrowser.open(session.auth_url)
+        except Exception:                                  # noqa: BLE001
+            pass
+    print("  waiting for the scan (up to %ds) ..." % login_mod.LOGIN_TIMEOUT_S)
+    try:
+        token = login_mod.poll_for_token(product, session.state)
+    except login_mod.KVError as exc:
+        print(f"\n  login failed: {exc}", file=sys.stderr)
+        return 1
+    session.credential = token
+    try:
+        session.account = login_mod.fetch_account(product, session.state, token)
+    except login_mod.KVError as exc:
+        # The token is the point. A failed account read is a missing nickname,
+        # not a reason to discard a working credential.
+        print(f"  (account details unavailable: {exc})", file=sys.stderr)
+    _persist_login(session, token)
+
+    nickname = (session.account or {}).get("nickname") or ""
+    if nickname:
+        print(f"  signed in as: {nickname}")
+    print("  check it with: python wbproxy.py doctor")
+    return 0
+
+
+def _login_paste() -> int:
+    """The manual path, unchanged in what it writes."""
     print("Paste the WorkBuddy credential fields. Leave a field empty to stop.")
     print("They are stored under ~/.wbproxy/accounts.json (not world-readable).")
     print()
@@ -1292,24 +1538,25 @@ def cmd_login(args: argparse.Namespace) -> int:
     uid = input("uid (optional): ").strip()
     label = input("label [manual]: ").strip() or "manual"
 
-    target = Path.home() / ".wbproxy" / "accounts.json"
+    target = _store_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     doc: dict[str, Any] = {"accounts": []}
     if target.exists():
         try:
             doc = json.loads(target.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception:                                  # noqa: BLE001
             pass
     doc.setdefault("accounts", []).append({
         "id": f"manual-{int(time.time())}",
         "label": label,
+        "region": "cn" if domain.lower().endswith((".cn",)) else "global",
         "credential": {"accessToken": access, "refreshToken": refresh,
-                       "domain": domain, "uid": uid},
+                       "domain": domain, "uid": uid, "expiresAtMs": 0},
     })
     target.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         os.chmod(target, 0o600)
-    except Exception:
+    except Exception:                                      # noqa: BLE001
         pass
     print(f"\nwritten to {target}")
     print("check it with: python wbproxy.py doctor")
@@ -1386,7 +1633,19 @@ def main(argv: list[str] | None = None) -> int:
     p_doctor = sub.add_parser("doctor", help="check accounts, tokens and endpoints")
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_login = sub.add_parser("login", help="add a credential by hand")
+    p_login = sub.add_parser(
+        "login", help="add an account: scan a QR link, or paste a token")
+    # No `choices=`: the accepted spellings live in `login.REGION_ALIASES` and
+    # are resolved there, so `cn`, `global`, `workbuddy` and `intl` all work and
+    # an unknown one gets the list rather than argparse's usage dump. Keeping two
+    # lists in two places is how they end up disagreeing.
+    p_login.add_argument(
+        "--region", default="cn",
+        help="which product to sign in to: cn (国内版) or intl (国际版); "
+             "aliases: %s" % ", ".join(sorted(login_mod.REGION_ALIASES)))
+    p_login.add_argument(
+        "--paste", action="store_true",
+        help="paste a credential by hand instead of scanning")
     p_login.set_defaults(func=cmd_login)
 
     args = parser.parse_args(argv)
