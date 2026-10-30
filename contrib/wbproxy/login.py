@@ -257,17 +257,47 @@ def decorate_login_url(auth_url: str, product: Product) -> str:
         return auth_url
 
 
+def _jwt_expiry_s(access_token: str) -> float:
+    """The `exp` claim of a JWT, in seconds, or 0 when it is not one.
+
+    The upstream states no expiry anywhere. Measured 2026-10-30 on a real scan
+    login: `auth/token` returns access + refresh tokens and a `domain`;
+    `login/account` returns `uid`/`nickname`/`uin` and account flags. Neither
+    mentions when the grant ends, and the pool needs that number to schedule a
+    refresh -- so it is read out of the token, which is a JWT whose `exp` claim
+    is exactly this. Decoded, not verified: this reads a field the issuer put in
+    the clear, it does not authenticate anything.
+    """
+    parts = access_token.split(".")
+    if len(parts) < 2:
+        return 0.0
+    segment = parts[1]
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        import base64
+        claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception:                                        # noqa: BLE001
+        return 0.0
+    try:
+        return float(claims.get("exp") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _parse_token(data: dict[str, Any]) -> dict[str, Any]:
     """The token envelope, in the shape this program stores."""
     access = data.get("accessToken") or data.get("access_token") or ""
     refresh = data.get("refreshToken") or data.get("refresh_token") or ""
     if not access:
         raise KVError("auth/token answered without an access token")
+    # `expiresAtMs` is what `Account.__init__` reads. Prefer a claim over a
+    # stated field only because the upstream states none at all.
+    exp_s = _jwt_expiry_s(str(access))
     return {
         "accessToken": str(access),
         "refreshToken": str(refresh),
         "domain": str(data.get("domain") or ""),
-        "expiresAt": data.get("expiresAt") or data.get("expires_at") or 0,
+        "expiresAtMs": int(exp_s * 1000) if exp_s else 0,
     }
 
 
