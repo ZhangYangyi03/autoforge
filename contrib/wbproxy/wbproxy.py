@@ -1343,7 +1343,31 @@ def _persist_login(session: Any, token: dict[str, Any]) -> None:
 
 
 def _expiry_ms(token: dict[str, Any]) -> int:
-    """The credential's expiry in milliseconds, from whichever field it used."""
+    """The credential's expiry in milliseconds.
+
+    Read from the access token itself, because the upstream does not say.
+
+    Measured 2026-10-30 on a real scan login: `auth/token` returns access/refresh
+    tokens and a `domain`, and `login/account` returns `uid`/`nickname`/`uin`
+    and a pile of account flags -- **neither carries an expiry**. The first
+    version of this function looked for `expiresAt`/`expiresAtMs`/`expiresIn` in
+    the token envelope, found none, and stored 0. The account then read as
+    "expired 0 seconds ago" or "no expiry at all" depending on which consumer
+    looked, and the one number a pool needs to schedule a refresh was missing.
+
+    The token is a JWT (`eyJhbGciOiJS...`) whose `exp` claim is the instant and
+    whose `iat` is the issue time; a 30-day grant is `exp - iat = 2592000`.
+    Decoded without verifying the signature -- this is not authenticating the
+    token, only reading a field the issuer already put in the clear.
+    """
+    direct = _instant_ms(token)
+    if direct:
+        return direct
+    return _jwt_expiry_ms(str(token.get("accessToken") or ""))
+
+
+def _instant_ms(token: dict[str, Any]) -> int:
+    """An expiry the envelope itself stated, if it stated one at all."""
     for key in ("expiresAtMs", "expiresAt", "expires_at", "expiresIn"):
         raw = token.get(key)
         if raw in (None, "", 0):
@@ -1359,6 +1383,30 @@ def _expiry_ms(token: dict[str, Any]) -> int:
             return int((time.time() + value) * 1000)
         return int(value)
     return 0
+
+
+def _jwt_expiry_ms(access_token: str) -> int:
+    """The `exp` claim of a JWT, in milliseconds, or 0 when it is not one."""
+    parts = access_token.split(".")
+    if len(parts) < 2:
+        return 0
+    segment = parts[1]
+    # base64url without padding; Python needs the padding restored
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        import base64
+        claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception:                                      # noqa: BLE001
+        return 0
+    exp = claims.get("exp")
+    try:
+        value = float(exp)
+    except (TypeError, ValueError):
+        return 0
+    # A JWT `exp` is always an instant in seconds. No duration branch here:
+    # unlike `expiresIn`, a small number in this field would mean a token issued
+    # in 1970, which is a malformed claim rather than a relative time.
+    return int(value * 1000)
 
 
 def cmd_models(args: argparse.Namespace) -> int:
