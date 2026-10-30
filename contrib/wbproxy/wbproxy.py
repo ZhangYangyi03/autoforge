@@ -82,6 +82,121 @@ GLOBAL_CONFIG_PATH = "/v3/config"                  # global
 REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 CHAT_PATH = "/v2/chat/completions"
 
+#: Sentences the gateways refuse, and their rewrites. Copied verbatim from
+#: dsh-xdpool's `BANNED_SYSTEM_PHRASES` (lib/index.js) and the same three in
+#: `vendor/channel-pack/pack.js` around line 35458.
+#:
+#: WHY THIS IS NOT PARANOIA. Both gateways scan system and assistant CONTENT
+#: for other clients' fingerprints and answer `400 / 11128` ("this call failed
+#: channel verification") when one appears. The match is a case-insensitive
+#: SUBSTRING, so shifting the phrase (a leading newline, a trailing space) does
+#: not help -- the sentence has to be rewritten into a different one.
+#:
+#: Measured there, on live accounts: `powered by DeepSeek Harness` fixed
+#: 2026-10-21, `DeepSeek Harness Web GUI` fixed 2026-10-28, and the third --
+#: `Relative paths resolve from the workspace root`, which DSH emits whenever
+#: the agent has a `read` tool -- cost another week of 400s because it names no
+#: product at all and so did not look like a fingerprint.
+#:
+#: A client that sends its own system prompt straight through, as this proxy
+#: does, is exactly the client that trips these. Without this list every request
+#: from a harness that says "powered by" fails on both regions.
+BANNED_SYSTEM_PHRASES: tuple[tuple[str, str], ...] = (
+    ("powered by DeepSeek Harness", "running on DeepSeek Harness"),
+    ("DeepSeek Harness Web GUI", "DeepSeek Harness web interface"),
+    ("Relative paths resolve from the workspace root",
+     "Relative paths are resolved against the workspace root"),
+)
+
+
+def sanitize_text(text: str) -> str:
+    """Apply the fingerprint rewrites to one string, case-insensitively.
+
+    Returns the same object when nothing matched: a long conversation's system
+    prompt is large, and rebuilding an identical string is waste on the hot path.
+    """
+    out = text
+    for needle, replacement in BANNED_SYSTEM_PHRASES:
+        if needle.lower() in out.lower():
+            # Case-insensitive replace without losing the surrounding text's
+            # own casing: walk the lowercase match positions and splice the
+            # ORIGINAL string, replacing only the matched span.
+            lowered = out.lower()
+            needle_l = needle.lower()
+            parts: list[str] = []
+            cursor = 0
+            while True:
+                at = lowered.find(needle_l, cursor)
+                if at < 0:
+                    parts.append(out[cursor:])
+                    break
+                parts.append(out[cursor:at])
+                parts.append(replacement)
+                cursor = at + len(needle)
+                lowered = out.lower()
+            out = "".join(parts)
+    return out
+
+
+def sanitize_content(content: Any) -> Any:
+    """Rewrite fingerprinted text inside a message's content.
+
+    OpenAI-compatible bodies carry content either as a plain string or as a list
+    of blocks (`{"type":"text","text":...}`, images, cache-control markers).
+    Handling only the string form would miss every request that carries an
+    image -- which is most of the ones a multimodal harness sends.
+    """
+    if isinstance(content, str):
+        return sanitize_text(content)
+    if isinstance(content, list):
+        out: list[Any] = []
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                new_text = sanitize_text(block["text"])
+                if new_text is not block["text"]:
+                    block = dict(block)
+                    block["text"] = new_text
+                    changed = True
+            out.append(block)
+        return out if changed else content
+    return content
+
+
+def is_blank_assistant(message: dict[str, Any]) -> bool:
+    """An assistant turn with neither prose nor a tool call.
+
+    The upstream refuses it and the refusal is not retryable, so it has to be
+    dropped before sending rather than discovered as a 400. `#73` in
+    dsh-xdpool's CHANGELOG measured this on the CN gateway: an interrupted turn
+    leaves an assistant message carrying only `reasoning` and an empty content
+    string, which serialises to `""` on the wire and earns `400 / 11151` -- a
+    code in nobody's retry set. The international gateway tolerated all shapes,
+    so the failure only ever appeared on domestic accounts.
+
+    `tool_calls` is the exception, and it is not a nicety: an assistant message
+    that carries tool calls but no prose is the pairing anchor for the tool
+    results that follow. Dropping it would leave those results orphaned and the
+    request malformed in a new way. Empty `user` messages are left alone for the
+    same reason the upstream leaves them -- both gateways accept them, and
+    rewriting the caller's turns is not this proxy's business.
+    """
+    if str(message.get("role") or "") != "assistant":
+        return False
+    if message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        # A list of blocks counts as empty when no block carries any text.
+        for block in content:
+            if isinstance(block, dict) and str(block.get("text") or "").strip():
+                return False
+        return True
+    return content is None
+
+
 #: Paths that do NOT exist on these hosts. Kept as a record: an earlier version
 #: of this file assumed the messages/responses wires were available and built a
 #: whole translation layer for them. Measured: all four are 404.
@@ -771,6 +886,28 @@ class Bridge:
         if acct.region == "global" and not (
                 messages and str(messages[0].get("role")) == "system"):
             messages.insert(0, {"role": "system", "content": "You are a helpful assistant."})
+
+        # Fingerprint rewrites run AFTER the prepend above, because that is
+        # where the host's own system text lands and it is the text most likely
+        # to carry one of the three phrases. Only `system` and `assistant`
+        # content is rewritten: the gateways scan those two roles, and rewriting
+        # a user turn would be editing the person's own words for no reason.
+        #
+        # Blank assistant turns are dropped in the same pass. An interrupted
+        # turn leaves one carrying only reasoning and empty content, which
+        # serialises to `""` and earns `400 / 11151` on the CN gateway -- a code
+        # in nobody's retry set. An assistant turn WITH tool_calls is never
+        # dropped: it is the anchoring pair for the tool results that follow.
+        cleaned: list[dict[str, Any]] = []
+        for m in messages:
+            role = str(m.get("role") or "")
+            if role in ("system", "assistant") and "content" in m:
+                m["content"] = sanitize_content(m["content"])
+            if is_blank_assistant(m):
+                log("dropped a blank assistant turn (no prose, no tool_calls)")
+                continue
+            cleaned.append(m)
+        messages = cleaned
 
         body: dict[str, Any] = {
             "model": model,
