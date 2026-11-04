@@ -333,6 +333,60 @@ MEMORY_ENTRY_CHARS = 240
 MEMORY_SLOTS = 20
 
 
+# ---------------------------------------------------------------------------
+# A timeout that is a deadline
+# ---------------------------------------------------------------------------
+# The market pre-lookup reaches across the network from inside a forge. A socket
+# timeout bounds each blocking recv, so a peer that accepts the connection and
+# then trickles (or a rerank that runs long behind keep-alive) holds the caller
+# past its budget -- and with a 30s budget and a 20s call window that is not a
+# slow lookup, it is a dead agent. Measured on 2026-10-23: two probes against a
+# peer that never answers blocked ~35s each and outlived their own timeouts.
+#
+# So the fetch runs in a child process and is killed at the deadline. A thread
+# was the obvious answer and the wrong one: a thread cannot be killed, and
+# `join(timeout)` was measured to overrun by 15s+, which is the bug wearing the
+# fix's clothes.
+_FETCH_CHILD = """
+import json, sys, urllib.request
+url, limit = sys.argv[1], int(sys.argv[2])
+with urllib.request.urlopen(urllib.request.Request(url), timeout=float(sys.argv[3])) as r:
+    body = r.read(limit)
+sys.stdout.buffer.write(body)
+"""
+
+
+def _fetch_json_with_deadline(req: Any, budget: float,
+                              limit: int = 8 * 1024 * 1024) -> Any:
+    """GET `req` and parse JSON, or raise -- never past `budget` seconds.
+
+    Raises TimeoutError when the deadline is hit, so the caller records "no
+    answer" rather than "nothing on the shelf".
+    """
+    import json as _json
+    import os as _os
+    import subprocess as _sub
+    import sys as _sys
+    deadline = max(0.5, float(budget))
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    keep = ("SYSTEMROOT", "TEMP", "TMP", "PATH", "USERPROFILE", "APPDATA",
+            "LOCALAPPDATA", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
+    try:
+        proc = _sub.run(
+            [_sys.executable, "-c", _FETCH_CHILD, url, str(int(limit)),
+             str(deadline)],
+            capture_output=True, timeout=deadline,
+            env={k: v for k, v in _os.environ.items() if k in keep},
+        )
+    except _sub.TimeoutExpired:
+        raise TimeoutError(
+            f"market did not answer within {deadline:.1f}s (child killed)") from None
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(err[-1] if err else f"fetcher exited {proc.returncode}")
+    return _json.loads(proc.stdout.decode("utf-8", "replace"))
+
+
 def _coerce_weights(value: Any, current: Any) -> tuple[Any | None, str | None]:
     """Turn whatever the model sent into RoutingWeights, or explain why not.
 
@@ -1371,6 +1425,22 @@ class ForgeAgent:
         "with this that from into when then your have will does each some more "
         "need tool which what over under than make made used using".split())
 
+    @staticmethod
+    def _market_search_fetch(req: Any, budget: float) -> Any:
+        """The one place the search half reaches the network.
+
+        Named rather than inlined so a test can fake the transport without
+        faking the logic: the deadline lives in `_fetch_json_with_deadline` and
+        is pinned by its own test, while everything about *interpreting* an
+        answer stays reachable from a monkeypatch.
+        """
+        return _fetch_json_with_deadline(req, budget, ForgeAgent.MAX_MARKET_BYTES)
+
+    #: Hard ceiling on a market response body. The shelf's /resources was 52 MB
+    #: on 2026-10-23 and grows with every forge, so "read it all and parse it" is
+    #: a way to spend a gigabyte of memory on a duplicate check.
+    MAX_MARKET_BYTES = 8 * 1024 * 1024
+
     def _market_search(self, need: str, k: int = 5) -> list[dict[str, Any]]:
         """Semantic hits from the sibling market's `/search`, best-effort.
 
@@ -1400,8 +1470,11 @@ class ForgeAgent:
             # "no answer". Waiting longer costs one pre-forge step; timing out
             # costs the whole duplicate check.
             budget = float(_os.environ.get("TOOLMARKET_SEARCH_TIMEOUT") or 30.0)
-            with _url.urlopen(req, timeout=budget) as resp:
-                data = _json.loads(resp.read().decode("utf-8", "replace"))
+            # urlopen's timeout is a socket timeout, not a deadline, and the body
+            # is read unbounded (/resources measured at 52 MB on 2026-10-23). Both
+            # are fixed here: a child process does the fetch and is killed at a
+            # real wall-clock deadline.
+            data = self._market_search_fetch(req, budget)
         except Exception as exc:                          # noqa: BLE001
             self._record("market_semantic_lookup", {
                 "need": need, "ok": False,
@@ -1986,9 +2059,11 @@ class ForgeAgent:
             import urllib.request as _url
             url = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000")
             req = _url.Request(url.rstrip("/") + "/resources")
-            with _url.urlopen(req, timeout=6) as resp:
-                body = resp.read().decode("utf-8", "replace")
-            payload = _json.loads(body)
+            # Same deadline rule as /search: the shelf's /resources was measured
+            # at 52 MB on 2026-10-23, so this read is bounded in time AND size
+            # rather than trusted to finish. A socket timeout would not have
+            # covered the body read.
+            payload = _fetch_json_with_deadline(req, 6.0)
             lexical_ok = True
         except Exception as exc:                          # noqa: BLE001
             self._record("market_prelookup", {"need": need, "ok": False,
@@ -2505,7 +2580,8 @@ class ForgeAgent:
         ))
 
     def _tool_spawn(self) -> None:
-        def spawn_agent(task: str, isolated: bool = False, role: str = "") -> str:
+        def spawn_agent(task: str, isolated: bool = False, role: str = "",
+                        timeout_seconds: float = 0, context: str = "") -> str:
             if not self.policy.may_spawn_agents:
                 return "Denied by autonomy policy: may_spawn_agents is off."
             mode = ShareMode.ISOLATED if isolated else ShareMode.SHARED
@@ -2554,12 +2630,17 @@ class ForgeAgent:
                     brief = role_brief(known)
 
             rec = self.spawner.spawn(task, mode=mode, restrict_to=allowed,
-                                     role=role_name, brief=brief)
+                                     role=role_name, brief=brief,
+                                     timeout_seconds=timeout_seconds or None,
+                                     context=context)
             self._record("spawn", rec.to_dict())
             if rec.error:
                 return f"Child failed: {rec.error}"
 
-            bits = [f"Child {rec.child_id} finished in {rec.finished - rec.started:.1f}s."]
+            bits = [f"Child {rec.child_id} {rec.state} in {rec.finished - rec.started:.1f}s."]
+            if rec.timed_out:
+                bits.append(f"It ran past its {rec.timeout_seconds:.0f}s budget, so "
+                            f"its answer is partial and the state says so.")
             if role:
                 scope = ", ".join(allowed) if allowed else "unrestricted by name"
                 bits.append(f"Ran as '{role_name}', scoped to: {scope}.")
@@ -2585,6 +2666,13 @@ class ForgeAgent:
                          "description": "a node id (or role name) from the current "
                                         "topology; restricts the child to that node's "
                                         "tools_whitelist (omit for unrestricted)"},
+                "timeout_seconds": {"type": "number",
+                                    "description": "wall-clock budget; a child that "
+                                                   "overruns it is recorded INTERRUPTED "
+                                                   "rather than returned as a success"},
+                "context": {"type": "string",
+                            "description": "task facts the child needs that its role "
+                                           "cannot imply (paths, ids, what was tried)"},
             }, "required": ["task"]},
             fn=spawn_agent, source="builtin", tags=["meta"],
         ))

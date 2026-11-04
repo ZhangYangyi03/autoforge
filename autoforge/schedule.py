@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -122,6 +122,14 @@ class Task:
     runs: int = 0
     failures: int = 0
     cancelled: bool = False
+    # Stuck, not just overdue. A task that fails N times in a row is skipped
+    # rather than retried forever: a permanently broken task retried every
+    # hour buries the one that would have worked, and the operator sees a
+    # silent agent rather than a loud failure. `auto_disable_after` is per
+    # task so a deliberately-flaky job can opt out with 0.
+    consecutive_failures: int = 0
+    auto_disable_after: int = 5
+    disabled_reason: str = ""
     notes: list[str] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -183,7 +191,12 @@ class Schedule:
                 continue
             try:
                 data = json.loads(line)
-                task = Task(**data)
+                # Filter to known fields instead of refusing the line: a record
+                # written before a field existed (or by a newer version) would
+                # otherwise be skipped as unreadable, which loses the task
+                # silently -- the worst of the three outcomes.
+                known = {f.name for f in fields(Task)}
+                task = Task(**{k: v for k, v in data.items() if k in known})
             except (ValueError, TypeError):
                 bad += 1
                 continue
@@ -254,6 +267,22 @@ class Schedule:
         task.last_run = now
         if not ok:
             task.failures += 1
+            task.consecutive_failures += 1
+        else:
+            # A success clears the streak: the question is "is it broken NOW",
+            # not "has it ever failed", and a task that fails once a week for a
+            # year is working.
+            task.consecutive_failures = 0
+        if (task.auto_disable_after > 0
+                and task.consecutive_failures >= task.auto_disable_after
+                and not task.cancelled):
+            # Disabled, not deleted: the record and the notes stay, so the next
+            # run can say WHY it stopped instead of finding an empty agenda.
+            task.cancelled = True
+            task.disabled_reason = (
+                f"auto-disabled after {task.consecutive_failures} consecutive "
+                f"failures (last: {note[:160] or 'no note'})")
+            task.notes.append(task.disabled_reason[:500])
         if note:
             task.notes.append(note[:500])
             del task.notes[:-10]

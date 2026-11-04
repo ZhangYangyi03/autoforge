@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import io
 import json
+
+import pytest
 from types import SimpleNamespace
 
 import urllib.request
@@ -29,6 +31,39 @@ import urllib.request
 from autoforge.agent import ForgeAgent
 from autoforge.autonomy.policy import FULL_FREEDOM
 from autoforge.core.llm import MockLLMClient
+
+
+@pytest.fixture(autouse=True)
+def _inprocess_fetch(monkeypatch):
+    """Keep the pre-lookup's HTTP in this process, where a test can fake it.
+
+    The fetch runs in a child process (`_fetch_json_with_deadline`) so a peer
+    that never answers cannot hold a forge past its budget -- a real fix, which
+    also put the call beyond the reach of `monkeypatch.setattr(urllib.request,
+    "urlopen", ...)`. That silently turned "the shelf is unreachable" into "the
+    shelf answered nothing", and this file's central claim went untested while
+    still passing. Routing it back through urlopen here restores the seam the
+    tests were written against; the deadline itself is pinned separately.
+    """
+    import autoforge.agent as _agent_mod
+    import urllib.request as _url
+
+    def _inprocess(req, budget, limit=None):
+        if limit is None:
+            limit = _agent_mod.ForgeAgent.MAX_MARKET_BYTES
+        # `read()` with no argument, deliberately: these fakes' _Resp object
+        # does not accept one, and the size cap belongs to the real transport
+        # (pinned in test_market_deadline.py), not to the seam under test here.
+        with _url.urlopen(req, timeout=float(budget)) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    # `_market_search` was already delegating to a module-level name, which these
+    # tests patch. Point that name at the same in-process fetch, or the search
+    # half keeps going out to the real shelf and the fakes never see it.
+    monkeypatch.setattr(_agent_mod.ForgeAgent, "_market_search_fetch",
+                        staticmethod(_inprocess), raising=False)
+
+    monkeypatch.setattr(_agent_mod, "_fetch_json_with_deadline", _inprocess)
 
 
 def _agent() -> ForgeAgent:
