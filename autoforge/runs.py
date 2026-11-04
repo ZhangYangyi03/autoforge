@@ -620,6 +620,51 @@ def _next_step(mark: Mark) -> str:
     return "continue the task"
 
 
+def same_task(a: str, b: str) -> bool:
+    """Whether two stored tasks are the same request typed twice.
+
+    Whitespace-insensitive and case-sensitive on purpose: the operator re-types
+    a short task ("继续", "你又断了") when a run dies, and those must pair up,
+    while two genuinely different tasks must not be merged because they start
+    with the same word.
+    """
+    return " ".join((a or "").split()) == " ".join((b or "").split())
+
+
+def supersede(root: str | os.PathLike[str] | None = None) -> dict[str, str]:
+    """Drop the older copy of a task that has a newer one, and say which went.
+
+    The operator's own behaviour makes this necessary: when a run dies they
+    type the same thing again. The typing starts a *new* run, and the old
+    record stays on disk looking resumable -- so the report listed "你又断了"
+    three times and "继续" a dozen, and `resume_run` with no id, whose contract
+    is "the one stranded longest", kept handing back the oldest copy of a task
+    the newer session had already answered. Resuming it replays a conversation
+    that is superseded, which is worse than useless: it is the same work twice.
+    """
+    marks = unfinished(root)
+    newest: dict[str, Mark] = {}
+    dropped: dict[str, str] = {}
+    for mark in sorted(marks, key=lambda m: m.updated_at, reverse=True):
+        key = " ".join((mark.task or "").split())
+        if not key:
+            continue
+        keeper = newest.get(key)
+        if keeper is None:
+            newest[key] = mark
+            continue
+        try:
+            # `root` is threaded through, not defaulted: without it the delete
+            # targets the real journal directory while the scan read somewhere
+            # else, and the two disagree silently -- the record stays, the
+            # report says it went.
+            _path(mark.run_id, root).unlink()
+            dropped[mark.run_id] = keeper.run_id
+        except OSError:
+            pass
+    return dropped
+
+
 def resumable(root: str | os.PathLike[str] | None = None, *,
               now: float | None = None, settle_s: float = SETTLE_S) -> list[Mark]:
     """The records worth picking up right now, oldest first.

@@ -98,6 +98,39 @@ class LLMAborted(InterruptedError):
     """
 
 
+class LLMEmptyReply(LLMError):
+    """The endpoint answered 200, and the reply held nothing at all.
+
+    No content, no tool calls, no reasoning -- `choices[0].message` dressed as
+    a completion with the message left out. Every other reply failure in this
+    module is loud: a bad status raises, a non-JSON body raises, a choice of
+    the wrong type raises. This one was silent, and silence is the shape that
+    cost a whole session.
+
+    Observed on 2026-11-04: the assistant message was written to the
+    transcript with empty content and no tool calls, and the loop, having
+    nothing to act on, ended the turn and printed a blank `agent>`. To the
+    person typing it read as "又断了" -- the run had not crashed, it had
+    accepted nothing as an answer. Retrying is the right response: an empty
+    body is a provider hiccup, not a verdict on the question.
+    """
+
+
+def _has_payload(resp: Any) -> bool:
+    """Whether a response carries anything a caller can act on.
+
+    Content, tool calls, or a reasoning trace. The trace counts because a
+    reasoning model that answered inside its thinking and stopped on the cap
+    has written *something*; throwing that away and retrying would ask the
+    same expensive question again for no new information.
+    """
+    return bool(
+        (getattr(resp, "content", "") or "").strip()
+        or getattr(resp, "tool_calls", None)
+        or (getattr(resp, "reasoning", "") or "").strip()
+    )
+
+
 def _any_predicate(
     own: Callable[[], bool] | None,
     attached: Callable[[], bool] | None,
@@ -593,6 +626,24 @@ class OpenAICompatClient(LLMClient):
                     f"(HTTP {resp.status_code}): {(resp.text or '')[:200]!r}"
                 ) from exc
             parsed = self._to_response(body)
+            try:
+                choice_reason = body["choices"][0].get("finish_reason")
+            except Exception:                 # noqa: BLE001 - absent is a fact too
+                choice_reason = None
+            # A 200 with an empty message is the one failure that used to be
+            # silent -- see LLMEmptyReply. It is retried, not returned: the
+            # caller asked a question and got no answer, and handing that
+            # through ends the turn on a blank `agent>` line, which reads to
+            # the operator as the session having stopped.
+            if not _has_payload(parsed):
+                if not final:
+                    self._wait_before_retry(attempt, resp)
+                    continue
+                raise LLMEmptyReply(
+                    f"{self.name}: empty reply after {attempt} attempt(s) -- "
+                    f"HTTP {resp.status_code}, finish_reason="
+                    f"{(choice_reason or 'absent')!r}, no content, no tool calls"
+                )
             account_usage(self.usage_total, parsed)
 
             # An empty completion is usually a provider hiccup, and hiccups are

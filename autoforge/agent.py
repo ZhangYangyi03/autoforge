@@ -3530,6 +3530,14 @@ class ForgeAgent:
             if status != "resumable":
                 raise ValueError(f"run {mark.run_id} is {status}: {reason}")
         else:
+            # Retired duplicates first: the same task re-typed after a crash
+            # leaves one record per attempt, and without this the "oldest
+            # resumable" contract hands back the *oldest copy* of a task -- a
+            # conversation a later session already carried to its end.
+            try:
+                runs_mod.supersede()
+            except Exception:                     # noqa: BLE001 - never block a resume
+                pass
             pick = runs_mod.resumable()
             if not pick:
                 raise ValueError(
@@ -3554,8 +3562,36 @@ class ForgeAgent:
 
         def runs_status() -> str:
             """What is unfinished, with the reason each record is or is not
-            resumable. Reads; never resumes anything."""
-            return runs_mod.report()
+            resumable. Reads; never resumes anything.
+
+            Records that are the *same task* as a newer record are dropped
+            first. The operator re-types a dead task instead of resuming it, so
+            every retype left its predecessor on disk looking resumable, and
+            the list grew a duplicate per attempt -- which is how "resume the
+            one stranded longest" kept returning a conversation a later session
+            had already finished.
+            """
+            try:
+                # Records past the 7-day resume limit go first: they cannot be
+                # resumed, so listing them as "unfinished" is a backlog that
+                # only ever grows. `prune` keeps a merely-stale record, which is
+                # the distinction that matters -- spent resume budget is
+                # evidence, an expired TTL is clutter.
+                expired = runs_mod.prune()
+                superseded = runs_mod.supersede()
+            except Exception:                     # noqa: BLE001 - a report never fails
+                expired, superseded = [], {}
+            text = runs_mod.report()
+            notes = []
+            if superseded:
+                notes.append(f"{len(superseded)} older record(s) of a task that "
+                             f"was re-typed dropped")
+            if expired:
+                notes.append(f"{len(expired)} record(s) past the 7-day resume "
+                             f"limit removed")
+            if notes:
+                text += "\n(" + "; ".join(notes) + ")"
+            return text
 
         def resume_run(run_id: str = "", task_text: str = "") -> str:
             """Pick up where an interrupted run stopped and carry it on.

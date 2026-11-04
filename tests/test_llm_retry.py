@@ -119,10 +119,27 @@ def test_exhausting_the_attempts_re_raises_the_real_error(monkeypatch):
     assert sender.attempts == 3
 
 
-def test_the_last_empty_answer_is_returned_rather_than_raised(monkeypatch):
-    """An empty body still carries `finish_reason`, which explains it better."""
+def test_the_last_empty_answer_raises_instead_of_ending_the_turn(monkeypatch):
+    """An empty body is retried, and the last one is an error -- not an answer.
+
+    This test used to assert the opposite: that `""` was returned, on the
+    grounds that the body's `finish_reason` explains it. The reasoning was
+    fine and the consequence was not. A returned empty string is written into
+    the transcript as an assistant message with no content and no tool calls;
+    the loop has nothing to act on, the turn ends, and the operator sees a
+    blank `agent>` line. On 2026-11-04 that is what "又断了" was -- not a
+    crash, a session that accepted silence as a reply, over and over.
+
+    Retrying is the right answer (a 200 with nothing in it is a provider
+    hiccup, not a verdict), and raising on the last attempt is what makes the
+    failure visible instead of mute.
+    """
     sender = _wire(monkeypatch, _Resp(200, ""), _Resp(200, ""), _Resp(200, ""))
-    assert _ask(_client()) == ""
+    try:
+        _ask(_client())
+        raise AssertionError("three empty answers should have raised")
+    except llm.LLMEmptyReply as exc:
+        assert "finish_reason" in str(exc)
     assert sender.attempts == 3
 
 
