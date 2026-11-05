@@ -76,6 +76,12 @@ class ToolRegistry:
         self.auto_quarantine = auto_quarantine
         # -- post-execute guards (guards.py, ported from deepseek-harness) --
         self._repeat = RepeatGuard()
+        #: What the post-call guards have done to this registry, in totals. The
+        #: events above say *which* call; this says how much, and it is the only
+        #: number that survives when nobody reads the event list.
+        self._guards: dict[str, int] = {
+            "spilled": 0, "chars_omitted": 0, "repeat_warned": 0, "errors": 0,
+        }
         self._spill_name = ""
         #: Characters of a tool result kept inline. 0 disables spilling, which
         #: is the upstream default too ("omitting the cap disables retention").
@@ -337,16 +343,35 @@ class ToolRegistry:
         appears to have failed, so the whole thing is wrapped and a guard that
         raises is logged and skipped.
         """
+        # `name`, not `self._spill_name`: the live registry passes the tool being
+        # called. Writing every guard event under one synthetic name meant a
+        # count of what the guards had done could not be attributed to any tool,
+        # which is indistinguishable from having no count at all.
         try:
-            out = spill(self._spill_name, out, max_chars=self.spill_max_chars)
-            reminder = self._repeat.observe(self._spill_name, arguments)
+            out, report = spill(name, out, max_chars=self.spill_max_chars)
+            if report:
+                self._guards["spilled"] += 1
+                self._guards["chars_omitted"] += report["omitted"]
+                self._log("spill", name, report)
+            reminder = self._repeat.observe(name, arguments)
         except Exception as exc:  # noqa: BLE001 - a guard must not break a call
-            self._log("guard", self._spill_name, {"error": f"{type(exc).__name__}: {exc}"})
+            self._log("guard", name, {"error": f"{type(exc).__name__}: {exc}"})
             return out
         if reminder:
-            self._log("repeat_guard", self._spill_name, {"count": self._repeat._count})
+            self._guards["repeat_warned"] += 1
+            self._log("repeat_guard", name, {"count": self._repeat._count})
             out = (out.rstrip() + "\n\n" + reminder) if out else reminder
         return out
+
+    def guard_stats(self) -> dict[str, int]:
+        """How often the post-call guards fired, and how much they took out.
+
+        `spilled` is the count of results that came back too large to show
+        whole; `chars_omitted` is the total size of what was replaced by a
+        notice. Together they are the answer to "are these guards doing
+        anything", asked once per session instead of never.
+        """
+        return dict(self._guards)
 
     def reset_repeat_chain(self) -> None:
         """Start a fresh loop-hygiene chain -- called when the operator speaks.

@@ -1121,10 +1121,29 @@ class ForgeAgent:
         if self.enable_meta_cognition:
             self.metacog = MetaCognition(self.llm, self.registry, self.pipeline)
 
+        # The delegation route is wired here, not left to a caller: the
+        # provider is what answers "which model does the child run on", and a
+        # spawner without one runs every child on the parent's model by default
+        # -- which is fine, but it means the whole backend layer (ported from
+        # hermes, 2026-11) was dead code reachable only from a test. Wired with
+        # the active/default backend so a config can switch it and an explicit
+        # `delegation.backend` that does not resolve refuses the spawn instead
+        # of quietly using `default`.
+        try:
+            from .autonomy.delegation import default_registry as _deleg_reg
+            _deleg_config = dict(getattr(self, "delegation_config", None) or {})
+            _deleg = _deleg_reg().active(_deleg_config)
+        except Exception:                    # noqa: BLE001 - see below
+            # A backend that cannot resolve must not take the agent down with
+            # it: spawning is one capability of many, and refusing to construct
+            # the agent would turn a routing problem into a total outage.
+            _deleg, _deleg_config = None, {}
         self.spawner = Spawner(
             registry=self.registry,
             agent_factory=_default_agent_factory(self),
             policy=self.policy,
+            delegation=_deleg,
+            delegation_config=_deleg_config,
         )
 
         self.topology_designer = TopologyDesigner(self.llm)
@@ -3183,6 +3202,26 @@ class ForgeAgent:
 
             if not self.policy.unenforced:
                 lines.append("Every 'off' in this policy is a gate you can watch close.")
+
+            # The post-call guards, reported where they are already relevant:
+            # they are reach, not policy -- they change what a tool's result
+            # looks like -- and until this block existed they fired silently
+            # and nobody could say whether they had ever fired at all.
+            try:
+                g = self.registry.guard_stats()
+            except Exception:                       # noqa: BLE001
+                g = None
+            if g:
+                lines += [
+                    "",
+                    "Post-call guards (ported from the harness trees):",
+                    f"  spilled {g['spilled']} result(s), {g['chars_omitted']:,} "
+                    f"chars replaced by a notice",
+                    f"  repeat-loop reminder shown {g['repeat_warned']} time(s)",
+                ]
+                if not g["spilled"] and not g["repeat_warned"]:
+                    lines.append("  (neither has fired this session -- they are"
+                                 " watching, not idle)")
             return "\n".join(lines)
 
         self._add(ToolSpec(
@@ -5472,13 +5511,26 @@ class ForgeAgent:
             # Per call, via `replace`: the sandbox is shared with the forge and
             # the verifier, so a timeout written onto it would outlive the call
             # that asked for it and rewrite someone else's budget.
-            # A snippet yields to ANY line from the operator, not only to
-            # `/stop`. This is the one long step where giving way costs
-            # nothing: the code is re-run in seconds, whereas a forge that
-            # gives way has thrown away minutes of work -- which is why the
-            # forge asks the narrower question and this does not.
+            # Only a real /stop may kill a running snippet. A question typed
+            # mid-run must be answered at the loop boundary, not by destroying
+            # work already in flight: `run_python` is how every long backtest,
+            # large file read and data pull runs on this host, and aborting one
+            # loses 10-60 seconds of real computation plus its output file.
+            #
+            # Measured 2026-11-05: the operator asked "咋样" while a 30-second
+            # TCA replay was running; `_operator_should_yield` answered True
+            # (has_pending), the sandbox killed the child, and the round ended
+            # with "stopped by the operator before it finished". The agent then
+            # answered the question in words and never resumed the replay.
+            # The forge had been using the narrow predicate for weeks; this
+            # call site was the one still wired to the cheap one.
+            #
+            # A /stop still reaches it: `stop_requested` is polled inside the
+            # sandbox on every beat, so the operator's kill switch is intact.
+            # Cheap model calls keep `_operator_should_yield` -- aborting a
+            # request costs nothing and is how a question gets a fast answer.
             box = replace(self.sandbox, timeout=cap,
-                          abort_check=self._operator_should_yield)
+                          abort_check=self._operator_wants_the_floor)
             try:
                 res = box.run(wrapped, "main")
             except Exception as exc:                              # noqa: BLE001

@@ -131,8 +131,15 @@ def spill_output(
     *,
     max_chars: int = 24_000,
     spill_dir: str | None = None,
-) -> str:
+) -> tuple[str, dict[str, Any] | None]:
     """Bound an oversized tool result to a head/tail preview plus a file path.
+
+    Returns `(text, report)`. `report` is None when nothing was spilled, and a
+    dict describing what was cut and where it went otherwise -- so the caller
+    can write down that the guard fired. It used to return the text alone,
+    which made a guard that fired indistinguishable from one that did not, and
+    the whole pool of them silent: the only trace on this host was a directory
+    of files nobody had a count of.
 
     `max_chars` is deliberately a character budget and not a token estimate:
     this registry has no tokenizer, and a wrong token count would silently
@@ -143,7 +150,7 @@ def spill_output(
     while trying to make it smaller is worse than no guard.
     """
     if max_chars <= 0 or not isinstance(output, str) or len(output) <= max_chars:
-        return output
+        return output, None
 
     try:
         base = spill_dir or os.path.join(tempfile.gettempdir(), "autoforge-spill")
@@ -155,7 +162,7 @@ def spill_output(
             with open(path, "w", encoding="utf-8", errors="replace") as fh:
                 fh.write(output)
     except Exception:
-        return output                    # best effort: keep it all rather than drop it
+        return output, None              # best effort: keep it all rather than drop it
 
     notice_reserve = 320
     budget = max(0, max_chars - notice_reserve)
@@ -168,7 +175,13 @@ def spill_output(
         f"new output or into a tool call. The complete result is at {path} -- use "
         f"run_python to read it with an offset, or to grep this path.>>\n\n"
     )
-    return output[:head_n] + notice + output[len(output) - tail_n:]
+    report = {
+        "chars_before": len(output),
+        "chars_after": head_n + tail_n,
+        "omitted": omitted,
+        "path": path,
+    }
+    return output[:head_n] + notice + output[len(output) - tail_n:], report
 
 
 def is_spill_notice(text: str) -> bool:

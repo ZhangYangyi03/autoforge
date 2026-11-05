@@ -120,6 +120,16 @@ JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+#: Put a process into this job *outside* its limits and outside
+#: KILL_ON_JOB_CLOSE, by starting it under a freshly created intermediate job
+#: that is itself breakaway. Windows already ships the mechanism: a process
+#: created with CREATE_BREAKAWAY_FROM_JOB leaves its current job when that job
+#: allows breakaway, and the nested job can be configured to allow it. This is
+#: what a deliberately long-lived child needs (a session, a watcher); it is
+#: NOT the default, because the default is what stops a forged tool leaving a
+#: daemon behind.
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
 
 _JobObjectExtendedLimitInformation = 9
@@ -443,6 +453,20 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
                 except BaseException as exc:   # noqa: BLE001
                     box["exc"] = exc
                 finally:
+                    # The child is reaped before the pipes are touched. On
+                    # Windows `communicate()` returns as soon as the stdout
+                    # read hits EOF -- which happens the instant the child
+                    # closes its end, *before* it exits. Closing the pipes at
+                    # that moment pulls stdio out from under a process still
+                    # finishing its teardown; measured 2026-11-05, that left
+                    # `_runner.py` alive holding the job directory, which then
+                    # made the *next* run_python fail with WinError 32 on a
+                    # temp dir that could not be removed.
+                    try:
+                        proc.wait(timeout=5)
+                    except BaseException:      # noqa: BLE001
+                        pass
+
                     # The pipes are closed here, not left to the child. A
                     # `communicate()` that is still parked in `fh.read()` when
                     # this call returns owns the only thing that would ever
