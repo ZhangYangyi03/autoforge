@@ -26,6 +26,12 @@ from .message import Message, ToolCall
 #: enough that the polling itself is invisible.
 _POLL_SECONDS = 0.25
 
+#: Floor for the whole-call ceiling in `_post_watchable`. A slow but honest
+#: gateway can legitimately take a while on a large prompt; twice the read
+#: timeout is the rule, and this keeps a tiny configured timeout from turning
+#: every ordinary call into a spurious abort.
+_MIN_CALL_CEILING_S = 120.0
+
 
 def _sleep(seconds: float) -> None:
     """Indirection so tests can make retry backoff instant."""
@@ -95,6 +101,23 @@ class LLMAborted(InterruptedError):
     its way is no longer the answer being asked for. The caller is expected to
     fold the operator's line into the conversation and ask again -- which is
     why this carries no partial content.
+    """
+
+
+class LLMTimeout(LLMError):
+    """A call was abandoned because it outlived its wall-clock ceiling.
+
+    Distinct from the transport's own timeout on purpose. ``requests`` times out
+    on *idleness* -- no byte for N seconds -- and a peer that trickles slowly, or
+    a connection that went half-dead with its socket still open, never trips it.
+    Measured on this host 2026-11-05: a live session sat with a request in
+    flight for 313 seconds and `Get-NetTCPConnection` showed no connection at
+    all; `requests` would have waited forever.
+
+    It subclasses ``LLMError`` because the right response is the ordinary one:
+    the endpoint did not work, so fail over or retry. It is *not* a quiet
+    failure and must not be swallowed -- the whole point is that this used to
+    become a silent hang nobody could see.
     """
 
 
@@ -188,9 +211,13 @@ def _post_watchable(
     it finishes on its own, and the worker is a daemon so a process exit never
     blocks on it.
     """
-    if should_abort is None and on_wait is None:
-        return requests.post(endpoint, headers=headers, json=payload,
-                             timeout=timeout, proxies=proxies)
+    # Always through the watchdog, even when nobody is watching. The fast path
+    # used to be "no watcher -> plain requests.post", which made the one case
+    # with no human in the loop the one case with no ceiling -- a hang there is
+    # invisible by construction, because there is nobody to notice it and no
+    # poller to consult. `on_wait` stays None here so the caller is not given
+    # progress it did not ask for; the ceiling is not progress reporting.
+    _ = should_abort  # None is a valid "never abort on input" predicate below
 
     done = threading.Event()
     box: dict[str, Any] = {}
@@ -206,13 +233,39 @@ def _post_watchable(
 
     threading.Thread(target=_worker, daemon=True).start()
     started = time.time()
+    # A wall-clock ceiling on the *whole* call, not just on one socket read.
+    #
+    # `timeout=timeout` is a per-read and per-connect limit, and on this host it
+    # is not enough: measured 2026-11-05, a live session sat with a request in
+    # flight for 313 seconds -- no connection left in `Get-NetTCPConnection`, no
+    # child process, two threads in `Wait/UserRequest`, the ledger silent -- and
+    # `requests` never raised, because nothing was ever *idle* long enough for
+    # its read timeout to fire. A half-dead connection that trickles a byte now
+    # and then holds a peer open indefinitely under that timeout.
+    #
+    # The loop above polls `should_abort`, which means it only had one way out:
+    # the operator speaking. If they were not typing, the request had no exit at
+    # all. Waiting forever is the one failure the person at the terminal cannot
+    # see, cannot correct, and reads as "it crashed". Abandoning is safe: a
+    # completion has no side effect to undo, and the worker is a daemon.
+    ceiling = max(2.0 * float(timeout or 0.0), _MIN_CALL_CEILING_S)
     while not done.wait(_POLL_SECONDS):
+        elapsed = time.time() - started
         if on_wait is not None:
-            on_wait(time.time() - started)
+            on_wait(elapsed)
         if should_abort is not None and should_abort():
             raise LLMAborted(
-                f"abandoned a model call in flight after {time.time() - started:.1f}s "
+                f"abandoned a model call in flight after {elapsed:.1f}s "
                 "because the operator said something"
+            )
+        if elapsed > ceiling:
+            raise LLMTimeout(
+                f"the model call was abandoned after {elapsed:.1f}s with no "
+                f"complete response (ceiling {ceiling:.0f}s = 2x the {timeout:.0f}s "
+                "read timeout). The connection was still open but delivering "
+                "nothing, so the per-read timeout could not fire. Retrying is "
+                "the right next move; the endpoint is slow or half-dead, not "
+                "the request."
             )
     if "exc" in box:
         raise box["exc"]
