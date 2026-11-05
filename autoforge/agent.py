@@ -6422,6 +6422,26 @@ class ForgeAgent:
         # that needs it is exactly the run whose first turn would otherwise miss
         # it. Set here rather than inside the loop: this is where the task is.
         self.registry.protect = self._hot_protect()
+        # The usage counters belong to the run, not to the agent. They live on
+        # the client, the client outlives every run, and nothing used to zero
+        # them -- so a session that had been up for a day reported the running
+        # total as if it were the cost of the task in front of it. The ledger
+        # shows the shape: a run with `turns: 2` carrying 1.6e8 prompt tokens,
+        # each new run inheriting all of the previous ones. Zeroed here, at the
+        # one point every run passes through, rather than in the loop, where
+        # resume would zero a partially-spent run's own counters.
+        try:
+            from .core.llm import new_usage_totals as _new_totals
+            # Not `self.llm.usage_total = ...`: on a FailoverClient that name is
+            # a read-only property that sums the clients behind it, so assigning
+            # to it raises and a bare `except` would hide the fact that nothing
+            # was reset. Zero every endpoint the chain can serve from.
+            targets = getattr(self.llm, "clients", None) or [self.llm]
+            for _c in targets:
+                if getattr(_c, "usage_total", None):
+                    _c.usage_total = _new_totals()
+        except Exception:                          # noqa: BLE001
+            pass
         try:
             return self._run_locked(task, history, _emit, journal=journal_obj)
         finally:
