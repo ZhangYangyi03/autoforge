@@ -34,6 +34,9 @@ class ToolAborted(Exception):
     """
 
 
+from .guards import RepeatGuard, spill_output as spill
+
+
 @dataclass
 class ToolResult:
     name: str
@@ -71,6 +74,12 @@ class ToolRegistry:
         self.quarantine_success_rate = quarantine_success_rate
         self.quarantine_consecutive_failures = quarantine_consecutive_failures
         self.auto_quarantine = auto_quarantine
+        # -- post-execute guards (guards.py, ported from deepseek-harness) --
+        self._repeat = RepeatGuard()
+        self._spill_name = ""
+        #: Characters of a tool result kept inline. 0 disables spilling, which
+        #: is the upstream default too ("omitting the cap disables retention").
+        self.spill_max_chars = 24000
         # -- the autonomy gate (see autonomy/confirm.py) -----------------
         # `call` is the one place every tool actually runs, which is why the
         # confirmation gate lives here rather than in each tool: a freedom the
@@ -296,6 +305,7 @@ class ToolRegistry:
             # a success with the real error buried in a string.
             if isinstance(out, ToolResult):
                 out.duration_ms = (time.perf_counter() - started) * 1000
+                out.output = self._after_call(name, arguments, out.output)
                 spec.stats.record_call(out.ok, out.error)
                 if self.auto_quarantine:
                     self._maybe_quarantine(spec)
@@ -314,7 +324,38 @@ class ToolRegistry:
         spec.stats.record_call(ok, err)
         if self.auto_quarantine:
             self._maybe_quarantine(spec)
+        out = self._after_call(name, arguments, out)
         return ToolResult(name, ok, out, err, duration)
+
+    # -- post-execute guards -------------------------------------------
+    def _after_call(self, name: str, arguments: dict[str, Any], out: str) -> str:
+        """Bound the output and nudge a model that is stuck in a loop.
+
+        Both guards are ported from the harness trees (see tools/guards.py) and
+        both are advisory: neither one fails a call, blocks one, or removes a
+        result the model needs. A broken guard must never be the reason a tool
+        appears to have failed, so the whole thing is wrapped and a guard that
+        raises is logged and skipped.
+        """
+        try:
+            out = spill(self._spill_name, out, max_chars=self.spill_max_chars)
+            reminder = self._repeat.observe(self._spill_name, arguments)
+        except Exception as exc:  # noqa: BLE001 - a guard must not break a call
+            self._log("guard", self._spill_name, {"error": f"{type(exc).__name__}: {exc}"})
+            return out
+        if reminder:
+            self._log("repeat_guard", self._spill_name, {"count": self._repeat._count})
+            out = (out.rstrip() + "\n\n" + reminder) if out else reminder
+        return out
+
+    def reset_repeat_chain(self) -> None:
+        """Start a fresh loop-hygiene chain -- called when the operator speaks.
+
+        A new message from the operator is the one event that makes a repeated
+        call legitimate again, which is exactly why upstream keys the reset on
+        a user prompt rather than on a timer.
+        """
+        self._repeat.reset()
 
     # -- the autonomy gate ---------------------------------------------
     def _gate(self, spec: ToolSpec, name: str,

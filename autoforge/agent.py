@@ -36,6 +36,7 @@ import sys
 import threading
 import textwrap
 import time
+import threading as _threading
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -2049,6 +2050,15 @@ class ForgeAgent:
         while `/resources` answers is a partial answer, and it is reported as
         partial rather than as either extreme.
         """
+        # A pre-lookup is advice, and advice may not cost the forge its
+        # latency. Measured 2026-11: /resources is 52 MB and /search runs an
+        # LLM pass, so on a busy shelf the *pre-forge* lookup alone spent more
+        # than ten seconds -- before the forge itself had started. 6s is the
+        # cap on the whole leg; past it the forge runs without the advice and
+        # says so, which is the only ordering in which a lookup can never turn
+        # a working forge into a hung one.
+        _deadline = time.monotonic() + float(__import__("os").environ.get(
+            "TOOLMARKET_PRELOOKUP_BUDGET", "6"))
         shelf_size = None
         lexical_ok = False
         lexical: list[str] = []
@@ -2063,7 +2073,8 @@ class ForgeAgent:
             # at 52 MB on 2026-10-23, so this read is bounded in time AND size
             # rather than trusted to finish. A socket timeout would not have
             # covered the body read.
-            payload = _fetch_json_with_deadline(req, 6.0)
+            payload = _fetch_json_with_deadline(
+                req, max(0.5, _deadline - time.monotonic()))
             lexical_ok = True
         except Exception as exc:                          # noqa: BLE001
             self._record("market_prelookup", {"need": need, "ok": False,
@@ -2083,6 +2094,10 @@ class ForgeAgent:
                 "need": need, "ok": True, "shelf_size": shelf_size,
                 "hits": lexical})
 
+        if time.monotonic() >= _deadline:
+            self._record("market_prelookup", {"need": need, "ok": False,
+                                              "skipped": "budget_spent"})
+            return ""
         semantic = self._market_search(need)
         # Peers are asked even -- especially -- when the local shelf is dead.
         # Written the other way first, and a test with the local shelf refused
@@ -2436,7 +2451,30 @@ class ForgeAgent:
             # a day with zero executions -- 158 forges, no pre-forge lookup --
             # because it was written as a principle and never as a call site.
             # A principle is not a gate. This is the call site.
-            shelf = self._prelookup_market(need)
+            # A pre-lookup is advice, and advice may not cost the forge its
+            # whole round. Measured 2026-11: /resources is 52 MB and /search
+            # runs an LLM pass, so on a busy shelf this leg alone ran past ten
+            # seconds and the forge it was meant to help never started. It now
+            # runs in its own thread under the same deadline the lookup itself
+            # enforces, so a shelf that ignores its own budget cannot hold the
+            # forge either. A prelookup that misses is a forge without advice,
+            # never a forge that does not happen.
+            shelf = ""
+            _advice = _threading.Thread(
+                target=lambda: _advice_box.__setitem__(0, self._prelookup_market(need)),
+                daemon=True)
+            _advice_box = [""]
+            try:
+                _advice.start()
+                _advice.join(float(__import__("os").environ.get(
+                    "TOOLMARKET_PRELOOKUP_BUDGET", "6")) + 1.5)
+                shelf = _advice_box[0] if not _advice.is_alive() else ""
+                if not shelf and _advice.is_alive():
+                    self._record("market_prelookup",
+                                 {"need": need, "ok": False, "skipped": "prelookup_overrun"})
+            except Exception as _exc:                     # noqa: BLE001
+                self._record("market_prelookup",
+                             {"need": need, "ok": False, "error": str(_exc)})
             if shelf:
                 over = (over + "\n\n" + shelf) if over else shelf
             # `replace` is left at the pipeline default (False): a forge is not

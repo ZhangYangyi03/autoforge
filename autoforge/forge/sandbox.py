@@ -130,6 +130,24 @@ _RUNNER = textwrap.dedent('''
 ''').strip()
 
 
+def _close_pipes(proc: "subprocess.Popen[bytes]") -> None:
+    """Close the std handles this process holds on a child.
+
+    A `communicate` worker blocked on a pipe whose writer is gone is the shape
+    of a hang that no timeout in this file can reach: the wait is inside the
+    read, not around it. Closing from this side turns that read into EOF, which
+    is the only thing that unblocks it.
+    """
+    for attr in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, attr, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:                 # noqa: BLE001 - already closed is fine
+            pass
+
+
 def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
     """Kill the child *and everything it started*.
 
@@ -139,7 +157,17 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
     temp directory we are about to delete. On Windows that is exactly the
     lock that turns a clean abort into a hang, so the tree is killed by pid.
     """
-    if proc.poll() is not None:
+    # No early return on `proc.poll() is not None`. That check used to skip the
+    # kill for a child that had *exited* -- and then the pipes were left open,
+    # so the `communicate` worker blocked for ever on a read whose writer was
+    # gone but whose grandchildren still held the handle. Measured 2026-11: a
+    # sandbox that timed out once could never be used again; the second run
+    # hung with zero CPU and the interpreter's own faulthandler timer never
+    # fired, because the block is a pipe read in a worker thread and not a
+    # Python-level wait. Killing the tree unconditionally is idempotent and
+    # closes the handles that make the next run work.
+    if proc.returncode is not None:
+        _close_pipes(proc)
         return
     try:
         if os.name == "nt":
@@ -339,6 +367,11 @@ class Sandbox:
                     # parent that has no console gets a *new* one, with a
                     # visible window. Every sandboxed call would flash one.
                     creationflags=_NO_CONSOLE,
+                    # See containment.py: on Windows every inheritable handle
+                    # this process owns is copied into the child, including a
+                    # previous sandbox's pipe. That is how a reader thread ends
+                    # up waiting for an EOF that never comes.
+                    close_fds=True,
                 )
             except OSError as exc:
                 return SandboxResult(
@@ -378,7 +411,11 @@ class Sandbox:
 
             if verdict is not None:
                 _kill_tree(proc)
-                done.wait(timeout=10)
+                if not done.wait(timeout=10):
+                    # The worker is still inside a pipe read. Closing the
+                    # parent's handles is the only lever that reaches it.
+                    _close_pipes(proc)
+                    done.wait(timeout=5)
                 return SandboxResult(
                     ok=False,
                     error=("aborted by the operator" if verdict == "aborted"

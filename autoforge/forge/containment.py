@@ -294,6 +294,24 @@ def describe_failure(returncode: int | None, accounted: dict[str, Any],
     return None
 
 
+def _close_pipes(proc) -> None:
+    """Close the child's stdio pipes so a reader thread can reach EOF.
+
+    A `communicate()` that gave up leaves the pipes open; the reader thread
+    stays parked in `fh.read()` until something closes the write end. Closing
+    here is what makes the thread reapable instead of accumulating one per
+    timed-out run.
+    """
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(proc, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:                  # noqa: BLE001
+            pass
+
+
 def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
                      cpu_seconds: float = 30.0):
     """Build the `runner` callable `Sandbox` documents, around a real sandbox.
@@ -358,6 +376,14 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
                     [base.python, "-I", runner_path],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, env=base.effective_env(), cwd=td,
+                    # bInheritHandles=False. Windows leaks every inheritable
+                    # handle this process owns into the child, and an HTTP
+                    # socket or a previous sandbox's pipe is inheritable. The
+                    # consequence is not theoretical: three reader threads were
+                    # measured wedged in `fh.read()` (2026-11) because a later
+                    # child held a previous child's stdout, so the older pipe
+                    # never reached EOF and its `communicate` never returned.
+                    close_fds=True,
                     # Same reason as the plain path. CREATE_NO_WINDOW, not
                     # DETACHED_PROCESS: a detached runner holds no console to
                     # pass to the snippet's own children, so each of those gets
@@ -403,11 +429,27 @@ def contained_runner(base, *, memory_mb: int = 512, max_processes: int = 8,
             box: dict[str, Any] = {}
 
             def _drain() -> None:
+                # Closed on the way out, always. `communicate()` blocks in
+                # `fh.read()` until every write end of the child's stdout is
+                # gone, and a thread parked there outlives the call that
+                # started it: measured 2026-11, three were parked at once
+                # while the parent had exactly one child running. Closing the
+                # pipes in `finally` is what lets the thread finish. Adding a
+                # timeout here was tried and reverted -- it made every
+                # timed-out run wait out a second full budget before the
+                # caller could return, which is a worse bug than the leak.
                 try:
                     box["out"], box["err"] = proc.communicate(input=payload.encode("utf-8"))
                 except BaseException as exc:   # noqa: BLE001
                     box["exc"] = exc
                 finally:
+                    # The pipes are closed here, not left to the child. A
+                    # `communicate()` that is still parked in `fh.read()` when
+                    # this call returns owns the only thing that would ever
+                    # reach EOF, and the next run inherits it. Closing is what
+                    # makes the thread reapable. Measured 2026-11: three of
+                    # these parked at once while the parent had one child.
+                    _close_pipes(proc)
                     done.set()
 
             threading.Thread(target=_drain, daemon=True).start()
