@@ -89,19 +89,44 @@ def test_probe_uses_measurement_not_assumption_for_the_target():
     assert runs, f"the host must run its own native build: {why}"
 
 
-def test_runs_here_refuses_an_isa_this_machine_does_not_have():
+#: A target no compiler can resolve. The guard's contract is "fail closed when
+#: you cannot prove a binary runs", not "know which ISAs happen to be absent
+#: from the machine running pytest". The previous version hard-coded "znver5"
+#: and assumed no host would ever report it; GitHub's ubuntu-latest runners now
+#: do exactly that, so `target == info.arch` short-circuited to True and these
+#: tests failed on the 3.10 job while the product code was correct.
+UNKNOWN_TARGET = "zz-not-a-real-march"
+
+
+def test_runs_here_fails_closed_on_an_unplaceable_target():
     """The whole point: refuse before compiling, not after crashing."""
-    runs, why = C.runs_here("znver5")
+    runs, why = C.runs_here(UNKNOWN_TARGET)
     assert not runs
-    assert "znver5" in why
+    assert UNKNOWN_TARGET in why
 
 
 def test_a_refused_target_is_refused_by_compile_too():
     """`runs_here` is not advisory — the compile path consults it."""
-    src = C.KernelSource(name="nope", code=SAXPY, target="znver5")
+    if not C.probe().compiler:
+        pytest.skip("no C compiler on this host; the fail-closed gate itself "
+                    "is covered by the test above, and CI has gcc")
+    src = C.KernelSource(name="nope", code=SAXPY, target=UNKNOWN_TARGET)
     with pytest.raises(C.KernelUnavailable) as exc:
         C.compile_kernel(src)
-    assert "znver5" in str(exc.value)
+    assert UNKNOWN_TARGET in str(exc.value)
+
+
+def test_a_kernel_built_for_this_exact_machine_is_allowed():
+    """The `target == info.arch` fast path is a real case, not a hole.
+
+    Kept as its own assertion so that making the two tests above host-independent
+    cannot silently delete coverage of the matching-arch branch that exposed
+    the original problem.
+    """
+    info = C.probe()
+    assert info.arch, "the probe must resolve an arch for this assertion to mean anything"
+    runs, why = C.runs_here(info.arch, info=info)
+    assert runs, why
 
 
 # ---------------------------------------------------------------------------

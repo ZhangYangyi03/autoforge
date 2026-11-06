@@ -7,6 +7,6 @@ authors:
     given-names: Yangyi
     affiliation: Georgetown University
 repository-code: "https://github.com/ZhangYangyi03/autoforge"
-license: Apache-2.0
+license: MIT
 type: software
 keywords: [llm agents, tool verification, self-evolving, agent framework]

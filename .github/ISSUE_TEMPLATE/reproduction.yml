@@ -1,0 +1,70 @@
+name: Independent reproduction / 独立复现
+description: Report what happened when you ran the published checks on your own machine
+title: "[repro] "
+labels: ["reproduction"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        External reproduction is the weakest part of this portfolio. A report that says
+        "these commands produced different numbers on my machine" is more valuable than
+        a star. **Both success and failure are welcome.** You do not need to send code.
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit / version
+      description: The commit hash or release you checked out.
+      placeholder: "e.g. 9debb2b or v0.4.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Output of:
+          python -c "import sys, platform; print(sys.version, platform.platform())"
+        Plus OS, CPU, compiler (`gcc --version` or `cl`), and anything non-standard.
+        CPU-kernel tests need a C compiler; on a machine without one they fail or skip.
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands and full output
+      description: Paste the exact commands and their output. A traceback is fine.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - All checks passed
+        - Some checks failed
+        - Numbers differ from what is published
+        - Could not run (dependency / data / platform)
+        - A published claim looks unsupported
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: One sentence is enough. If a number differs, give both numbers.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Confirmation
+      options:
+        - label: I ran this on a machine that is not the author's, and I am reporting what actually happened
+          required: true

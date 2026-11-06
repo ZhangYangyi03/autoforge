@@ -112,3 +112,22 @@ Open an issue with the template. The three things that make a report actionable:
 Do not open a public issue for a vulnerability: this agent runs code with real
 filesystem and network reach, so a sandbox escape is worth a private report.
 Email the maintainer at 2936745@qq.com and give it a week.
+
+## Reporting an independent reproduction
+
+Use the "Independent reproduction" issue template. This portfolio has strong
+internal verification and almost no external reproduction: a report that says
+"the full suite passed on Ubuntu 24.04 / Python 3.12" or "these 14 CPU-kernel
+tests fail on a machine without a C compiler" is more valuable than a star.
+
+What makes it actionable: the commit hash, `python -c "import sys, platform;
+print(sys.version, platform.platform())"`, the compiler version, the exact
+commands and their full output, and one sentence of expected vs actual. Please
+report a failing check before fixing it in a pull request, so the discrepancy
+is recorded.
+
+Note on the CPU-kernel tests: `tests/test_cpu.py` needs a C compiler on PATH.
+CI has gcc; a Windows machine without gcc/cl will see failures or skips in that
+file. That is an environment limitation, not a product failure -- say which it
+was in your report. See the portfolio's "External validation" section for what
+CI green does and does not establish.
