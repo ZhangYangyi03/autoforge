@@ -795,6 +795,11 @@ BUILTIN_SCOPES: dict[str, str] = {
     # tool, because that is the decision an operator made when they switched
     # it off (see modes.py's `_gated_bash` for the same reading).
     "run_python": "system",
+    # crawler-stack: fetching a URL is network egress and nothing else.
+    "crawl_fast": "network",
+    "crawl_stealth": "network",
+    "crawl_render": "network",
+    "crawl_capabilities": "read_only",
 }
 
 
@@ -1188,6 +1193,7 @@ class ForgeAgent:
         self._tool_mcp()
         self._tool_gpu()
         self._tool_cpu()
+        self._tool_crawler()
         self._tool_notify()
         self._tool_schedule()
         self._tool_mission()
@@ -4476,6 +4482,89 @@ class ForgeAgent:
     # ------------------------------------------------------------------
     # reaching a human; keeping an agenda
     # ------------------------------------------------------------------
+    def _tool_crawler(self) -> None:
+        """crawler-stack, integrated as native named tools.
+
+        The engine lives in .crawler (a vendored copy of the open-source
+        crawler-stack module) so a call does not depend on a sibling checkout.
+        Imports are lazy: on a host without aiohttp / curl_cffi / playwright
+        the tools still exist and degrade to the stdlib fallback.
+        """
+        from . import crawler as C
+
+        def _urls(value):
+            if isinstance(value, str):
+                return [u.strip() for u in value.replace(",", "\n").splitlines() if u.strip()]
+            if isinstance(value, list):
+                return [str(u) for u in value]
+            return []
+
+        def _one(kind):
+            def run(urls, concurrency=20, timeout=8, with_text=False):
+                u = _urls(urls)
+                if not u:
+                    return "INVALID: urls must be a non-empty string or list"
+                if len(u) > 500:
+                    return "INVALID: at most 500 URLs per call"
+                try:
+                    return C.report(C.crawl(u, mode=kind, concurrency=concurrency,
+                                            timeout=timeout, with_text=with_text))
+                except Exception as e:
+                    return "ERROR: " + str(e)[:200]
+            return run
+
+        common = {"urls": {"type": ["string", "array"],
+                           "description": "one URL, a comma/newline separated string, or a list of URLs (max 500)"},
+                  "concurrency": {"type": "integer", "default": 20,
+                                  "description": "max in-flight requests"},
+                  "timeout": {"type": "number", "default": 8,
+                              "description": "per-URL seconds"},
+                  "with_text": {"type": "boolean", "default": False,
+                                "description": "also extract clean article markdown via trafilatura"}}
+
+        specs = [
+            ("crawl_fast", "fast",
+             "Fetch static pages concurrently with aiohttp (highest throughput). "
+             "Returns per-URL status, bytes, title, links, text preview and rps. "
+             "Falls back to urllib when aiohttp is absent."),
+            ("crawl_stealth", "stealth",
+             "Fetch fingerprint-gated pages with curl_cffi Chrome TLS/UA "
+             "impersonation. Same result shape as crawl_fast; falls back to "
+             "urllib when curl_cffi is absent."),
+            ("crawl_render", "render",
+             "Fetch Javascript-rendered pages with headless Chromium. Each batch "
+             "runs in an isolated subprocess with a hard wall-clock guard; on a "
+             "hung browser it returns a typed error instead of blocking. "
+             "Serial page reuse is ~5.7 pages/s on this host."),
+        ]
+        for name, kind, desc in specs:
+            self._add(ToolSpec(
+                name=name, description=desc,
+                parameters={"type": "object", "properties": dict(common),
+                            "required": ["urls"]},
+                fn=_one(kind), source="builtin",
+                tags=["crawler", "network", "fetch"],
+            ))
+
+
+        def capabilities() -> str:
+            import json as _json
+            caps = C.capabilities()
+            return (_json.dumps(caps, ensure_ascii=False) + "\n"
+                    "engines: fast(aiohttp) stealth(curl_cffi) render(playwright). "
+                    "Missing engines fall back to urllib. " +
+                    "Source: autoforge/crawler.py, vendored from crawler-stack commit 6f47b35.")
+
+        self._add(ToolSpec(
+            name="crawl_capabilities",
+            description=("Report which optional engines and parsers are "
+                         "importable on this host, so a failed mode can be read "
+                         "as a missing dependency rather than a broken tool."),
+            parameters={"type": "object", "properties": {}},
+            fn=capabilities, source="builtin", tags=["crawler", "read"],
+        ))
+
+
     def _tool_notify(self) -> None:
         """Speaking to a person, over the channels the config named.
 
