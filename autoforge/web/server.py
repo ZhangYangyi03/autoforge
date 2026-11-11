@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from ..core.llm import LLMAborted
+
 __all__ = ["serve", "Harness"]
 
 STATIC = Path(__file__).parent / "static"
@@ -313,6 +315,12 @@ class Harness:
     def _run(self, session: Session, fn: Callable[[], None]) -> None:
         try:
             fn()
+        except LLMAborted:
+            # A yield, not a failure: see cli.py. The browser must not paint a
+            # red error because the operator typed mid-answer.
+            session.error = None
+            session.push(_event("system",
+                                text="heard you — picking up what you just said"))
         except Exception as exc:                                  # noqa: BLE001
             session.error = f"{type(exc).__name__}: {exc}"
             session.push(_event("error", text=session.error,

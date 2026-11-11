@@ -44,7 +44,7 @@ from . import __version__, configfile, setup_wizard
 from .agent import ForgeAgent
 from .autonomy.policy import (CONFIRM_REQUIRED, FULL_FREEDOM, SUPERVISED,
                              AutonomyPolicy)
-from .core.llm import DEFAULT_MAX_TOKENS, FailoverClient, OpenAICompatClient
+from .core.llm import DEFAULT_MAX_TOKENS, FailoverClient, LLMAborted, OpenAICompatClient
 from .core.lineedit import LineEditor
 from .core.steering import Steering
 from .forge.generator import LLMToolGenerator
@@ -1002,6 +1002,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
             except KeyboardInterrupt:
                 live.stop()
                 emit(f"\n{_c(_D, 'interrupted')}")
+                continue
+            except LLMAborted:
+                # Not a failure: the run gave its turn back because the
+                # operator spoke mid-answer. Printing it as a red `error:` was
+                # the whole "it crashed when I typed" complaint. Their line is
+                # still in the steering queue and `take_line` opens with a
+                # `get_nowait()`, so the very next turn picks it up -- nothing
+                # to drain, nothing to re-run by hand.
+                live.stop()
+                emit(_c(_D, "(heard you — picking up what you just said)"))
                 continue
             except Exception as exc:                                   # noqa: BLE001
                 live.stop()

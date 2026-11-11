@@ -215,6 +215,14 @@ class Agent:
         #: How many operator lines the last `_absorb` folded in. Reset there, so
         #: a run with no steering channel never reads a stale count.
         self._folded = 0
+        #: Set by `_yield_if_mine` at the instant this loop's own abort
+        #: predicate fires, and read by the `LLMAborted` handler. Whether an
+        #: interruption belongs to this loop is decided *when it happens*, not
+        #: by re-reading the steering queue after the exception unwound: the
+        #: queue can be drained in between, and then a line meant for this
+        #: loop is mistaken for somebody else's and re-raised to the CLI as a
+        #: red `error:` (measured 2026-11-09).
+        self._aborted_by_own_channel = False
         if allow_self_terminate:
             self._register_terminate_tool()
 
@@ -448,6 +456,21 @@ class Agent:
         except Exception:                     # noqa: BLE001 - see docstring
             return False
 
+    def _yield_if_mine(self) -> bool:
+        """The abort predicate handed to this loop's own model call.
+
+        Wraps `_operator_should_yield` so that a True result is *remembered*.
+        `LLMClient.chat` merges this with any predicate already attached to the
+        client (`abort_check`) via `_any_predicate`, so an abort can arrive here
+        from a parent loop the operator was actually addressing. The flag is
+        what tells those two apart; re-asking the steering channel after the
+        exception cannot, because by then the line may be gone.
+        """
+        if self._operator_should_yield():
+            self._aborted_by_own_channel = True
+            return True
+        return False
+
     def _operator_should_yield(self) -> bool:
         """Whether a *cheap* step should give way so the operator gets an answer.
 
@@ -545,38 +568,43 @@ class Agent:
             _notify(self.on_request, turn)
             try:
                 _req_msgs, _req_tools = self._request(msgs)
+                self._aborted_by_own_channel = False
                 resp = self.llm.chat(
                     _req_msgs, tools=_req_tools,
                     # The cheap step: a question is reason enough to go round
                     # again and answer it, because nothing is lost by asking a
                     # request twice. Long steps ask the narrower question.
-                    should_abort=self._operator_should_yield,
+                    should_abort=self._yield_if_mine,
                 )
             except LLMAborted:
                 # They spoke while the answer was in flight. Nothing has been
-                # decided yet -- no tool ran, no message was appended -- so the
-                # only correct move is to go round again, where `_absorb` folds
-                # their line into the list and the same question is asked, now
-                # informed. The turn is given back: a turn that produced no
-                # answer is not a turn spent, and counting it would let an
-                # operator's own corrections race the turn cap.
-                # Unless the abort was not this loop's to answer. A nested loop
-                # -- a verification probe agent, an adversary's attacker -- runs
-                # on the same client as the run that spawned it, so it inherits
-                # that run's abort predicate and can be woken by a line
-                # addressed to somebody else. Going round again here would spin:
-                # this loop's own channel is empty, `_absorb` has nothing to
-                # fold in, and the inherited predicate is still true, so the
-                # next call aborts immediately and forever. Only a line this
-                # loop can actually absorb is worth another turn; anything else
-                # belongs to the caller, which is where the operator's message
-                # is waiting.
-                # Asked with the same predicate the call used. Asking the
-                # narrower one here would re-raise our own question: the call
-                # aborted because there was a line to answer, and the narrow
-                # question ("did they send /stop?") is False, so the line would
-                # be thrown away as somebody else's.
-                if not self._operator_should_yield():
+                # decided yet -- no tool ran, no message was appended -- so
+                # the only correct move is to go round again, where `_absorb`
+                # folds their line into the list and the same question is
+                # asked, now informed. The turn is given back: a turn that
+                # produced no answer is not a turn spent, and counting it
+                # would let an operator's own corrections race the turn cap.
+                #
+                # But only if the interruption was ours to answer. A nested
+                # loop -- a verification probe agent, an adversary's attacker
+                # -- runs on the same client as the run that spawned it, so it
+                # inherits that run's `abort_check` and can be woken by a line
+                # addressed to somebody else. It cannot absorb that line and
+                # would spin forever, so it hands the abort back up; the forge
+                # pipeline catches it and yields.
+                #
+                # Ownership was recorded by `_yield_if_mine` at the instant
+                # the predicate fired. The old test here was
+                # `if not self._operator_should_yield(): raise`, which re-read
+                # the queue *after* the exception unwound. That raced: a
+                # sibling loop, a burst fold or `_answer_the_operator` could
+                # drain the queue in between, so a line genuinely meant for
+                # this loop read as "somebody else's", was re-raised, and the
+                # CLI painted it as `error: LLMAborted: ... the operator said
+                # something` -- the 2026-11-09 "it crashed when I typed".
+                # A loop whose own predicate fired can never spin: with the
+                # line consumed, the next call's predicate is False.
+                if not self._aborted_by_own_channel:
                     raise
                 turn -= 1
                 continue
