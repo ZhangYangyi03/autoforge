@@ -1205,6 +1205,10 @@ class ForgeAgent:
         self._tool_vision()
         self._tool_media()
         self._tool_code()
+        # Hot reload reruns this registration pass on the live agent.
+        # Bring in saved tools too, rather than waiting for a process restart.
+        if getattr(self, "store", None) is not None:
+            self._load_persisted_tools()
 
     def _import_package(self, path: str) -> str:
         """Install edited source into the running process, mid-turn.
@@ -6292,6 +6296,9 @@ class ForgeAgent:
         # reason the control plane is: a bare registry has no ledger to ask.
         if hasattr(self.registry, "last_called_source"):
             self.registry.last_called_source = self._last_called_at
+        # The CLI attaches its store after construction; load persisted tools
+        # here too, otherwise this startup path exposes only builtins.
+        self._load_persisted_tools()
         try:
             from . import egress
 
