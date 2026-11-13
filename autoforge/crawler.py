@@ -30,6 +30,39 @@ import sys
 import time
 import urllib.request
 
+def _egress():
+    """This host exits through the 七七VPN MITM proxy, whose root CA Python
+    does not trust.  Return (proxy_url_or_None, verify_ssl).  Override with
+    AUTOFORGE_CRAWLER_PROXY and AUTOFORGE_CRAWLER_VERIFY_SSL=1 (strict)."""
+    proxy = None
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        enabled, _ = winreg.QueryValueEx(k, "ProxyEnable")
+        raw, _ = winreg.QueryValueEx(k, "ProxyServer")
+        if enabled and raw:
+            if ";" in raw:
+                parts = dict(x.split("=", 1) for x in raw.split(";") if "=" in x)
+                raw = parts.get("http") or raw.split(";")[0].split("=")[-1]
+            if raw and not raw.startswith("http"):
+                raw = "http://" + raw
+            proxy = raw
+    except Exception:
+        pass
+    proxy = os.environ.get("AUTOFORGE_CRAWLER_PROXY") or proxy
+    verify = os.environ.get("AUTOFORGE_CRAWLER_VERIFY_SSL", "") == "1"
+    return proxy, verify
+
+
+def _unverified_ctx():
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 __version__ = "0.1.0"
 __all__ = ["crawl", "extract", "capabilities", "report"]
 
@@ -115,9 +148,19 @@ def extract(html, with_text=False):
 
 def _urllib_one(url, timeout):
     t = time.perf_counter()
+    proxy, verify = _egress()
+    if proxy or not verify:
+        handlers = []
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        if not verify:
+            handlers.append(urllib.request.HTTPSHandler(context=_unverified_ctx()))
+        opener = urllib.request.build_opener(*handlers).open
+    else:
+        opener = urllib.request.urlopen
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener(req, timeout=timeout) as r:
             body = r.read()
         d = {"url": url, "status": r.status, "bytes": len(body),
              "elapsed": round(time.perf_counter() - t, 3)}
@@ -133,10 +176,17 @@ def _fast(urls, concurrency, timeout, with_text):
         with concurrent.futures.ThreadPoolExecutor(min(concurrency, 16)) as ex:
             return list(ex.map(lambda u: _urllib_one(u, timeout), urls))
 
+    proxy, verify = _egress()
+
     async def run():
         import asyncio
+        # TCPConnector must be built INSIDE the running loop: aiohttp 3.x on
+        # Python 3.13 raises "no running event loop" at construction time.
+        connector = None if verify else aiohttp.TCPConnector(
+            ssl=False, limit=max(1, concurrency))
         sem = asyncio.Semaphore(max(1, concurrency))
-        async with aiohttp.ClientSession(headers={"User-Agent": _USER_AGENT}) as s:
+        async with aiohttp.ClientSession(headers={"User-Agent": _USER_AGENT},
+                                         connector=connector, proxy=proxy) as s:
             async def one(u):
                 async with sem:
                     t = time.perf_counter()
@@ -153,7 +203,15 @@ def _fast(urls, concurrency, timeout, with_text):
                                 "elapsed": round(time.perf_counter() - t, 3)}
             return await asyncio.gather(*[one(u) for u in urls])
     import asyncio
-    return list(asyncio.run(run()))
+    budget = max(20.0, min(120.0, timeout * (len(urls) / max(1, concurrency) + 1) * 1.5 + 10))
+
+    async def guarded():
+        try:
+            return await asyncio.wait_for(run(), timeout=budget)
+        except asyncio.TimeoutError:
+            return [{"url": u, "error": "batch wall-clock guard %.0fs" % budget}
+                    for u in urls]
+    return list(asyncio.run(guarded()))
 
 
 def _stealth(urls, concurrency, timeout, with_text):
@@ -162,10 +220,14 @@ def _stealth(urls, concurrency, timeout, with_text):
         with concurrent.futures.ThreadPoolExecutor(min(concurrency, 16)) as ex:
             return list(ex.map(lambda u: _urllib_one(u, timeout), urls))
 
+    proxy, verify = _egress()
     def one(u):
         t = time.perf_counter()
         try:
-            r = cr.get(u, impersonate="chrome", timeout=timeout)
+            kw = {"impersonate": "chrome", "timeout": timeout, "verify": verify}
+            if proxy:
+                kw["proxies"] = {"http": proxy, "https": proxy}
+            r = cr.get(u, **kw)
             d = {"url": u, "status": r.status_code, "bytes": len(r.content),
                  "elapsed": round(time.perf_counter() - t, 3)}
             if r.status_code == 200 and r.content:
@@ -253,15 +315,94 @@ def _render(urls, concurrency, timeout, with_text):
     except Exception as e:
         return [{"url": u, "error": "render engine: " + str(e)[:120]} for u in urls]
 
+_FETCH_WORKER = r"""
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("_crawler_child", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+cfg = json.loads(sys.stdin.read())
+res = mod.crawl_local(cfg["urls"], mode=cfg["mode"], concurrency=cfg["concurrency"],
+                      timeout=cfg["timeout"], with_text=cfg["with_text"])
+sys.stdout.write("__CRAWL_JSON__" + json.dumps(res) + "\n")
+sys.stdout.flush()
+"""
+
+
+def _isolated(mode, urls, concurrency, timeout, with_text):
+    """Run one fast/stealth batch in a CHILD interpreter and return its result.
+
+    Why: Python 3.13.13 on this host dies inside python313.dll (0xc0000005)
+    after a handful of consecutive aiohttp batches -- measured 2026-11-13 with
+    a bare aiohttp loop that never imported this module, and against a local
+    127.0.0.1 server too, so it is the interpreter's asyncio/TLS stack, not the
+    network and not the parser.  A crash in the agent's own process takes the
+    whole session with it (pids 9000 / 10988, three times in one afternoon), so
+    the fetch borrows the render engine's shape: one child per batch, a
+    wall-clock guard, and a typed error instead of a dead agent.
+
+    Returns a crawl() dict, or None when a child cannot be used at all (the
+    caller then falls back to crawl_local).
+    """
+    import json as _json
+    import os as _os
+    import subprocess
+    import sys as _sys
+
+    cfg = {"urls": list(urls), "mode": mode,
+           "concurrency": max(1, int(concurrency)), "timeout": float(timeout),
+           "with_text": bool(with_text)}
+    wall = max(20.0, min(180.0,
+                         float(timeout) * (len(urls) / max(1, int(concurrency)) + 2) + 15.0))
+    last_err = "no output"
+    for _attempt in range(2):
+        try:
+            proc = subprocess.run(
+                [_sys.executable, "-u", "-c", _FETCH_WORKER, _os.path.abspath(__file__)],
+                input=_json.dumps(cfg), capture_output=True, text=True, timeout=wall,
+                encoding="utf-8", errors="replace",
+                env=dict(_os.environ, AUTOFORGE_CRAWLER_INPROCESS="1"),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            marker = "__CRAWL_JSON__"
+            line = next((l for l in (proc.stdout or "").splitlines()
+                         if l.startswith(marker)), None)
+            if line:
+                return _json.loads(line[len(marker):])
+            last_err = ((proc.stderr or proc.stdout or "").strip()[-160:]
+                        or "rc=%s" % proc.returncode)
+        except subprocess.TimeoutExpired:
+            last_err = "child exceeded wall clock %.0fs" % wall
+        except Exception:
+            return None
+    return {"mode": mode, "count": len(urls), "elapsed": 0.0, "rps": 0.0,
+            "results": [{"url": u, "error": "fetch child: " + last_err} for u in urls]}
+
+
 def crawl(urls, mode="fast", concurrency=20, timeout=8, with_text=False):
-    """Fetch URLs concurrently. Returns a dict; per-URL errors never abort the batch.
+    """Fetch URLs concurrently, isolated in a child process. Returns a dict.
 
     urls        str or list of str; empty list -> empty results, no exception
     mode        "fast" | "stealth" | "render"
     concurrency max in-flight requests (render caps at 4)
     timeout     per-URL seconds
     with_text   also run trafilatura for clean article markdown
+
+    AUTOFORGE_CRAWLER_INPROCESS=1 forces the old in-process behaviour, so a
+    test can still see a crash instead of a child's exit code.
     """
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [str(u) for u in urls]
+    if urls and mode in ("fast", "stealth") \
+            and os.environ.get("AUTOFORGE_CRAWLER_INPROCESS", "") != "1":
+        out = _isolated(mode, urls, concurrency, timeout, with_text)
+        if out is not None:
+            return out
+    return crawl_local(urls, mode=mode, concurrency=concurrency,
+                       timeout=timeout, with_text=with_text)
+
+
+def crawl_local(urls, mode="fast", concurrency=20, timeout=8, with_text=False):
+    """The engine itself, in this process. Prefer crawl(); see _isolated()."""
     if isinstance(urls, str):
         urls = [urls]
     urls = [str(u) for u in urls]
