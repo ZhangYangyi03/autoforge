@@ -1205,6 +1205,7 @@ class ForgeAgent:
         self._tool_vision()
         self._tool_media()
         self._tool_code()
+        self._tool_shared_web_search()
         # Hot reload reruns this registration pass on the live agent.
         # Bring in saved tools too, rather than waiting for a process restart.
         if getattr(self, "store", None) is not None:
@@ -5658,6 +5659,39 @@ class ForgeAgent:
             fn=run_python, source="builtin", tags=["code", "exec"],
         ))
 
+    def _tool_shared_web_search(self) -> None:
+        """Use the tested shared-market web search, without executing shelf code locally."""
+        def shared_web_search(query: str, objective: str, num_results: int = 5) -> str:
+            import json as _json
+            import os as _os
+            import urllib.request as _url
+            if not query.strip() or not objective.strip():
+                return "INVALID: query and objective are required"
+            count = max(1, min(int(num_results), 10))
+            base = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000").rstrip("/")
+            body = {"arguments": {"tool": "web_search_exa", "arguments": {
+                "query": query, "objective": objective, "numResults": count}}}
+            request = _url.Request(base + "/resources/tool:exa_web_search_sse_fixed/invoke",
+                data=_json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            try:
+                with _url.urlopen(request, timeout=45) as response:
+                    result = _json.loads(response.read(2_000_001))
+                if not result.get("ok"):
+                    return "MARKET INVOCATION FAILED: " + str(result.get("error"))
+                return str(result.get("output", ""))
+            except Exception as exc:
+                return "MARKET UNAVAILABLE: " + type(exc).__name__ + ": " + str(exc)
+        self._add(ToolSpec(
+            name="shared_web_search",
+            description="Search public web through the shared toolmarket Exa tool; use for current news, investigations, public sources and fact checking. 网络搜索 新闻 调查 核实 公开报道。",
+            parameters={"type":"object", "properties": {
+                "query":{"type":"string", "description":"search query"},
+                "objective":{"type":"string", "description":"which sources and facts to find"},
+                "num_results":{"type":"integer", "description":"number of results, 1 to 10"}},
+                "required":["query", "objective"]},
+            fn=shared_web_search, source="builtin", tags=["network", "search"],
+        ))
+
     def _tool_gpu(self) -> None:
         """CUDA kernel-layer tools.
 
@@ -6306,6 +6340,137 @@ class ForgeAgent:
         except Exception:                                     # noqa: BLE001
             pass
 
+    def _task_tool_candidates(self, task: str, limit: int = 4) -> list[str]:
+        """Rank saved tools by concrete task terms, never invoke them automatically."""
+        import re as _re
+        import math as _math
+        from collections import Counter as _Counter
+        def terms(text):
+            text = str(text).lower()
+            words = _re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", text)
+            out = []
+            for word in words:
+                if _re.fullmatch(r"[\u4e00-\u9fff]+", word):
+                    out.extend(word[i:i+2] for i in range(len(word)-1))
+                elif word not in {"the", "and", "for", "tool", "tools", "use", "you", "with", "this", "that", "from", "have"}:
+                    out.extend(word.split("_"))
+            return {w for w in out if len(w) >= 2}
+        query = terms(task)
+        if not query or self.store is None:
+            return []
+        try:
+            records = self.store.load_all_tools()
+        except Exception:
+            return []
+        docs = []
+        for name, record in records.items():
+            if name.startswith("mcp__rea__") or self.registry.get(name) is None:
+                continue
+            probes = getattr(record, "probes", []) or []
+            text = name.replace("_", " ") + " " + str(getattr(record, "description", ""))
+            for probe in probes:
+                if isinstance(probe, dict):
+                    text += " " + str(probe.get("query", ""))
+            words = terms(text)
+            if words:
+                docs.append((name, words))
+        freq = _Counter(w for _, words in docs for w in words)
+        scored = []
+        for name, words in docs:
+            overlap = query & words
+            if len(overlap) < 2:
+                continue
+            score = sum(_math.log(1 + len(docs)/(1 + freq[w])) for w in overlap)
+            scored.append((score, name))
+        return [name for _, name in sorted(scored, reverse=True)[:limit]]
+
+    def _shared_market_task_candidates(self, task: str, limit: int = 3) -> list[str]:
+        """Offer market-only tools by HTTP, without importing their code."""
+        import json as _json
+        import os as _os
+        import re as _re
+        import urllib.parse as _parse
+        import urllib.request as _url
+        base = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000").rstrip("/")
+        try:
+            qs = _parse.urlencode({"q": task[:500], "k": max(1, min(limit, 5))})
+            with _url.urlopen(base + "/search/fast?" + qs, timeout=0.5) as r:
+                hits = _json.loads(r.read(200_001)).get("results", [])
+        except Exception as exc:
+            # Older local servers lack /search/fast. Query their on-disk lexical
+            # index read-only instead of downloading their huge resource list.
+            hits = []
+            try:
+                from toolmarket.vectorstore import Store as _Store
+                import pathlib as _pathlib
+                index = _os.environ.get("TOOLMARKET_INDEX")
+                if not index:
+                    base_dir = _pathlib.Path.home() / "toolmarket_data"
+                    candidates = sorted((x for x in base_dir.glob("index*.sqlite")
+                                         if x.name != "index.sqlite" or len(list(base_dir.glob("index*.sqlite"))) == 1),
+                                        key=lambda x: x.stat().st_size, reverse=True)
+                    index = str(candidates[0]) if candidates else str(base_dir / "index.sqlite")
+                if not _pathlib.Path(index).is_file() or not base.startswith(
+                    ("http://127.0.0.1:", "http://localhost:")):
+                    raise ValueError("local index unavailable")
+                store = _Store(index)
+                try:
+                    rows = store.bm25_search("tools", task[:500], k=max(3, min(limit * 4, 20)))
+                    if rows:
+                        floor = 0.5 * float(rows[0][1])
+                        rows = [row for row in rows if row[1] >= floor]
+                finally:
+                    store.close()
+                hits = [{"resource_id": rid, "name": rid.removeprefix("tool:")}
+                        for rid, score, meta in rows if score > 0]
+            except Exception as fallback:
+                self._record("shared_market_discovery", {"ok": False, "error": str(exc)[:120],
+                                                          "fallback_error": str(fallback)[:120]})
+                return []
+        names = []
+        for hit in hits:
+            rid, name = str(hit.get("resource_id") or ""), str(hit.get("name") or "")
+            if not rid.startswith("tool:") or not name:
+                continue
+            try:
+                with _url.urlopen(base + "/resources/" + _parse.quote(rid, safe=":"), timeout=2) as r:
+                    resource = _json.loads(r.read(2_000_001))
+                if not isinstance(resource, dict):
+                    continue
+                if resource.get("state") not in ("probation", "verified", "active"):
+                    continue
+                schema = resource.get("contract", {}).get("parameters", {})
+                if not isinstance(schema, dict) or schema.get("type") != "object":
+                    continue
+            except Exception:
+                continue
+            exposed = "shared_market_" + _re.sub(r"[^a-z0-9_]", "_", name.lower())[:35]
+            # A tool already loaded locally is reusable, but exposing a second
+            # HTTP clone of it only adds noise to the model's tool menu.
+            raw = rid.removeprefix("tool:")
+            if self.registry.get(raw):
+                names.append(raw)
+                continue
+            if not self.registry.get(exposed):
+                def invoke(_rid=rid, **kwargs):
+                    req = _url.Request(base + "/resources/" + _parse.quote(_rid, safe=":") + "/invoke",
+                        data=_json.dumps({"arguments": kwargs}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    try:
+                        with _url.urlopen(req, timeout=45) as response:
+                            result = _json.loads(response.read(2_000_001))
+                        return str(result.get("output", "")) if result.get("ok") else "FAILED: " + str(result.get("error"))
+                    except Exception as exc:
+                        return "MARKET UNAVAILABLE: " + type(exc).__name__ + ": " + str(exc)
+                self._add(ToolSpec(name=exposed, description=str(resource.get("description") or hit.get("description") or name)
+                    + " (shared market HTTP invocation; assess suitability before use)",
+                    parameters=schema, fn=invoke, source="builtin", tags=["shared", "market"]))
+            names.append(exposed)
+            if len(names) >= limit:
+                break
+        self._record("shared_market_discovery", {"ok": True, "tools": names})
+        return names
+
     def _hot_protect(self) -> set[str]:
         """Tools this run must carry in full, whatever the ledger says.
 
@@ -6570,6 +6735,21 @@ class ForgeAgent:
         # that needs it is exactly the run whose first turn would otherwise miss
         # it. Set here rather than inside the loop: this is where the task is.
         self.registry.protect = self._hot_protect()
+        # Surface matching existing capabilities for ordinary tasks, not only
+        # on the forge path. The model still decides whether a tool is suitable.
+        candidates = self._task_tool_candidates(task)
+        if getattr(self, "policy", None) is None or getattr(self.policy, "may_use_shared_market", True):
+            candidates.extend(self._shared_market_task_candidates(task))
+        # Research intent in Chinese and English must expose the working shared
+        # search tool even if its market contract is absent from the local store.
+        # Expose the tested shared-market search contract for research tasks.
+        research_terms = ("新闻", "报道", "调查", "核实", "查证", "搜索",
+                          "当前", "今天", "最新", "黄仁勋", "news", "investigat",
+                          "fact check", "research", "web search", "current")
+        if any(term in task.lower() for term in research_terms):
+            candidates.append("shared_web_search")
+        self.registry.protect.update(candidates)
+        self._record("task_tool_candidates", {"tools": candidates})
         # The usage counters belong to the run, not to the agent. They live on
         # the client, the client outlives every run, and nothing used to zero
         # them -- so a session that had been up for a day reported the running

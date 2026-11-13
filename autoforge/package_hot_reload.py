@@ -60,11 +60,34 @@ def sha256_file(path: str) -> str:
 
 
 def module_files(base: str, package: str = "autoforge") -> list[tuple[str, str]]:
-    """(module name, path) for every .py in the package, shallow modules first."""
+    """(module name, path) for every .py in the package, shallow modules first.
+
+    Vendored code is deliberately excluded. `vendor/` is a verbatim import of
+    another agent's source, kept for provenance and read-only comparison; its
+    modules are never edited here, but several of them import optional cloud
+    SDKs (boto3, anthropic, pyautogui, a Python-2-only `parallel`) that are not
+    installed on this host. Reloading them can only fail, and a single failure
+    rolls back the *entire* install -- so one unused vendored SDK could silently
+    veto every self-fix. Measured 2026-11-05: the run_python abort fix could not
+    be hot-loaded until three such SDKs were installed, and the third would not
+    build on Python 3.13.
+
+    Skip it at enumeration time rather than swallowing the error: a vendored
+    module that *is* genuinely needed still fails at its real import site,
+    where the error names what is missing.
+    """
     root = os.path.join(base, package)
     out: list[tuple[str, str]] = []
     for dp, dn, fn in os.walk(root):
         if "__pycache__" in dp:
+            continue
+        # Prune the walk, not just the append: os.walk otherwise descends into
+        # vendor/tars/core/... and every subdirectory below it. The package
+        # `autoforge.vendor.tars` itself has an __init__ that imports those SDKs,
+        # so skipping only the .py files below it is not enough.
+        rel = os.path.relpath(dp, root)
+        if rel.split(os.sep)[0] == "vendor":
+            dn[:] = []
             continue
         for f in fn:
             if not f.endswith(".py"):
@@ -74,6 +97,10 @@ def module_files(base: str, package: str = "autoforge") -> list[tuple[str, str]]
             name = rel[:-3].replace(os.sep, ".")
             if name.endswith(".__init__"):
                 name = name[: -len(".__init__")]
+            # Defensive: a vendor path that reached here by another route must
+            # never be reloaded.
+            if ".vendor." in name or name.endswith(".vendor"):
+                continue
             out.append((name, path))
     out.sort(key=lambda item: (item[0].count("."), item[0]))
     return out

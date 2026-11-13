@@ -124,9 +124,9 @@ def test_the_timeout_cap_is_honoured_per_call_not_written_on_the_shared_box():
     assert a.sandbox.timeout == before
 
 
-# -- the operator can stop it ------------------------------------------------
+# -- a question must not kill it; a /stop still does ------------------------
 class _Speaks:
-    """A steering channel that has something to say the moment it is asked."""
+    """The operator asked a question -- not for the work to stop."""
 
     def has_pending(self) -> bool:
         return True
@@ -135,14 +135,41 @@ class _Speaks:
         return False
 
 
-def test_a_long_snippet_yields_to_the_operator_rather_than_going_deaf():
-    """The one thing that must not be the only step nobody can interrupt."""
+class _Stops:
+    """The operator actually sent /stop."""
+
+    def has_pending(self) -> bool:
+        return True
+
+    def stop_requested(self) -> bool:
+        return True
+
+
+def test_a_question_does_not_kill_a_running_snippet():
+    """Measured 2026-11-05: '咋样' killed a 30s TCA replay and it never resumed.
+
+    The loop answers a question at its next boundary. Killing the sandbox
+    child instead throws away real computation and leaves no result to read.
+    """
     a = make_agent()
     a.steer = _Speaks()
 
+    r = call(a, code="print('still alive')", timeout=60)
+
+    assert "still alive" in (r.output or ""), (
+        "a question must not abort run_python: %r" % (r.output,))
+    assert not r.aborted
+
+
+def test_a_real_stop_stops_a_running_snippet():
+    """The kill switch stays intact -- only its trigger is narrowed."""
+    a = make_agent()
+    a.steer = _Stops()
+
     r = call(a, code="import time\ntime.sleep(30)", timeout=60)
 
-    assert "operator" in r.output, "the snippet ran to completion while the operator was talking"
+    assert r.aborted or "operator" in (r.output or ""), (
+        "/stop must still be able to kill a snippet: %r" % (r.output,))
 
 
 # -- and the policy can switch it off ---------------------------------------
