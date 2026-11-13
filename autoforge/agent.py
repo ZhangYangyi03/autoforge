@@ -6341,24 +6341,20 @@ class ForgeAgent:
             pass
 
     def _task_tool_candidates(self, task: str, limit: int = 4) -> list[str]:
-        """Rank saved tools by concrete task terms, never invoke them automatically."""
-        import re as _re
-        import math as _math
-        from collections import Counter as _Counter
-        def terms(text):
-            text = str(text).lower()
-            words = _re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", text)
-            out = []
-            for word in words:
-                if _re.fullmatch(r"[\u4e00-\u9fff]+", word):
-                    out.extend(word[i:i+2] for i in range(len(word)-1))
-                elif word not in {"the", "and", "for", "tool", "tools", "use", "you", "with", "this", "that", "from", "have"}:
-                    out.extend(word.split("_"))
-            return {w for w in out if len(w) >= 2}
-        query = terms(task)
-        if not query or self.store is None:
+        """Rank saved tools for a colloquial task; never invoke them automatically.
+
+        The old implementation counted the overlap of raw task terms with tool
+        descriptions and required >= 2 shared terms. Measured 2026-11-13, that
+        gave 0 hits on the operator's real tasks ("传一下刚才做好的最新版..." or
+        "看一下我月额度为什么85%"): verbs like 传/推/看一下 never appear in a
+        tool description, while filler like 刚才/最新版/是不是好了 dilutes the
+        query. rank() in task_retrieval.py is the ported BM25Okapi + RAKE +
+        MultiQuery union that fixes it (see that module for provenance).
+        """
+        if not task or self.store is None:
             return []
         try:
+            from .task_retrieval import rank as _rank
             records = self.store.load_all_tools()
         except Exception:
             return []
@@ -6366,67 +6362,92 @@ class ForgeAgent:
         for name, record in records.items():
             if name.startswith("mcp__rea__") or self.registry.get(name) is None:
                 continue
-            probes = getattr(record, "probes", []) or []
             text = name.replace("_", " ") + " " + str(getattr(record, "description", ""))
-            for probe in probes:
+            for probe in (getattr(record, "probes", []) or []):
                 if isinstance(probe, dict):
                     text += " " + str(probe.get("query", ""))
-            words = terms(text)
-            if words:
-                docs.append((name, words))
-        freq = _Counter(w for _, words in docs for w in words)
-        scored = []
-        for name, words in docs:
-            overlap = query & words
-            if len(overlap) < 2:
-                continue
-            score = sum(_math.log(1 + len(docs)/(1 + freq[w])) for w in overlap)
-            scored.append((score, name))
-        return [name for _, name in sorted(scored, reverse=True)[:limit]]
+            docs.append((name, text))
+        if not docs:
+            return []
+        return [name for name, _ in _rank(task, docs, limit=limit)]
+
+    def _task_search_views(self, task: str) -> list[str]:
+        """Canonical rewrites of a colloquial task, for the shared shelf.
+
+        The shelf's /search abstains when fewer than 60% of its discriminating
+        terms appear in the top document. The operator's real task measured
+        coverage 0.33 and returned nothing, while "提交并推送代码到 github 仓库"
+        returned git_add_commit_push at rank 1. Send the shelf the views that
+        are written in its own vocabulary, not only the raw sentence.
+        """
+        try:
+            from .task_retrieval import query_views as _views
+            return _views(task) or [task]
+        except Exception:
+            return [task]
+
+    def _research_tool_candidates(self, task: str) -> list[str]:
+        """Expose the tested shared-market search contract for research tasks.
+
+        Measured 2026-11-13: a bare "最新" in "最新版 autoforge" wrongly
+        surfaced shared_web_search on a git-push task. Require news/research
+        intent that is actually about looking something up, not a version
+        adjective or a request to measure something.
+        """
+        research_terms = ("新闻", "报道", "最新消息", "最新报道", "查证", "核实",
+                          "网络搜索", "网上搜", "黄仁勋", "news", "investigat",
+                          "fact check", "web search", "look up online", "current events")
+        return (["shared_web_search"]
+                if any(term in task.lower() for term in research_terms) else [])
 
     def _shared_market_task_candidates(self, task: str, limit: int = 3) -> list[str]:
-        """Offer market-only tools by HTTP, without importing their code."""
+        """Offer market-only tools by HTTP, without importing their code.
+
+        One raw colloquial sentence is a bad shelf query: measured 2026-11-13
+        the operator's git-push task abstained (coverage 0.33) on both /search
+        and /search/fast, while its canonical rewrite returned the right tool
+        at rank 1. Query several deterministic views and merge their hits by
+        best score (MultiQueryRetriever's union, MIT). /search is used rather
+        than /search/fast because the fast endpoint rate-limits (429) under
+        consecutive queries and its 0.5s budget made discovery time out.
+        """
         import json as _json
         import os as _os
         import re as _re
         import urllib.parse as _parse
         import urllib.request as _url
         base = _os.environ.get("TOOLMARKET_URL", "http://127.0.0.1:8000").rstrip("/")
-        try:
-            qs = _parse.urlencode({"q": task[:500], "k": max(1, min(limit, 5))})
-            with _url.urlopen(base + "/search/fast?" + qs, timeout=0.5) as r:
-                hits = _json.loads(r.read(200_001)).get("results", [])
-        except Exception as exc:
-            # Older local servers lack /search/fast. Query their on-disk lexical
-            # index read-only instead of downloading their huge resource list.
-            hits = []
+        views = self._task_search_views(task)
+        merged = {}
+        errors = []
+        for view in views[:6]:
+            qs = _parse.urlencode({"q": view[:500], "k": max(1, min(limit, 5))})
             try:
-                from toolmarket.vectorstore import Store as _Store
-                import pathlib as _pathlib
-                index = _os.environ.get("TOOLMARKET_INDEX")
-                if not index:
-                    base_dir = _pathlib.Path.home() / "toolmarket_data"
-                    candidates = sorted((x for x in base_dir.glob("index*.sqlite")
-                                         if x.name != "index.sqlite" or len(list(base_dir.glob("index*.sqlite"))) == 1),
-                                        key=lambda x: x.stat().st_size, reverse=True)
-                    index = str(candidates[0]) if candidates else str(base_dir / "index.sqlite")
-                if not _pathlib.Path(index).is_file() or not base.startswith(
-                    ("http://127.0.0.1:", "http://localhost:")):
-                    raise ValueError("local index unavailable")
-                store = _Store(index)
+                with _url.urlopen(base + "/search?" + qs, timeout=3) as r:
+                    payload = _json.loads(r.read(200_001))
+            except Exception as exc:
+                errors.append("%s: %s" % (type(exc).__name__, str(exc)[:80]))
+                continue
+            for hit in (payload.get("results") or []):
+                if not isinstance(hit, dict):
+                    continue
+                rid = str(hit.get("resource_id") or "")
+                name = str(hit.get("name") or rid.removeprefix("tool:"))
+                if not rid.startswith("tool:") or not name:
+                    continue
                 try:
-                    rows = store.bm25_search("tools", task[:500], k=max(3, min(limit * 4, 20)))
-                    if rows:
-                        floor = 0.5 * float(rows[0][1])
-                        rows = [row for row in rows if row[1] >= floor]
-                finally:
-                    store.close()
-                hits = [{"resource_id": rid, "name": rid.removeprefix("tool:")}
-                        for rid, score, meta in rows if score > 0]
-            except Exception as fallback:
-                self._record("shared_market_discovery", {"ok": False, "error": str(exc)[:120],
-                                                          "fallback_error": str(fallback)[:120]})
-                return []
+                    score = float(hit.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if rid not in merged or score > merged[rid][0]:
+                    merged[rid] = (score, name, str(hit.get("description") or ""))
+        hits = [{"resource_id": rid, "name": name, "description": desc}
+                for rid, (score, name, desc) in
+                sorted(merged.items(), key=lambda kv: (-kv[1][0], kv[0]))]
+        if not hits:
+            self._record("shared_market_discovery", {"ok": False, "views": len(views),
+                                                      "errors": errors[:3]})
+            return []
         names = []
         for hit in hits:
             rid, name = str(hit.get("resource_id") or ""), str(hit.get("name") or "")
@@ -6740,14 +6761,7 @@ class ForgeAgent:
         candidates = self._task_tool_candidates(task)
         if getattr(self, "policy", None) is None or getattr(self.policy, "may_use_shared_market", True):
             candidates.extend(self._shared_market_task_candidates(task))
-        # Research intent in Chinese and English must expose the working shared
-        # search tool even if its market contract is absent from the local store.
-        # Expose the tested shared-market search contract for research tasks.
-        research_terms = ("新闻", "报道", "调查", "核实", "查证", "搜索",
-                          "当前", "今天", "最新", "黄仁勋", "news", "investigat",
-                          "fact check", "research", "web search", "current")
-        if any(term in task.lower() for term in research_terms):
-            candidates.append("shared_web_search")
+        candidates.extend(self._research_tool_candidates(task))
         self.registry.protect.update(candidates)
         self._record("task_tool_candidates", {"tools": candidates})
         # The usage counters belong to the run, not to the agent. They live on
