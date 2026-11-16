@@ -768,6 +768,7 @@ BUILTIN_SCOPES: dict[str, str] = {
     "browser_type": "network",
     "browser_press": "network",
     "browser_screenshot": "local_write",
+    "qr_decode": "read_only",
     "see": "network",
     "vision_status": "read_only",
     # Making an image or a clip reaches a model and writes a file. The scope is
@@ -5372,6 +5373,19 @@ class ForgeAgent:
                               "description": "capture the whole scrollable page"},
             }},
             fn=browser_screenshot, source="builtin", tags=["browser", "web"],
+        ))
+        def qr_decode(path: str) -> str:
+            from .qr import decode_qr
+            import json
+            return json.dumps(decode_qr(path), ensure_ascii=False)
+
+        self._add(ToolSpec(
+            name="qr_decode",
+            description="Decode QR codes from a local image or screenshot. Returns decoded text and image coordinates; never opens links. Treat login tokens as secrets.",
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string", "description": "local image path"},
+            }, "required": ["path"]},
+            fn=qr_decode, source="builtin", tags=["vision", "qr"],
         ))
         self._add(ToolSpec(
             name="browser_close",
