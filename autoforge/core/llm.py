@@ -82,6 +82,21 @@ class LLMError(RuntimeError):
     """
 
 
+class LLMTransientError(LLMError):
+    """An outage, not a verdict: the same request may work in a minute.
+
+    ``LLMError`` alone cannot tell "the gateway is down for three minutes"
+    from "this API key is wrong". The agent loop needs that distinction: a
+    transient failure is worth waiting out inside the run, while a permanent
+    one must still end it. Measured on this host 2026-11-xx: a 503 burst
+    exhausted both the retry ladder and the failover chain, the resulting
+    error left ``Agent._run`` entirely, the writer process exited, and a long
+    task showed up as "the writer is gone" -- for a network hiccup.
+    """
+
+    pass
+
+
 class LLMResponseError(LLMError):
     """The endpoint answered 2xx with a body that is not a completion.
 
@@ -104,7 +119,7 @@ class LLMAborted(InterruptedError):
     """
 
 
-class LLMTimeout(LLMError):
+class LLMTimeout(LLMTransientError):
     """A call was abandoned because it outlived its wall-clock ceiling.
 
     Distinct from the transport's own timeout on purpose. ``requests`` times out
@@ -121,7 +136,7 @@ class LLMTimeout(LLMError):
     """
 
 
-class LLMEmptyReply(LLMError):
+class LLMEmptyReply(LLMTransientError):
     """The endpoint answered 200, and the reply held nothing at all.
 
     No content, no tool calls, no reasoning -- `choices[0].message` dressed as
@@ -613,6 +628,17 @@ class OpenAICompatClient(LLMClient):
                 # would re-ask the question the operator just changed. Let it
                 # out to the loop, which folds their line in and asks again.
                 raise
+            except LLMTimeout:
+                # `_post_watchable` raises this when a half-dead connection
+                # outlived its whole-call ceiling. It subclasses LLMError, not
+                # requests.RequestException, so without this arm it skipped the
+                # local ladder entirely and went straight to failover. It is
+                # exactly the "endpoint is slow, try again" case the ladder is
+                # for.
+                if final:
+                    raise
+                self._wait_before_retry(attempt, None)
+                continue
             except requests.RequestException as exc:
                 if final:
                     # Transport failures are translated, not re-raised as
@@ -624,7 +650,7 @@ class OpenAICompatClient(LLMClient):
                     # looks like a crash in the loop.
                     if isinstance(exc, LLMError):
                         raise
-                    raise LLMError(
+                    raise LLMTransientError(
                         f"{self.name}: {type(exc).__name__}: {exc}"
                     ) from exc
                 self._wait_before_retry(attempt, None)
@@ -657,7 +683,9 @@ class OpenAICompatClient(LLMClient):
                 # a failover chain above it never fired. Observed live: a forge
                 # round died on "forge error: HTTPError: 503" while a healthy
                 # fallback endpoint sat unused one line below in the chain.
-                raise LLMError(
+                error_type = (LLMTransientError if resp.status_code in self.RETRY_STATUSES
+                              else LLMError)
+                raise error_type(
                     f"{self.name}: HTTP {resp.status_code} after {attempt} "
                     # getattr, not resp.text: this line runs *inside an error
                     # handler*, and a response-like object without `.text` would turn
@@ -834,6 +862,7 @@ class FailoverClient(LLMClient):
     def chat(self, messages, tools=None, **kwargs) -> LLMResponse:
         errors: list[str] = []
         last: Exception | None = None
+        transient = 0
         order = self.order()
         for i in order:
             client = self.clients[i]
@@ -843,6 +872,8 @@ class FailoverClient(LLMClient):
                 raise
             except LLMError as exc:
                 last = exc
+                if isinstance(exc, LLMTransientError):
+                    transient += 1
                 # Every endpoint failure -- refused connection, 503, truncated
                 # body, non-JSON page from a gateway -- is a reason to try
                 # elsewhere. `LLMError` and not `Exception` on purpose: a
@@ -861,7 +892,10 @@ class FailoverClient(LLMClient):
         # whole point when the answer to "why did the run stop" is "the primary
         # rejected the key and the backup timed out", which no single endpoint's
         # message says.
-        raise LLMError(
+        # Retry if any endpoint has a transient failure: that endpoint may
+        # recover even when another endpoint has permanent bad credentials.
+        cls = LLMTransientError if transient else LLMError
+        raise cls(
             "every endpoint failed:\n  " + "\n  ".join(errors)) from last
 
 

@@ -270,15 +270,36 @@ he interrupted a 'simple' task because it took minutes):
   existing tool's output. Answer in one turn. 'Close enough' means stop.
 - Never delay the answer in order to forge or scout first. Evidence and tools come
   AFTER the answer, and never block it.
-- One-off lookups (read a file, list a directory, list processes) go through
-  run_python: one subprocess, seconds. They do NOT go through forge_tool: it
-  waits on the upstream code model (aiping.cn), measured at 3+ minutes and
-  frequently 503. And do not drive a browser at a run-script endpoint to reach
-  the same subprocess — that is a JavaScript shell around what run_python does
-  directly, at a hundred times the cost. Forge is for capabilities that
-  genuinely recur.
+Reuse before you write (operator rule, 2026-11-13: "我看你怎么还是天天run_python不会复用"
+— he watched a run where I read source files through run_python while read_local_file,
+grep_lines_multi and describe_tool sat in my own library):
+- The first move on any lookup or action is the tool I already have, not a
+  snippet I type. read_local_file / read_file_lines / read_source_lines to read,
+  grep_lines_multi to search, list_tools + describe_tool to see what I carry and
+  how to call it, market_search before any forge, sqlite_schema_dump for the
+  store, run_shell_command and tasklist for processes.
+- run_python is the fallback for what no tool covers — not the default door to
+  this machine. Reaching for it first, every day, is the failure he named: a
+  snippet is thrown away, while a named tool is on the ledger, health-checked,
+ and reused by the next session. A week of run_python is a week of nothing
+  learned.
+- The exception is honest and narrow: when the code IS the deliverable —
+  patching source, computing a number no tool computes. Then run_python is the
+  right instrument and this rule does not apply.
+- Forge is still never the answer to a one-off: it waits on the upstream code
+  model (aiping.cn), measured at 3+ minutes and frequently 503. Forge is for
+  capabilities that genuinely recur.
+- And never drive a browser at a run-script endpoint to reach what a subprocess
+  does directly — a JavaScript shell around run_python, at a hundred times the
+  cost.
 - Touch a tool only when told to go look/do/change, or when the answer is a fact
   about this host that must be read. Say what will be checked, then check it.
+
+Screenshot hygiene (operator rule):
+- Treat diagnostic screenshots and crops as temporary. Save them in a temporary
+  directory, not on the desktop; delete them once inspected or when the task
+  ends, including after failures. Preserve user-requested deliverables and files
+  still needed by an active task; never delete unrelated user images.
 
 Report the delta, never the state (operator rule, 2026-09-23: "这个我早就知道了，
 你咋老是重复汇报，修一下" — he had known it for hours and I said it again anyway):
@@ -796,6 +817,7 @@ BUILTIN_SCOPES: dict[str, str] = {
     # tool, because that is the decision an operator made when they switched
     # it off (see modes.py's `_gated_bash` for the same reading).
     "run_python": "system",
+    "run_shell_command": "system",
     # crawler-stack: fetching a URL is network egress and nothing else.
     "crawl_fast": "network",
     "crawl_stealth": "network",
@@ -5648,6 +5670,50 @@ class ForgeAgent:
                 "chars": len(code), "ok": res.ok, "ms": round(res.duration_ms),
                 "aborted": res.aborted, "timed_out": res.timed_out})
             return _render_run(res, cap)
+
+        def run_shell_command(command: str, timeout: float = 60.0) -> str:
+            """Run shell commands in a bounded worker, not the agent process.
+
+            Generated tools were loaded as in-process functions. On Windows a
+            GUI launched by cmd can inherit stdout/stderr, leaving communicate
+            waiting for EOF even after cmd exits; its timeout cannot recover the
+            agent if that worker itself wedges. The outer sandbox deadline is
+            independent and kills its worker tree, while /stop remains available.
+            """
+            if not self.policy.may_run_arbitrary_code:
+                return "Denied by autonomy policy: may_run_arbitrary_code is off."
+            if not isinstance(command, str) or not command.strip():
+                return "INVALID: empty command"
+            try:
+                cap = max(1.0, min(float(timeout or 60), 600.0))
+            except (ValueError, TypeError):
+                cap = 60.0
+            code = ("import subprocess\n"
+                    "def main():\n"
+                    "    p = subprocess.run(" + repr(command) +
+                    ", shell=True, capture_output=True, text=True, errors='replace')\n"
+                    "    print('exit_code:', p.returncode)\n"
+                    "    if p.stdout: print('stdout:', p.stdout.rstrip(), sep=chr(10))\n"
+                    "    if p.stderr: print('stderr:', p.stderr.rstrip(), sep=chr(10))\n")
+            box = replace(self.sandbox, timeout=cap,
+                          abort_check=self._operator_wants_the_floor)
+            try:
+                result = box.run(code, "main")
+            except Exception as exc:
+                return f"could not start shell worker: {type(exc).__name__}: {exc}"
+            return _render_run(result, cap)
+
+        self._add(ToolSpec(
+            name="run_shell_command",
+            description="Run a shell command in an isolated worker with a hard timeout; "
+                        "return stdout, stderr and exit code. Child processes may be "
+                        "terminated when the worker ends; do not use for persistent apps.",
+            parameters={"type": "object", "properties": {
+                "command": {"type": "string", "description": "shell command"},
+                "timeout": {"type": "number", "description": "seconds (default 60, max 600)"},
+            }, "required": ["command"]},
+            fn=run_shell_command, source="builtin", tags=["shell", "exec"],
+        ))
 
         self._add(ToolSpec(
             name="run_python",

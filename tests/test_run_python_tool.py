@@ -195,8 +195,8 @@ def test_the_prompt_points_one_off_lookups_at_it():
     from autoforge.agent import AUTONOMOUS_SYSTEM as sp
 
     assert "run_python" in sp
-    assert "One-off lookups" in sp
-    assert "do not drive a browser" in sp.lower()
+    assert "Reuse before you write" in sp
+    assert "never drive a browser" in sp.lower()
 
 
 # -- the rendering, which is what the model actually reads ------------------
@@ -215,3 +215,22 @@ def test_the_three_outcomes_are_told_apart():
     assert "timed out" in timed_out and "part" in timed_out
     assert failed.startswith("[error]")
     assert "part" not in failed
+
+
+def test_shell_runs_out_of_process_and_returns_output():
+    a = make_agent()
+    assert a.registry.get("run_shell_command").source == "builtin"
+    assert BUILTIN_SCOPES["run_shell_command"] == "system"
+    result = a.registry.call("run_shell_command", {"command": "echo shell-ok", "timeout": 10})
+    assert "shell-ok" in result.output, result.output
+    assert "exit_code: 0" in result.output
+
+
+def test_shell_worker_timeout_does_not_wedge_agent():
+    a = make_agent()
+    import time
+    start = time.monotonic()
+    command = f'"{sys.executable}" -c "import time; time.sleep(30)"'
+    result = a.registry.call("run_shell_command", {"command": command, "timeout": 1})
+    assert "timed out" in result.output.lower(), result.output
+    assert time.monotonic() - start < 20

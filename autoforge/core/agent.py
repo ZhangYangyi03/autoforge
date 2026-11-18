@@ -27,10 +27,13 @@ part isn't what's broken in other frameworks.
 """
 from __future__ import annotations
 
+import os
+import time
+
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from .llm import LLMAborted, LLMClient
+from .llm import LLMAborted, LLMClient, LLMTransientError
 from .message import Message
 from . import lineedit
 from .compaction import OUTPUT_MAX_CHARS, bound_output
@@ -507,6 +510,62 @@ class Agent:
         finally:
             _mark_run(self.steer, False)
 
+    def _chat_with_recovery(self, msgs: list[Message], turn: int) -> Any:
+        """Ask the model, riding out a gateway outage instead of ending the run.
+
+        The retry ladder inside ``OpenAICompatClient`` and the failover chain
+        both have a budget measured in seconds or attempts; this host's 503
+        bursts are measured in *minutes*. When both exhaust, the resulting
+        error used to leave ``_run`` entirely: the writer process exited,
+        ``runs.scan`` said "the writer is gone", and a long task was stranded
+        at the boundary where a tool result had just come back. A resume can
+        reconstruct that step, but needing one for a three-minute hiccup is
+        the bug.
+
+        So a transient failure is waited out inside the run. The process stays
+        alive and the checkpoint keeps beating -- ``WEDGED_AFTER_S`` is 300s,
+        and a writer that is alive but quiet that long is declared wedged and
+        a second resumer would start the same task twice. Non-transient
+        errors (bad key, malformed payload) still leave the loop as before.
+        """
+        budget = float(os.environ.get("AUTOFORGE_GATEWAY_WAIT_S") or 1800.0)
+        base_delay = float(os.environ.get("AUTOFORGE_GATEWAY_RETRY_S") or 5.0)
+        deadline = time.monotonic() + max(0.0, budget)
+        delay = max(0.01, base_delay)
+        attempt = 0
+        while True:
+            try:
+                req_msgs, req_tools = self._request(msgs)
+                self._aborted_by_own_channel = False
+                return self.llm.chat(
+                    req_msgs, tools=req_tools,
+                    should_abort=self._yield_if_mine,
+                )
+            except LLMTransientError:
+                attempt += 1
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise
+                wait = min(delay, max(0.0, left))
+                # Keep the heartbeat young while waiting; see the docstring.
+                self._beat(msgs, turn, f"gateway outage, retry {attempt}")
+                slept = 0.0
+                since_beat = 0.0
+                while slept < wait:
+                    step = min(0.25, wait - slept)
+                    time.sleep(step)
+                    slept += step
+                    since_beat += step
+                    if since_beat >= 5.0:
+                        self._beat(msgs, turn,
+                                   f"gateway outage, retry {attempt}")
+                        since_beat = 0.0
+                    if self._operator_should_yield():
+                        self._aborted_by_own_channel = True
+                        raise LLMAborted(
+                            "operator spoke while the run waited for the gateway")
+                delay = min(delay * 1.5, 30.0)
+
     def _run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
         msgs = list(history or [])
         if not msgs or msgs[0].role != "system":
@@ -567,15 +626,7 @@ class Agent:
 
             _notify(self.on_request, turn)
             try:
-                _req_msgs, _req_tools = self._request(msgs)
-                self._aborted_by_own_channel = False
-                resp = self.llm.chat(
-                    _req_msgs, tools=_req_tools,
-                    # The cheap step: a question is reason enough to go round
-                    # again and answer it, because nothing is lost by asking a
-                    # request twice. Long steps ask the narrower question.
-                    should_abort=self._yield_if_mine,
-                )
+                resp = self._chat_with_recovery(msgs, turn)
             except LLMAborted:
                 # They spoke while the answer was in flight. Nothing has been
                 # decided yet -- no tool ran, no message was appended -- so

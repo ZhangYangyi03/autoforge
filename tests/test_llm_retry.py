@@ -236,3 +236,16 @@ def test_a_tool_call_only_reply_counts_as_an_answer(monkeypatch):
 # been failing ever since -- on any machine, from the checked-in code. What they
 # are about (one attempt for a permanent 400, three for a transient 503, the
 # last failure's status preserved) is unchanged.
+
+
+def test_http_error_classification_for_run_recovery(monkeypatch):
+    import pytest
+    from autoforge.core.llm import LLMTransientError
+    for status in (400, 401, 403, 404):
+        _wire(monkeypatch, _Resp(status))
+        with pytest.raises(LLMError) as exc:
+            _ask(_client())
+        assert not isinstance(exc.value, LLMTransientError)
+    _wire(monkeypatch, _Resp(503), _Resp(503), _Resp(503))
+    with pytest.raises(LLMTransientError):
+        _ask(_client())
