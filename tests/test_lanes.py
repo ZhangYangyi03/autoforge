@@ -515,3 +515,15 @@ class TestTheWriterStampOnAVersion:
             st.save_tool(self._mk("legacy", "two", "v2"), allow_overwrite=False)
         finally:
             st.close()
+
+
+def test_pid_alive_recognises_exited_process_with_retained_handle():
+    # On Windows an open Popen handle keeps the process object queryable after
+    # exit. OpenProcess succeeds even though the process cannot make progress.
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=20)
+    assert not lanes.pid_alive(child.pid)
+
+
+def test_pid_alive_reports_current_process():
+    assert lanes.pid_alive(os.getpid())

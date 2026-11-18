@@ -126,21 +126,37 @@ def pid_alive(pid: int) -> bool:                                     # noqa: D40
         return False
     if pid <= 0:
         return False
-    try:
+    if os.name == "nt":
         import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-        if not h:
-            return False
-        ctypes.windll.kernel32.CloseHandle(h)
-        return True
-    except Exception:                                                # noqa: BLE001
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            # Access denied is not evidence of death; invalid PID is.
+            return ctypes.get_last_error() != 87
         try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-        except Exception:                                            # noqa: BLE001
-            return False
+            state = kernel.WaitForSingleObject(handle, 0)
+            # WAIT_OBJECT_0 means exited; timeout or failure is not proof.
+            return state != 0
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True  # unknown errors are not proof of death
+
 
 
 def own_session_id() -> str:
