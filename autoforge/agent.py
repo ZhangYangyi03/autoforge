@@ -786,6 +786,8 @@ BUILTIN_SCOPES: dict[str, str] = {
     "browser_goto": "network",
     "browser_eval": "network",
     "browser_click": "network",
+    "browser_locator": "network",
+    "window_uia": "system",
     "browser_type": "network",
     "browser_press": "network",
     "browser_screenshot": "local_write",
@@ -5233,10 +5235,12 @@ class ForgeAgent:
                 # Focus through the DOM and dispatch a real click, so the page's
                 # own focus handling runs; setting .value directly would leave
                 # framework state untouched and the form would submit empty.
-                browser.evaluate(
+                focused = browser.evaluate(
                     "(() => { const el = document.querySelector("
-                    + json.dumps(selector) + "); if (!el) return false;"
-                    " el.focus(); return true; })()")
+                    + json.dumps(selector) + "); if (!el || el.disabled || el.readOnly) return false;"
+                    " el.focus(); return document.activeElement === el; })()")
+                if not focused:
+                    raise ValueError(f"Cannot focus editable element: {selector}")
             browser.type_text(text)
             key = ""
             if submit:
@@ -5246,6 +5250,25 @@ class ForgeAgent:
             return (f"Typed {len(text)} characters"
                     + (f" into {selector}" if selector else "")
                     + key)
+
+        def browser_locator(selector: str, action: str = "click", text: str = "",
+                            timeout: float = 10.0) -> str:
+            from .playwright_bridge import perform_locator
+            browser = self._ensure_browser()
+            target_id = browser.target.get("id", "")
+            if not target_id:
+                raise ValueError("Current CDP target has no ID; reconnect via HTTP endpoint")
+            result = perform_locator(self._browser_endpoint, target_id, selector,
+                                     action=action, text=text, timeout=timeout)
+            self._record("browser_locator", {"selector": selector, "action": action})
+            return result
+
+        def window_uia(hwnd: int, action: str, automation_id: str = "", text: str = "") -> str:
+            from .windows_uia import operate
+            result = operate(hwnd, action, automation_id, text)
+            self._record("window_uia", {"hwnd": hwnd, "action": action,
+                                        "automation_id": automation_id})
+            return result
 
         def browser_press(key: str) -> str:
             browser = self._ensure_browser()
@@ -5271,7 +5294,7 @@ class ForgeAgent:
             hint = ("\nPass it to `see` with your question to actually look at it."
                     if self.vision else
                     "\n(No vision endpoint is configured, so nothing can read it back.)")
-            return (f"Saved {len(data)} bytes to {os.path.abspath(target)}\n"
+            return (f"Saved {len(data)} bytes to {os.path.abspath(path)}\n"
                     f"Page: {browser.current_url()}" + hint)
 
         def browser_close() -> str:
@@ -5369,6 +5392,34 @@ class ForgeAgent:
                 "submit": {"type": "boolean", "description": "press Enter after typing"},
             }, "required": ["text"]},
             fn=browser_type, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_locator",
+            description=("Operate a CSS or Playwright selector on the currently attached tab. "
+                         "Uses Playwright actionability auto-wait and strict unique matching; "
+                         "click or fill without coordinates. Fill replaces existing text. "
+                         "Never logs the text. Does not bypass CAPTCHA or authentication."),
+            parameters={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "action": {"type": "string", "enum": ["click", "fill"]},
+                "text": {"type": "string", "description": "value for fill; not recorded"},
+                "timeout": {"type": "number", "description": "seconds, 0.1 to 60"},
+            }, "required": ["selector"]},
+            fn=browser_locator, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="window_uia",
+            description=("Inspect a Windows window's UI Automation control IDs/types, or click/fill "
+                         "exactly one visible enabled control by automation ID. Requires pywinauto. "
+                         "Does not expose control values or log text. For inaccessible windows use "
+                         "physical-coordinate GUI tools instead."),
+            parameters={"type": "object", "properties": {
+                "hwnd": {"type": "integer", "description": "exact top-level window handle"},
+                "action": {"type": "string", "enum": ["inspect", "click", "fill"]},
+                "automation_id": {"type": "string"},
+                "text": {"type": "string", "description": "value for fill; not recorded"},
+            }, "required": ["hwnd", "action"]},
+            fn=window_uia, source="builtin", tags=["windows", "gui"],
         ))
         self._add(ToolSpec(
             name="browser_press",

@@ -18,6 +18,8 @@ autoforge = "autoforge.cli:main"
 auto = "autoforge.cli:main"
 
 [project.optional-dependencies]
+# Optional UI automation backends. Install with pip install "autoforge-agent[automation]".
+automation = ["playwright>=1.40", "pywinauto>=0.6.9; sys_platform == 'win32'"]
 # The embedded market console (`auto market`). Listed as an extra rather than as
 # runtime deps because most users never serve a shelf, and the market's own code
 # is only imported inside `autoforge.embedded`.
