@@ -71,6 +71,51 @@ def image_parts(text: str) -> list[dict[str, Any]] | None:
     return parts if len(parts) > 1 else None
 
 
+def _reuse_hint(code: str, registry: Any) -> str:
+    """Suggest existing tools for recognizable read-only snippets; never block code.
+
+    Suggestions are deliberately conservative and filtered against the live
+    registry. Complex code and writes may genuinely need Python.
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, TypeError, ValueError):
+        return ""
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    attrs = {n.func.attr for n in calls if isinstance(n.func, ast.Attribute)}
+    names = {n.func.id for n in calls if isinstance(n.func, ast.Name)}
+    # Never steer a snippet with obvious mutations away from its intended work.
+    if attrs & {"write", "write_text", "write_bytes", "unlink", "remove",
+                "rename", "replace", "execute", "executemany", "commit"}:
+        return ""
+    for n in calls:
+        if isinstance(n.func, ast.Name) and n.func.id == "open":
+            if len(n.args) > 1 and isinstance(n.args[1], ast.Constant):
+                if any(c in str(n.args[1].value) for c in "wax+"):
+                    return ""
+            if any(k.arg == "mode" and isinstance(k.value, ast.Constant) and
+                   any(c in str(k.value.value) for c in "wax+") for k in n.keywords):
+                return ""
+    choices = []
+    if "open" in names or attrs & {"read_text", "read_bytes", "readlines"}:
+        choices += ["read_local_file", "read_file_lines", "grep_lines_multi"]
+    if attrs & {"run", "check_output", "Popen"}:
+        choices += ["run_shell_command"]
+    available = []
+    for name in choices:
+        try:
+            if registry.get(name) is not None:
+                available.append(name)
+        except (AttributeError, TypeError):
+            pass
+    if not available:
+        return ""
+    return ("工具复用提示：类似的后续操作先考虑现成工具 " +
+            ", ".join(available) +
+            "；仅在参数或功能不适合时继续使用 run_python。此提示不影响本次执行。")
+
+
 @dataclass
 class AgentResult:
     content: str
@@ -579,6 +624,8 @@ class Agent:
         used: list[str] = []
         turn = 0
         self._terminated = None
+        python_calls = 0
+        last_reuse_hint = -3
 
         while True:
             turn += 1
@@ -688,7 +735,17 @@ class Agent:
                         self_terminated=True, termination_reason=sig.reason,
                     )
                 _notify(self.on_tool_result, tc.name, result)
-                msgs.append(Message.tool(self._bounded(result.output, tc.name),
+                output = result.output
+                if tc.name == "run_python":
+                    python_calls += 1
+                    # Check throughout the run, including after compaction. A
+                    # three-call cooldown prevents repetitive prompt spam.
+                    if python_calls - last_reuse_hint >= 3:
+                        hint = _reuse_hint(tc.arguments.get("code", ""), self.registry)
+                        if hint:
+                            output = str(output) + "\n\n" + hint
+                            last_reuse_hint = python_calls
+                msgs.append(Message.tool(self._bounded(output, tc.name),
                                          tc.id, tc.name))
                 # A note typed while that tool ran lands here, before the model
                 # is asked again — a forge can take minutes, and waiting until
