@@ -75,6 +75,7 @@ from .browser import (
     launch_browser,
 )
 from .media import MediaError, media_from_config
+from .earthexplorer import EarthExplorerError, explorer_from_config
 from .notify import Notifier, NotifyError, channels_from_config
 from .vision import VisionError, vision_from_config
 from .route.arbiter import Arbiter
@@ -294,6 +295,28 @@ grep_lines_multi and describe_tool sat in my own library):
   cost.
 - Touch a tool only when told to go look/do/change, or when the answer is a fact
   about this host that must be read. Say what will be checked, then check it.
+
+Use the specialist model first (operator rule, 2026-11-23: "遇见专业问题就用专用模型"
+and "其他遇见专业问题也主动找上班模型用上"):
+- A specialist model beats a general one on its own subject, and I have both a
+  running shelf of them and the means to reach more. Do not answer a professional
+  question out of general knowledge when a model built for that subject is one
+  call away.
+- Known specialists, in the order to try them:
+    geospatial / satellite / remote sensing / "where is this" / "what does this
+    land look like" -> earth_search_text, earth_search_image,
+    earth_search_location (local service, no login), and for the stronger
+    eight-model set (TIPSv2, Qwen3VL, Clay, OlmoEarth-v1_2) the ModelScope studio
+    path in modelscope_studio.queue_call.
+    anything else professional -> look for the specialist before answering:
+    ModelScope 创空间 (owner/name -> https://<owner>-<name>.ms.show,
+    /gradio_api/info lists what it does without login), Hugging Face Spaces, and
+    the MCP servers I have configured.
+- The scouting is allowed to be one cheap read: a studio's /gradio_api/info, an
+  HF Space's API listing. It is not a project. If nothing specialist exists, say
+  which one I looked for and then fall back.
+- Record what a specialist answered and which model produced it, in the answer.
+  A specialist result with no provenance is indistinguishable from a guess.
 
 Screenshot hygiene (operator rule):
 - Treat diagnostic screenshots and crops as temporary. Save them in a temporary
@@ -784,6 +807,7 @@ BUILTIN_SCOPES: dict[str, str] = {
     "browser_close": "system",
     "browser_state": "read_only",
     "browser_goto": "network",
+    "browser_login": "network",
     "browser_eval": "network",
     "browser_click": "network",
     "browser_locator": "network",
@@ -1089,6 +1113,12 @@ class ForgeAgent:
         # config into a client costs nothing, and the endpoint is only
         # contacted when a tool is actually called.
         self.media, self._media_problem = media_from_config(load())
+        # A third kind of reading: not a picture's contents but a place's.
+        # Built the same way -- config in, client out, nothing contacted until
+        # a tool is called -- because the free mirror needs no credentials and
+        # an agent never asked about the ground should pay nothing for being
+        # able to look at it.
+        self.explorer, self._explorer_problem = explorer_from_config(load())
         self._browser: Browser | None = None
         self._browser_proc: Any = None
         self._browser_endpoint = os.environ.get(
@@ -1229,6 +1259,7 @@ class ForgeAgent:
         self._tool_browser()
         self._tool_vision()
         self._tool_media()
+        self._tool_earthexplorer()
         self._tool_code()
         self._tool_shared_web_search()
         # Hot reload reruns this registration pass on the live agent.
@@ -5200,6 +5231,12 @@ class ForgeAgent:
                     f"(target {browser.target.get('id', 'attached')!r}).\n"
                     f"{self._browser_report(browser)}")
 
+        def browser_login(action: str = "status", url: str = "") -> str:
+            from .browser_login import login_step
+            result = login_step(self._ensure_browser(headless=False), action, url)
+            self._record("browser_login", {"action": action})
+            return json.dumps(result, ensure_ascii=False)
+
         def browser_state() -> str:
             if self._browser is None or self._browser._closed:
                 return "No browser is attached. Call browser_open first."
@@ -5324,6 +5361,18 @@ class ForgeAgent:
                              "description": "CDP endpoint; default http://127.0.0.1:9222"},
             }},
             fn=browser_open, source="builtin", tags=["browser", "web"],
+        ))
+        self._add(ToolSpec(
+            name="browser_login",
+            description=("Navigate to Gmail or an explicit HTTPS WeChat login site, or "
+                         "inspect authentication status. Reports Duo/local-auth and "
+                         "possible QR prompts; never bypasses authentication or claims "
+                         "success without visible account evidence."),
+            parameters={"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["status", "gmail", "wechat"]},
+                "url": {"type": "string", "description": "Explicit HTTPS site for wechat action"},
+            }},
+            fn=browser_login, source="builtin", tags=["browser", "login"],
         ))
         self._add(ToolSpec(
             name="browser_state",
@@ -5646,6 +5695,190 @@ class ForgeAgent:
             parameters={"type": "object", "properties": {}},
             fn=media_status, source="builtin", tags=["media", "vision"],
         ))
+
+    def _tool_earthexplorer(self) -> None:
+        """Searching the Earth's surface, which no other tool here can do.
+
+        The distinction that makes this worth its own tools rather than a
+        corner of `see`: `see` answers "what is in this picture", and these
+        answer "where in the world", "what is at this coordinate", and "find
+        tiles that look like this one" against the whole land surface of the
+        planet. The answers are coordinates, granules and scores -- numbers a
+        remote-sensing or land-cover task can use directly -- rather than
+        prose.
+
+        Three tools and a status, matching the service's three tabs. The model
+        is validated before the call for a reason recorded in the module: the
+        far end does not serve a text query with an image-only encoder, it
+        simply returns nothing, and an empty result is a much worse error
+        message than a refusal that names the encoders that would work.
+        """
+
+        def earth_search_text(query: str, model: str = "",
+                              top_permille: int = 0, save: str = "") -> str:
+            client = self._explorer_client()
+            if not client:
+                return self._no_explorer()
+            try:
+                out = client.search_text(
+                    query, model=model, top_permille=int(top_permille or 0),
+                    save=save)
+            except EarthExplorerError as exc:
+                return f"Earth search failed: {exc}"
+            self._record("earth_search_text",
+                         {"query": query, "model": model or client.model})
+            return out
+
+        def earth_search_image(image: str, model: str = "",
+                               top_permille: int = 0, save: str = "") -> str:
+            client = self._explorer_client()
+            if not client:
+                return self._no_explorer()
+            try:
+                out = client.search_image(
+                    image, model=model, top_permille=int(top_permille or 0),
+                    save=save)
+            except EarthExplorerError as exc:
+                return f"Earth search failed: {exc}"
+            self._record("earth_search_image",
+                         {"image": image, "model": model or client.model})
+            return out
+
+        def earth_search_location(lat: float, lon: float,
+                                  top_permille: int = 0,
+                                  save: str = "") -> str:
+            client = self._explorer_client()
+            if not client:
+                return self._no_explorer()
+            try:
+                out = client.search_location(
+                    lat, lon, top_permille=int(top_permille or 0), save=save)
+            except EarthExplorerError as exc:
+                return f"Earth search failed: {exc}"
+            self._record("earth_search_location", {"lat": lat, "lon": lon})
+            return out
+
+        def earthexplorer_status() -> str:
+            client = self._explorer_client()
+            lines = [client.report() if client else "earthexplorer: not configured"]
+            if self._explorer_problem:
+                lines.append(f"  config problem: {self._explorer_problem}")
+            if client:
+                try:
+                    lines.append(client.models())
+                except EarthExplorerError as exc:
+                    lines.append(f"  could not read the model list: {exc}")
+            return "\n".join(lines)
+
+        common = {
+            "top_permille": {
+                "type": "integer",
+                "description": "how much of the index to return, in "
+                               "per-mille (1-30); 7 is the service default and "
+                               "gives ten tiles",
+            },
+            "save": {
+                "type": "string",
+                "description": "path prefix; the top thumbnails are written "
+                               "to <save>-0.webp and <save>-1.webp",
+            },
+            "model": {
+                "type": "string",
+                "description": ("SigLIP, FarSLIP (both text+image), SatCLIP, "
+                                "DINOv2 (image only). Defaults to the "
+                                "configured model."),
+            },
+        }
+
+        self._add(ToolSpec(
+            name="earth_search_text",
+            description=(
+                "Find where on Earth looks like a phrase -- 'a glacier', "
+                "'salt evaporation ponds', 'a city with a coastline' -- by "
+                "searching 249k Sentinel-2 tiles of the whole land surface. "
+                "Returns score, latitude, longitude and the Sentinel-2 "
+                "product id for each hit, best first. Needs a text-image "
+                "encoder: SigLIP or FarSLIP. A real call takes 50-90 seconds, "
+                "so do not put it inside a loop over many phrases."
+            ),
+            parameters={"type": "object", "properties": {
+                "query": {"type": "string", "description": "what to look for, "
+                                                          "in plain words"},
+                **common,
+            }, "required": ["query"]},
+            fn=earth_search_text, source="builtin",
+            tags=["earth", "satellite", "vision"],
+        ))
+        self._add(ToolSpec(
+            name="earth_search_image",
+            description=(
+                "Find where on Earth looks like this picture. Uploads a local "
+                "image and searches the satellite index for the tiles that "
+                "resemble it, returning coordinates, product ids and scores. "
+                "Works with all four encoders; DINOv2 is the pure-visual "
+                "choice, SatCLIP also folds in geography. Use it to locate an "
+                "unlabelled aerial photo, or to find other places with the "
+                "same land cover."
+            ),
+            parameters={"type": "object", "properties": {
+                "image": {"type": "string",
+                          "description": "local path to an image file"},
+                **common,
+            }, "required": ["image"]},
+            fn=earth_search_image, source="builtin",
+            tags=["earth", "satellite", "vision"],
+        ))
+        self._add(ToolSpec(
+            name="earth_search_location",
+            description=(
+                "What the satellite sees near one coordinate: the nearest "
+                "indexed Sentinel-2 tiles, with their scores and product ids. "
+                "Use it to check land cover at a lat/lon, or to get the "
+                "granule id for the pixels at a place. Needs no model -- the "
+                "search is by geography."
+            ),
+            parameters={"type": "object", "properties": {
+                "lat": {"type": "number", "description": "latitude, -90..90"},
+                "lon": {"type": "number", "description": "longitude, -180..180"},
+                "top_permille": common["top_permille"],
+                "save": common["save"],
+            }, "required": ["lat", "lon"]},
+            fn=earth_search_location, source="builtin",
+            tags=["earth", "satellite", "vision"],
+        ))
+        self._add(ToolSpec(
+            name="earthexplorer_status",
+            description=(
+                "Which satellite-retrieval service is configured, which "
+                "encoders that deployment actually advertises, and whether it "
+                "is reachable. Call it before promising a search, and when a "
+                "search returns nothing."
+            ),
+            parameters={"type": "object", "properties": {}},
+            fn=earthexplorer_status, source="builtin",
+            tags=["earth", "satellite", "vision"],
+        ))
+
+    def _explorer_client(self):
+        """The satellite-search client, built on first use.
+
+        Built lazily rather than only in __init__ because a hot reload swaps
+        the methods of a live agent without rerunning its constructor. A client
+        assigned in __init__ alone would be missing on exactly the instance
+        that was reloaded to gain it -- and the tool would report an
+        AttributeError as an empty answer, which reads like "the service found
+        nothing" rather than "the wiring is absent".
+        """
+        if not hasattr(self, "_explorer_cache"):
+            self._explorer_cache, problem = explorer_from_config(load())
+            self.explorer = self._explorer_cache
+            self._explorer_problem = problem
+        return self._explorer_cache
+
+    def _no_explorer(self) -> str:
+        return (f"Earth search is off: {getattr(self, '_explorer_problem', '') or 'no client'}."
+                f" Set earthexplorer.enabled / earthexplorer.base_url in the "
+                f"config (the default mirror is free and needs no account).")
 
     def _tool_code(self) -> None:
         """Running a snippet, the ordinary way, in the sandbox.
@@ -6827,7 +7060,20 @@ class ForgeAgent:
         # common case costs exactly nothing and cannot re-bill the prefix.
         stranded = self._resume_line()
         tail = f"\n\n{stranded}" if stranded else ""
-        out = (f"{self.system_prompt}\n\n{facts}\n\n{menu}\n\n"
+        # Operator's per-task speed rule is appended independently of the
+        # editable base prompt so a prompt amendment cannot silently remove it.
+        speed_rule = (
+            "TASK SPEED AND DEADLINE (operator rule): Start immediately and use "
+            "the fastest safe, direct route. Target completion within 10 minutes "
+            "of the request; avoid unnecessary scouting, retries, narration and "
+            "slow tool creation. Budget time for verification and reporting. "
+            "If blocked or the deadline is approaching, stop optional work and "
+            "report what was actually completed, what remains and the blocker; "
+            "record unfinished work in the mission. Never claim completion "
+            "without verification or bypass safety, authorization or required "
+            "user input. This is an instruction, not a hard process timeout."
+        )
+        out = (f"{self.system_prompt}\n\n{speed_rule}\n\n{facts}\n\n{menu}\n\n"
                f"{probe}\n\n{kept}\n\n{mission}{tail}\n\n{self._self_report()}")
         if self.role_brief:
             # Last, and separately labelled: a role narrows what this run is
