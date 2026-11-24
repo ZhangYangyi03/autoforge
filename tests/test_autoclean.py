@@ -114,3 +114,23 @@ def test_a_failing_cleaner_cannot_break_a_crawl(store, monkeypatch):
     out = crawler.crawl(["https://a.example/1"], mode="fast")
     assert out["count"] == 1                      # the fetch result is intact
     assert out["results"][0]["status"] == 200
+
+
+def test_the_report_the_model_reads_says_what_was_kept(store, monkeypatch):
+    """"抓到了但没留" and "根本没提过清洗" must not look the same in the report."""
+    from autoforge import crawler
+
+    def fake_isolated(mode, urls, concurrency, timeout, with_text):
+        return {"mode": mode, "count": len(urls), "elapsed": 0.01, "rps": 9.0,
+                "results": [_page(u) for u in urls]}
+    monkeypatch.setattr(crawler, "_isolated", fake_isolated)
+    r = crawler.crawl(["https://a.example/1"], mode="fast")
+    text = crawler.report(r)
+    assert "autoclean:" in text and "not kept" in text
+
+
+def test_a_report_without_a_verdict_gains_no_line():
+    from autoforge import crawler
+    text = crawler.report({"mode": "fast", "count": 0, "elapsed": 0.0, "rps": 0.0,
+                           "results": []})
+    assert "autoclean" not in text

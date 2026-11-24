@@ -475,4 +475,8 @@ def report(result, max_urls=20, text_chars=300):
             lines.append("       text: " + txt)
     if len(results) > max_urls:
         lines.append("  ... %d more URL(s) omitted" % (len(results) - max_urls))
+    # What happened to this crawl downstream belongs in the report the model reads:
+    # "抓到了但没留" and "根本没提过清洗" are different facts and must not look the same.
+    if isinstance(result, dict) and result.get("_autoclean_line"):
+        lines.append(result["_autoclean_line"])
     return '\n'.join(lines)
