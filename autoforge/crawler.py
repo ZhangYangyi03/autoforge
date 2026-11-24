@@ -396,9 +396,10 @@ def crawl(urls, mode="fast", concurrency=20, timeout=8, with_text=False):
             and os.environ.get("AUTOFORGE_CRAWLER_INPROCESS", "") != "1":
         out = _isolated(mode, urls, concurrency, timeout, with_text)
         if out is not None:
-            return out
-    return crawl_local(urls, mode=mode, concurrency=concurrency,
-                       timeout=timeout, with_text=with_text)
+            return _hand_to_cleaner(out)
+    return _hand_to_cleaner(
+        crawl_local(urls, mode=mode, concurrency=concurrency,
+                    timeout=timeout, with_text=with_text))
 
 
 def crawl_local(urls, mode="fast", concurrency=20, timeout=8, with_text=False):
@@ -408,6 +409,39 @@ def crawl_local(urls, mode="fast", concurrency=20, timeout=8, with_text=False):
     urls = [str(u) for u in urls]
     if not urls:
         return {"mode": mode, "count": 0, "elapsed": 0.0, "rps": 0.0, "results": []}
+    return _crawl_local_inner(urls, mode, concurrency, timeout, with_text)
+
+
+def _hand_to_cleaner(result):
+    """Offer a finished crawl to entity-graph, if it is worth keeping.
+
+    The operator's rule (2026-11-24): do not wait to be told to clean. The judgement --
+    whether this crawl produced anything worth a graph -- is entitygraph.auto.judge's,
+    and the verdict is appended to the result under "_autoclean" either way, so a crawl
+    that was deliberately not kept is distinguishable from one that was never offered.
+
+    A hook must not be able to break fetching, so every failure here is swallowed into
+    the same field.
+    """
+    try:
+        from .autoclean import after_crawl
+    except Exception:
+        return result
+    try:
+        verdict = after_crawl(result, engine="autoforge.crawler:" + str(result.get("mode", "")))
+    except Exception as exc:
+        verdict = {"worth": False, "cleaned": False,
+                   "reason": "autoclean hook failed: " + str(exc)[:160]}
+    if verdict is not None and isinstance(result, dict):
+        try:
+            from .autoclean import one_line
+            result["_autoclean_line"] = one_line(verdict)
+        except Exception:
+            pass
+    return result
+
+
+def _crawl_local_inner(urls, mode, concurrency, timeout, with_text):
     if mode not in ("fast", "stealth", "render"):
         raise ValueError('mode must be one of fast|stealth|render')
     t0 = time.perf_counter()
