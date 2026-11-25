@@ -6724,7 +6724,15 @@ class ForgeAgent:
             return []
         docs = []
         for name, record in records.items():
-            if name.startswith("mcp__rea__") or self.registry.get(name) is None:
+            # Any MCP-sourced tool is a peer process capability, not mine, and
+            # most of the market ones are duplicates of a local tool behind an
+            # mcp__market__ prefix. Measured 2026-11-25: on
+            # "\u770b\u4e00\u4e0b\u6211\u6708\u989d\u5ea6\u4e3a\u4ec0\u4e4885%" the duplicate
+            # mcp__market__toolmarket_list ranked first ahead of every local tool,
+            # and across the 112 rounds this ranker has run a candidate it offered
+            # was used twice. The old filter dropped only mcp__rea__, leaving 20
+            # shadowing names.
+            if name.startswith("mcp__") or self.registry.get(name) is None:
                 continue
             text = name.replace("_", " ") + " " + str(getattr(record, "description", ""))
             for probe in (getattr(record, "probes", []) or []):
@@ -6734,6 +6742,41 @@ class ForgeAgent:
         if not docs:
             return []
         return [name for name, _ in _rank(task, docs, limit=limit)]
+
+    def _task_hint_text(self) -> str:
+        """One request-size paragraph naming the tools that fit this task.
+
+        Why a paragraph and not a decision: the loop already protects these
+        names from being demoted, so they would ride in full on their own. What
+        was missing is the sentence that tells the model they are candidates for
+        *this* task rather than tools it happens to own. Four names plus their
+        one-liners is about 400 characters, against a forge round that costs
+        minutes and a run that costs a whole conversation when the tool existed
+        all along.
+        """
+        try:
+            from .tools.exposure import task_hint_line
+        except Exception:                                  # noqa: BLE001
+            return ""
+        task = (self._current_task or "").strip()
+        if not task:
+            return ""
+        cache = getattr(self, "_task_hint_cache", None)
+        if cache is not None and cache[0] == task:
+            return cache[1]
+        try:
+            names = self._task_tool_candidates(task, limit=4)
+        except Exception:                                  # noqa: BLE001
+            return ""
+        pairs = []
+        for name in names:
+            spec = self.registry.get(name)
+            if spec is None:
+                continue
+            pairs.append((name, spec.description or ""))
+        text = task_hint_line(pairs) if pairs else ""
+        self._task_hint_cache = (task, text)
+        return text
 
     def _task_search_views(self, task: str) -> list[str]:
         """Canonical rewrites of a colloquial task, for the shared shelf.
@@ -7166,6 +7209,7 @@ class ForgeAgent:
         finally:
             self._progress = None
             self._current_task = ""
+            self._task_hint_cache = None
             self.registry.protect = set()
 
     def _run_locked(self, task: str, history: list[Message] | None,
@@ -7201,6 +7245,11 @@ class ForgeAgent:
             # every request"; without it the loop sends all 204 schemas, which
             # is what it did until 2026-09-28.
             exposure=self.registry,
+            # The ranker's picks, spoken. Before this the shortlist only set
+            # `registry.protect`, which decides what rides in full and says
+            # nothing to the model: measured 2026-11-25, 112 turns of ranking
+            # produced 2 calls of a ranked tool.
+            task_hint=(lambda: self._task_hint_text()),
         )
         # A resumed run is handed the *stored transcript* plus a short
         # instruction, and this is the shape that makes a resume a resume. The

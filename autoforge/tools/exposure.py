@@ -48,6 +48,14 @@ HOT_FLOOR: frozenset[str] = frozenset({
 #: tool is for, short enough that 120 of them cost less than ten hot schemas.
 COLD_DESC_CHARS = 100
 
+#: A cold MCP tool is shown per server once a server has this many. Below it the
+#: individual lines are already short enough to be worth reading one by one.
+MCP_COLLAPSE_MIN = 5
+
+#: Prefix every mounted MCP tool carries. The server name sits between the
+#: prefix and the next "__" -- mcp__rea__open_binary -> rea.
+MCP_PREFIX = "mcp__"
+
 #: Parameter names shown in the cold list. The point of showing any is that
 #: "read_magic_value(path)" is recognisable where "read_magic_value" alone is
 #: only a guess; the point of capping is that the list is one line per tool.
@@ -116,13 +124,36 @@ def split(
     keep = set(floor) | set(protect)
     hot: list[dict[str, Any]] = []
     lines: list[str] = []
+    # Cold MCP tools are collapsed per server. Measured on this host
+    # 2026-11-25: 207 mcp__rea__ entries, never called once, cost 33,681
+    # characters of cold list -- about 11k tokens on every request, to describe
+    # a reverse-engineering server that was not even started. A cold line earns
+    # its place by being recognisable and askable-for-by-name; 207 of them in a
+    # row is a wall nobody reads. One line per server keeps the whole capability
+    # visible (mcp_servers() lists them all) at 1/200th of the price.
+    groups: dict[str, list[str]] = {}
     for schema in schemas:
         name = _schema_name(schema)
         age = days_since(name)
         if name in keep or (age is not None and age <= window_days):
             hot.append(schema)
-        else:
-            lines.append(cold_line(name, schema))
+            continue
+        if name.startswith(MCP_PREFIX):
+            server = name[len(MCP_PREFIX):].split("__", 1)[0] or "?"
+            groups.setdefault(server, []).append(name)
+            continue
+        lines.append(cold_line(name, schema))
+    for server, names in sorted(groups.items()):
+        if len(names) < MCP_COLLAPSE_MIN:
+            for n in names:
+                schema = next((x for x in schemas if _schema_name(x) == n), None)
+                if schema is not None:
+                    lines.append(cold_line(n, schema))
+            continue
+        lines.append(
+            "  - mcp__%s__* \u2014 %d tools from the %r MCP server, none called "
+            "yet; mcp_servers() lists them, and any one is callable by name."
+            % (server, len(names), server))
     stats = {
         "hot": len(hot),
         "cold": len(lines),
@@ -139,3 +170,37 @@ def manifest_header(stats: dict[str, int], window_days: float) -> str:
         "\u2014 use one directly, or call describe_tool(name) for its full "
         "parameter schema first."
     )
+
+
+def task_hint_line(pairs: "Iterable[tuple[str, str]]", stats: dict[str, int] | None = None) -> str:
+    """The ranker's shortlist, said out loud in the request.
+
+    Measured 2026-11-25 on this machine: `_task_tool_candidates` had ranked
+    tools for 112 user turns and the model called one of its picks twice. The
+    ranking was not the problem -- it was never spoken. The candidates were put
+    into `registry.protect`, which only decides whether a schema rides in full,
+    so a tool the ranker found and the model never noticed stayed exactly as
+    invisible as before.
+
+    Four names and their one-line descriptions cost about 400 characters. That
+    is cheaper than filling the forge slot for a capability that already exists
+    under a name nobody said.
+    """
+    seen: list[str] = []
+    seen_names: set[str] = set()
+    for name, desc in pairs:
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        # An MCP or builtin name is already advertised in full elsewhere; the
+        # hint is for the tool that would otherwise be looked for and missed.
+        d = (desc or "").strip().replace("\n", " ")
+        if len(d) > 90:
+            d = d[:89].rstrip() + "\u2026"
+        seen.append(f"  - {name} \u2014 {d}" if d else f"  - {name}")
+    if not seen:
+        return ""
+    head = ("Tools that fit this task, from this machine's own library "
+            "(ranked from the task text, not guesses):")
+    return head + "\n" + "\n".join(seen) + \
+        "\nCall one directly; describe_tool(name) gives its full schema first."

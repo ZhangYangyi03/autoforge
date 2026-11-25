@@ -330,3 +330,47 @@ def test_silence_alone_eventually_demotes_a_tool(monkeypatch):
     hot, cold, _ = reg.exposure(window_days=7)
     assert "yesterday_thing" not in [(s.get("function") or s).get("name") for s in hot]
     assert any("yesterday_thing" in line for line in cold)
+
+
+def test_cold_mcp_tools_collapse_per_server():
+    """207 never-called mcp__rea__ tools must not cost 207 lines every request.
+
+    Measured 2026-11-25: the cold list was 319 lines / 50,696 characters, of
+    which the rea server alone was 33,681 -- about 11k tokens per request to
+    describe a reverse-engineering service that was not even started. The
+    capability stays discoverable through mcp_servers(); what goes away is the
+    wall of individual lines.
+    """
+    from autoforge.tools.exposure import split
+
+    schemas = [{"type": "function",
+                "function": {"name": "mcp__rea__op_%d" % i,
+                             "description": "a reverse engineering operation",
+                             "parameters": {"type": "object", "properties": {}}}}
+               for i in range(40)]
+    schemas.append({"type": "function",
+                    "function": {"name": "read_local_file",
+                                 "description": "Read a local file",
+                                 "parameters": {"type": "object", "properties": {}}}})
+    hot, cold, stats = split(schemas, lambda name: None, protect=[])
+    joined = "\n".join(cold)
+    assert "mcp__rea__op_1" not in joined, "individual rea lines must not survive"
+    assert "40 tools from the 'rea' MCP server" in joined
+    assert any("read_local_file(" in line for line in cold), \
+        "a local cold tool keeps its own line"
+    assert stats["cold"] == 2, stats
+
+
+def test_task_hint_names_the_tools_and_keeps_order():
+    """The shortlist must be readable in one paragraph and say what each is for."""
+    from autoforge.tools.exposure import task_hint_line
+
+    text = task_hint_line([("read_local_file", "Read a local file from disk"),
+                           ("grep_lines_multi", ""),
+                           ("read_local_file", "duplicate must not repeat"),
+                           ("", "no name, no line")])
+    assert text.startswith("Tools that fit this task")
+    assert "read_local_file \u2014 Read a local file from disk" in text
+    assert text.count("read_local_file") == 1, "a repeated pick is said once"
+    assert "grep_lines_multi" in text
+    assert len(text) < 900, "the hint has to stay cheap: %d chars" % len(text)

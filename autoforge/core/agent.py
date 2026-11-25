@@ -215,6 +215,7 @@ class Agent:
         on_compact: Callable[[Any], None] | None = None,
         journal: Any = None,
         exposure: Any = None,
+        task_hint: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -254,6 +255,11 @@ class Agent:
         #: bare loop and every test that does not care about cost should get.
         #: See `autoforge/tools/exposure.py` for the measured reason it exists.
         self.exposure = exposure
+        #: Anything with `hint(turn) -> str`: a short list of library tools that
+        #: fit the task, computed once by the caller and offered in the request.
+        #: Optional, and None means the request says nothing extra -- a hint is
+        #: an optimisation for discovery, never a source of truth.
+        self.task_hint = task_hint
         #: The last tool asked for, kept so the checkpoint can say what the run
         #: was in the middle of doing. A resume prompt that says "you were 4
         #: turns in" is far weaker than one that says "you had just called
@@ -321,11 +327,23 @@ class Agent:
             # Falling back to sending everything is the pre-existing behaviour:
             # expensive and correct.
             return msgs, self.registry.schemas()
-        if not cold_lines:
+        # The ranker's shortlist rides in the same early block, ahead of the
+        # cold list. Measured 2026-11-25: the candidate ranker had run on 112
+        # user turns and the model used one of its picks twice, because the
+        # picks were never written down anywhere the model reads. It put them in
+        # `registry.protect`, which only decides whether a schema rides in full.
+        hint = ""
+        if self.task_hint is not None:
+            try:
+                hint = (self.task_hint() or "").strip()
+            except Exception:                             # noqa: BLE001
+                hint = ""
+        if not cold_lines and not hint:
             return msgs, hot
         from ..tools.exposure import manifest_header
-        block = (manifest_header(stats, getattr(self.exposure, "window_days", 7.0))
-                 + "\n" + "\n".join(cold_lines))
+        head = manifest_header(stats, getattr(self.exposure, "window_days", 7.0)) \
+            if cold_lines else ""
+        block = "\n\n".join(x for x in (hint, head, "\n".join(cold_lines)) if x)
         # Copied, never appended to `msgs`: the transcript on disk is the
         # conversation, and a block injected per request that became part of the
         # record would be replayed by a resume as something the person said.
@@ -624,6 +642,8 @@ class Agent:
         used: list[str] = []
         turn = 0
         self._terminated = None
+        # Limit recovery to one retry so legitimate blockers cannot loop forever.
+        progress_retry_used = False
         python_calls = 0
         last_reuse_hint = -3
 
@@ -710,6 +730,30 @@ class Agent:
             _notify(self.on_turn, turn, msgs[-1])
 
             if not resp.tool_calls:
+                # Do not mistake an explicit promise of imminent work for a
+                # final answer. Match only clear progress language, not normal
+                # answers, refusals, questions, or reports of completed work.
+                text = (resp.content or "").strip()
+                compact = "".join(text.split())
+                progress_only = (
+                    len(compact) <= 180
+                    and any(x in compact for x in (
+                        "我会先", "我现在就", "我这就", "我先去", "我先查",
+                        "我先检查", "我先查看", "我先处理", "我先修复",
+                        "我会检查", "我会查看", "我会修复", "我开始检查",
+                        "正在检查", "正在查看", "正在处理", "正在修复"))
+                    and not any(x in compact for x in (
+                        "已完成", "已修复", "已解决", "已提交", "已发送",
+                        "无法", "需要你", "需要您", "请你", "请您", "请提供",
+                        "请确认", "等待", "？", "?"))
+                )
+                if progress_only and not progress_retry_used:
+                    progress_retry_used = True
+                    _notify(self.on_reply, text)
+                    msgs.append(Message.user(
+                        "你刚才只报告了即将行动，不是任务结果。请立即继续执行，"
+                        "使用工具完成可做的工作；如确实受阻，请明确说明阻碍。"))
+                    continue
                 return AgentResult(resp.content, msgs, turn, used)
 
             # The second moment worth recording, and the more important one: the
