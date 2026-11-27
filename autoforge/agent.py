@@ -305,9 +305,17 @@ and "其他遇见专业问题也主动找上班模型用上"):
 - Known specialists, in the order to try them:
     geospatial / satellite / remote sensing / "where is this" / "what does this
     land look like" -> earth_search_text, earth_search_image,
-    earth_search_location (local service, no login), and for the stronger
-    eight-model set (TIPSv2, Qwen3VL, Clay, OlmoEarth-v1_2) the ModelScope studio
-    path in modelscope_studio.queue_call.
+    earth_search_location (local service, no login, four encoders: SigLIP,
+    FarSLIP, SatCLIP, DINOv2). The stronger eight-model set (TIPSv2, Qwen3VL,
+    Clay, OlmoEarth-v1_2) is the ModelScope studio
+    https://major-tom-earthembeddingexplorer.ms.show -- measured twice: its
+    /config reads without login and lists all eight, its /gradio_api/call/*
+    answers 403 until a logged-in browser opens the page and its iframe URL
+    hands out ?studio_token=<uuid>, which is what modelscope_studio.queue_call
+    takes. So it is NOT built in: it needs the operator's browser session.
+    Never tell the operator the eight-model set is unavailable because the
+    local service lacks it -- say which four are local and that the other
+    four need his logged-in browser.
     anything else professional -> look for the specialist before answering:
     ModelScope 创空间 (owner/name -> https://<owner>-<name>.ms.show,
     /gradio_api/info lists what it does without login), Hugging Face Spaces, and
@@ -5725,6 +5733,14 @@ class ForgeAgent:
                     save=save)
             except EarthExplorerError as exc:
                 return f"Earth search failed: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # A hot reload re-imports `earthexplorer`, so an error
+                # class raised by a client built before the reload is a
+                # DIFFERENT class from the one named above and the except
+                # clause misses it. Measured 2026-11-27: the failure then
+                # left this tool as a blank string, which reads exactly
+                # like the service finding nothing. Say it instead.
+                return f"Earth search failed: {type(exc).__name__}: {exc}"
             self._record("earth_search_text",
                          {"query": query, "model": model or client.model})
             return out
@@ -5740,6 +5756,14 @@ class ForgeAgent:
                     save=save)
             except EarthExplorerError as exc:
                 return f"Earth search failed: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # A hot reload re-imports `earthexplorer`, so an error
+                # class raised by a client built before the reload is a
+                # DIFFERENT class from the one named above and the except
+                # clause misses it. Measured 2026-11-27: the failure then
+                # left this tool as a blank string, which reads exactly
+                # like the service finding nothing. Say it instead.
+                return f"Earth search failed: {type(exc).__name__}: {exc}"
             self._record("earth_search_image",
                          {"image": image, "model": model or client.model})
             return out
@@ -5755,6 +5779,14 @@ class ForgeAgent:
                     lat, lon, top_permille=int(top_permille or 0), save=save)
             except EarthExplorerError as exc:
                 return f"Earth search failed: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # A hot reload re-imports `earthexplorer`, so an error
+                # class raised by a client built before the reload is a
+                # DIFFERENT class from the one named above and the except
+                # clause misses it. Measured 2026-11-27: the failure then
+                # left this tool as a blank string, which reads exactly
+                # like the service finding nothing. Say it instead.
+                return f"Earth search failed: {type(exc).__name__}: {exc}"
             self._record("earth_search_location", {"lat": lat, "lon": lon})
             return out
 
@@ -5766,8 +5798,9 @@ class ForgeAgent:
             if client:
                 try:
                     lines.append(client.models())
-                except EarthExplorerError as exc:
-                    lines.append(f"  could not read the model list: {exc}")
+                except Exception as exc:  # noqa: BLE001 - reload splits the class
+                    lines.append(f"  could not read the model list: "
+                                 f"{type(exc).__name__}: {exc}")
             return "\n".join(lines)
 
         common = {
@@ -5869,10 +5902,19 @@ class ForgeAgent:
         AttributeError as an empty answer, which reads like "the service found
         nothing" rather than "the wiring is absent".
         """
-        if not hasattr(self, "_explorer_cache"):
+        # Keyed on the class the module currently defines, not just on
+        # "have I built one yet". Measured 2026-11-27: a hot reload
+        # re-imports `earthexplorer`, so the cached client kept the OLD
+        # class -- with the old `_upload` and the old error text -- and
+        # every call after the reload still ran pre-edit code while the
+        # file on disk claimed otherwise.
+        from .earthexplorer import EarthExplorerClient as _cls
+        if (not hasattr(self, "_explorer_cache")
+                or getattr(self, "_explorer_class", None) is not _cls):
             self._explorer_cache, problem = explorer_from_config(load())
             self.explorer = self._explorer_cache
             self._explorer_problem = problem
+            self._explorer_class = _cls
         return self._explorer_cache
 
     def _no_explorer(self) -> str:

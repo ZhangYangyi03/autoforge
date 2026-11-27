@@ -780,6 +780,16 @@ class Agent:
                     )
                 _notify(self.on_tool_result, tc.name, result)
                 output = result.output
+                # A failed call whose output is empty used to arrive here
+                # as a blank tool message -- measured 2026-11-27 on a
+                # satellite search that raised EarthExplorerError: the
+                # model saw nothing at all, so "the tool is broken" and
+                # "the service found nothing" were indistinguishable, and
+                # the run spent turns guessing. The registry knows the
+                # reason; it costs one line to say it.
+                if not result.ok and not str(output).strip():
+                    output = ("FAILED: " + (result.error or "the tool "
+                              "raised and reported no reason"))
                 if tc.name == "run_python":
                     python_calls += 1
                     # Check throughout the run, including after compaction. A
